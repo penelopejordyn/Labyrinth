@@ -12,7 +12,7 @@ struct Stroke {
     let centerPoints: [CGPoint]
     let width: CGFloat
     let color: SIMD4<Float>
-    let vertices: [SIMD2<Float>]  // ← Cached in world space (no transform)
+    let vertices: [SIMD2<Float>]  // ← Pre-tessellated at identity
     
     init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>, viewSize: CGSize) {
         self.id = UUID()
@@ -20,12 +20,12 @@ struct Stroke {
         self.width = width
         self.color = color
         
-        // Tessellate ONCE with no transform
+        // Tessellate ONCE at identity transform
         self.vertices = tessellateStroke(
             centerPoints: centerPoints,
             width: width,
             viewSize: viewSize,
-            panOffset: .zero,      // ← No transform!
+            panOffset: .zero,    // ← Identity
             zoomScale: 1.0
         )
     }

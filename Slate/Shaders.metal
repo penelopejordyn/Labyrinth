@@ -20,7 +20,7 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
                          constant Transform *transform [[buffer(1)]]) {
     float2 pos = positions[vertexID];
     
-    // Vertices are in NDC space, stored at identity transform
+    // Vertices are in NDC at identity transform
     // Apply current view transform
     
     // 1. Apply zoom around center
@@ -28,7 +28,7 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
     
     // 2. Apply pan (convert from pixels to NDC)
     float panX = (transform->panOffset.x / transform->screenWidth) * 2.0;
-    float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;  // Negative for correct direction
+    float panY = -(transform->panOffset.y / transform->screenHeight) * 2.0;
     
     float2 transformed = zoomed + float2(panX, panY);
     
@@ -38,4 +38,3 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
 fragment float4 fragment_main(float4 in [[stage_in]]) {
     return float4(0.0, 1.0, 0.0, 1.0);
 }
-
