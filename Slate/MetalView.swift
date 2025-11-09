@@ -150,51 +150,157 @@ func createCircle(at point: CGPoint,
 // MARK: - Coordinate Conversion Helpers
 
 /// Screen pixels -> World pixels (inverse of worldToScreenPixels).
+//func screenToWorldPixels(_ p: CGPoint,
+//                         viewSize: CGSize,
+//                         panOffset: SIMD2<Float>,
+//                         zoomScale: Float,
+//                         rotationAngle: Float) -> CGPoint {
+//    let cx = Float(viewSize.width) * 0.5
+//    let cy = Float(viewSize.height) * 0.5
+//
+//    let sx = Float(p.x), sy = Float(p.y)
+//
+//    let centeredX = sx - cx
+//    let centeredY = sy - cy
+//
+//    let unpannedX = centeredX - panOffset.x
+//    let unpannedY = centeredY - panOffset.y
+//    
+//    let unzoomedX = unpannedX / zoomScale
+//    let unzoomedY = unpannedY / zoomScale
+//    
+//    
+////    x = x'×cos(-θ) + y'×sin(-θ) = x'×cos(θ) - y'×sin(θ)
+////    y = -x'×sin(-θ) + y'×cos(θ) = x'×sin(θ) + y'×cos(θ)
+//    
+//    let unrotatedX = unzoomedX * cos(rotationAngle) - unzoomedY * sin(rotationAngle)
+//    let unrotatedY = unzoomedX * sin(rotationAngle) + unzoomedY * cos(rotationAngle)
+//
+//    let wx = unrotatedX + cx
+//    let wy = unrotatedY + cy
+//
+//    return CGPoint(x: CGFloat(wx), y: CGFloat(wy))
+//}
+
+// Screen pixels -> World pixels (full inverse of the shader path in *NDC*)
 func screenToWorldPixels(_ p: CGPoint,
                          viewSize: CGSize,
                          panOffset: SIMD2<Float>,
-                         zoomScale: Float) -> CGPoint {
-    let cx = Float(viewSize.width) * 0.5
-    let cy = Float(viewSize.height) * 0.5
+                         zoomScale: Float,
+                         rotationAngle: Float) -> CGPoint {
+    let W = Float(viewSize.width)
+    let H = Float(viewSize.height)
 
-    let sx = Float(p.x), sy = Float(p.y)
+    // screen -> NDC
+    let ndcX = (Float(p.x) / W) * 2.0 - 1.0
+    let ndcY = -((Float(p.y) / H) * 2.0 - 1.0)
 
-    let centeredX = sx - cx
-    let centeredY = sy - cy
+    // unpan in NDC (NOTE: same conversion/signs as shader)
+    let panNDCx = (panOffset.x / W) * 2.0
+    let panNDCy = -(panOffset.y / H) * 2.0
+    let upX = ndcX - panNDCx
+    let upY = ndcY - panNDCy
 
-    let unpannedX = centeredX - panOffset.x
-    let unpannedY = centeredY - panOffset.y
+    // unzoom
+    let uzX = upX / zoomScale
+    let uzY = upY / zoomScale
 
-    let wx = unpannedX / zoomScale + cx
-    let wy = unpannedY / zoomScale + cy
+    // unrotate (R(-θ))
+    let c = cos(rotationAngle), s = sin(rotationAngle)
+    let posX =  uzX * c - uzY * s
+    let posY =  uzX * s + uzY * c
 
+    // NDC -> world pixels (same mapping you use for vertices)
+    let wx = ((posX + 1.0) * 0.5) * W
+    let wy = ((1.0 - posY) * 0.5) * H
     return CGPoint(x: CGFloat(wx), y: CGFloat(wy))
 }
 
-/// World pixels -> Screen pixels (inverse of screenToWorldPixels).
+// World pixels -> Screen pixels
 func worldToScreenPixels(_ w: CGPoint,
                          viewSize: CGSize,
                          panOffset: SIMD2<Float>,
-                         zoomScale: Float) -> CGPoint {
-    let cx = Float(viewSize.width) * 0.5
-    let cy = Float(viewSize.height) * 0.5
+                         zoomScale: Float,
+                         rotationAngle: Float) -> CGPoint {
+    let W = Float(viewSize.width)
+    let H = Float(viewSize.height)
 
-    let wx = Float(w.x), wy = Float(w.y)
+    // world pixels -> model NDC (identity)
+    let x0 = (Float(w.x) / W) * 2.0 - 1.0
+    let y0 = -((Float(w.y) / H) * 2.0 - 1.0)
 
-    let centeredX = wx - cx
-    let centeredY = wy - cy
+    // rotate (R(θ)), same as shader
+    let c = cos(rotationAngle), s = sin(rotationAngle)
+    let rx =  x0 * c + y0 * s
+    let ry = -x0 * s + y0 * c
 
-    let zx = centeredX * zoomScale
-    let zy = centeredY * zoomScale
+    // zoom
+    let zx = rx * zoomScale
+    let zy = ry * zoomScale
 
-    let px = zx + panOffset.x
-    let py = zy + panOffset.y
+    // pan in NDC (same conversion/signs as shader)
+    let panNDCx = (panOffset.x / W) * 2.0
+    let panNDCy = -(panOffset.y / H) * 2.0
+    let ndcX = zx + panNDCx
+    let ndcY = zy + panNDCy
 
-    let sx = px + cx
-    let sy = py + cy
-
+    // NDC -> screen pixels
+    let sx = ((ndcX + 1.0) * 0.5) * W
+    let sy = ((1.0 - ndcY) * 0.5) * H
     return CGPoint(x: CGFloat(sx), y: CGFloat(sy))
+
 }
+
+@inline(__always)
+func worldToModelNDC(_ w: CGPoint, viewSize: CGSize) -> SIMD2<Float> {
+    let W = Float(viewSize.width), H = Float(viewSize.height)
+    let x = (Float(w.x) / W) * 2.0 - 1.0
+    let y = -((Float(w.y) / H) * 2.0 - 1.0)
+    return SIMD2<Float>(x, y)
+}
+
+@inline(__always)
+func screenToNDC(_ p: CGPoint, viewSize: CGSize) -> SIMD2<Float> {
+    let W = Float(viewSize.width), H = Float(viewSize.height)
+    let x = (Float(p.x) / W) * 2.0 - 1.0
+    let y = -((Float(p.y) / H) * 2.0 - 1.0)
+    return SIMD2<Float>(x, y)
+}
+
+/// Solve the pixel panOffset that keeps `anchorWorld` under `desiredScreen`
+/// for the current zoom/rotation (matches shader math exactly).
+func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
+                             desiredScreen: CGPoint,
+                             viewSize: CGSize,
+                             zoomScale: Float,
+                             rotationAngle: Float) -> SIMD2<Float> {
+    let W = Float(viewSize.width), H = Float(viewSize.height)
+
+    // modelNDC(w)
+    let m = worldToModelNDC(CGPoint(x: CGFloat(anchorWorld.x), y: CGFloat(anchorWorld.y)),
+                            viewSize: viewSize)
+
+    // R(θ)*m
+    let c = cos(rotationAngle), s = sin(rotationAngle)
+    let rx =  m.x * c + m.y * s
+    let ry = -m.x * s + m.y * c
+
+    // desired screen → sNDC
+    let sNDC = screenToNDC(desiredScreen, viewSize: viewSize)
+
+    // panNDC = sNDC - zoom * R*m
+    let panNDCx = sNDC.x - zoomScale * rx
+    let panNDCy = sNDC.y - zoomScale * ry
+
+    // Convert NDC pan to pixel panOffset (inverse of your shader’s conversion)
+    // panNDC.x = (panPx / W)*2 → panPx = panNDC.x * (W/2)
+    // panNDC.y = -(panPy / H)*2 → panPy = -panNDC.y * (H/2)
+    let panPx = panNDCx * (W * 0.5)
+    let panPy = -panNDCy * (H * 0.5)
+    return SIMD2<Float>(panPx, panPy)
+}
+
+
 
 // MARK: - GPU Transform Struct
 
@@ -203,6 +309,7 @@ struct GPUTransform {
     var zoomScale: Float
     var screenWidth: Float
     var screenHeight: Float
+    var rotationAngle: Float
 }
 
 // MARK: - MetalView
@@ -231,11 +338,62 @@ struct MetalView: UIViewRepresentable {
 
         var panGesture: UIPanGestureRecognizer!
         var pinchGesture: UIPinchGestureRecognizer!
+        var rotationGesture: UIRotationGestureRecognizer!
 
         // Pinch anchor (persist between .began and subsequent states)
         var pinchAnchorScreen: CGPoint = .zero
         var pinchAnchorWorld: SIMD2<Float> = .zero
         var panOffsetAtPinchStart: SIMD2<Float> = .zero
+        
+        //roation anchor
+        var rotationAnchorScreen: CGPoint = .zero
+        var rotationAnchorWorld: SIMD2<Float> = .zero
+        var panOffsetAtRotationStart: SIMD2<Float> = .zero
+        
+        enum AnchorOwner { case none, pinch, rotation }
+
+        var activeOwner: AnchorOwner = .none
+        var anchorWorld: SIMD2<Float> = .zero
+        var anchorScreen: CGPoint = .zero
+        
+        var lastPinchTouchCount: Int = 0
+        var lastRotationTouchCount: Int = 0
+
+
+        
+        
+        func lockAnchor(owner: AnchorOwner, at screenPt: CGPoint, coord: Coordinator) {
+            activeOwner = owner
+            anchorScreen = screenPt
+            let w = screenToWorldPixels(screenPt,
+                                        viewSize: bounds.size,
+                                        panOffset: coord.panOffset,
+                                        zoomScale: coord.zoomScale,
+                                        rotationAngle: coord.rotationAngle)
+            anchorWorld = SIMD2<Float>(Float(w.x), Float(w.y))
+        }
+
+        // Re-lock anchor to a new screen point *without changing the transform*
+        func relockAnchorAtCurrentCentroid(owner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
+            activeOwner = owner
+            anchorScreen = screenPt
+            // IMPORTANT: recompute world under the *new* centroid using current pan/zoom/rotation.
+            let w = screenToWorldPixels(screenPt,
+                                        viewSize: bounds.size,
+                                        panOffset: coord.panOffset,
+                                        zoomScale: coord.zoomScale,
+                                        rotationAngle: coord.rotationAngle)
+            anchorWorld = SIMD2<Float>(Float(w.x), Float(w.y))
+        }
+
+        func handoffAnchor(to newOwner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
+            relockAnchorAtCurrentCentroid(owner: newOwner, screenPt: screenPt, coord: coord)
+        }
+
+        func clearAnchorIfUnused() { activeOwner = .none }
+
+
+        
 
         override init(frame: CGRect, device: MTLDevice?) {
             super.init(frame: frame, device: device)
@@ -254,80 +412,128 @@ struct MetalView: UIViewRepresentable {
 
             pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             addGestureRecognizer(pinchGesture)
+            
+            rotationGesture = UIRotationGestureRecognizer(target: self, action: #selector(handleRotation(_:)))
+            addGestureRecognizer(rotationGesture)
 
             panGesture.delegate = self
             pinchGesture.delegate = self
+            rotationGesture.delegate = self
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
             guard let coord = coordinator else { return }
-            let location = gesture.location(in: self)
+            let loc = gesture.location(in: self)
+            let tc  = gesture.numberOfTouches
 
             switch gesture.state {
             case .began:
-                // Save current pan offset
-                panOffsetAtPinchStart = coord.panOffset
-                
-                // Store screen anchor and corresponding world point
-                pinchAnchorScreen = location
-                let w = screenToWorldPixels(location,
-                                            viewSize: bounds.size,
-                                            panOffset: coord.panOffset,
-                                            zoomScale: coord.zoomScale)
-                pinchAnchorWorld = SIMD2<Float>(Float(w.x), Float(w.y))
+                lastPinchTouchCount = tc
+                if activeOwner == .none { lockAnchor(owner: .pinch, at: loc, coord: coord) }
 
-            case .changed, .ended:
-                // Calculate pan delta since pinch started
-                let currentPanDelta = SIMD2<Float>(
-                    coord.panOffset.x - panOffsetAtPinchStart.x,
-                    coord.panOffset.y - panOffsetAtPinchStart.y
-                )
-                
-                // Temporarily remove the pan delta to calculate zoom correctly
-                coord.panOffset = panOffsetAtPinchStart
-                
-                // Incremental zoom (clamped)
-                let newZoom = coord.zoomScale * Float(gesture.scale)
+            case .changed:
+                // If touch count changed (finger lifted/added), re-lock to new centroid w/o moving content.
+                if activeOwner == .pinch, tc != lastPinchTouchCount {
+                    relockAnchorAtCurrentCentroid(owner: .pinch, screenPt: loc, coord: coord)
+                    lastPinchTouchCount = tc
+                    // Do not solve pan on this exact frame; early-return to avoid visible snap.
+                    gesture.scale = 1.0
+                    return
+                }
 
-                // Where would the same world point land now?
-                let newScreen = worldToScreenPixels(
-                    CGPoint(x: CGFloat(pinchAnchorWorld.x), y: CGFloat(pinchAnchorWorld.y)),
-                    viewSize: bounds.size,
-                    panOffset: coord.panOffset,
-                    zoomScale: newZoom
-                )
-
-                // Pixel correction to keep anchor under fingers
-                let dx = Float(pinchAnchorScreen.x - newScreen.x)
-                let dy = Float(pinchAnchorScreen.y - newScreen.y)
-
-                coord.panOffset.x += dx
-                coord.panOffset.y += dy
-                coord.zoomScale = newZoom
-                
-                // Re-apply the pan delta from simultaneous panning
-                coord.panOffset.x += currentPanDelta.x
-                coord.panOffset.y += currentPanDelta.y
-                
-                // Update the baseline for next iteration
-                panOffsetAtPinchStart = SIMD2<Float>(
-                    coord.panOffset.x - currentPanDelta.x,
-                    coord.panOffset.y - currentPanDelta.y
-                )
-
+                // Normal incremental zoom
+                coord.zoomScale = coord.zoomScale * Float(gesture.scale)
                 gesture.scale = 1.0
 
-            default:
-                break
+                // Keep the shared anchor pinned
+                let target = (activeOwner == .pinch) ? loc : anchorScreen
+                coord.panOffset = solvePanOffsetForAnchor(anchorWorld: anchorWorld,
+                                                          desiredScreen: target,
+                                                          viewSize: bounds.size,
+                                                          zoomScale: coord.zoomScale,
+                                                          rotationAngle: coord.rotationAngle)
+                if activeOwner == .pinch { anchorScreen = target }
+
+            case .ended, .cancelled, .failed:
+                if activeOwner == .pinch {
+                    // If rotation is active, hand off smoothly to its centroid
+                    if rotationGesture.state == .changed || rotationGesture.state == .began {
+                        let rloc = rotationGesture.location(in: self)
+                        handoffAnchor(to: .rotation, screenPt: rloc, coord: coord)
+                    } else {
+                        clearAnchorIfUnused()
+                    }
+                }
+                lastPinchTouchCount = 0
+
+            default: break
             }
         }
 
+
+
         @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
-            let translation = gesture.translation(in: self)
-            coordinator?.panOffset.x += Float(translation.x)
-            coordinator?.panOffset.y += Float(translation.y)
+            let t = gesture.translation(in: self)
+            coordinator?.panOffset.x += Float(t.x)
+            coordinator?.panOffset.y += Float(t.y)
             gesture.setTranslation(.zero, in: self)
+
+            if activeOwner != .none {
+                anchorScreen.x += t.x
+                anchorScreen.y += t.y
+            }
         }
+
+        
+        @objc func handleRotation(_ gesture: UIRotationGestureRecognizer) {
+            guard let coord = coordinator else { return }
+            let loc = gesture.location(in: self)
+            let tc  = gesture.numberOfTouches
+
+            switch gesture.state {
+            case .began:
+                lastRotationTouchCount = tc
+                if activeOwner == .none { lockAnchor(owner: .rotation, at: loc, coord: coord) }
+
+            case .changed:
+                // Re-lock when finger count changes to prevent jump.
+                if activeOwner == .rotation, tc != lastRotationTouchCount {
+                    relockAnchorAtCurrentCentroid(owner: .rotation, screenPt: loc, coord: coord)
+                    lastRotationTouchCount = tc
+                    gesture.rotation = 0.0
+                    return
+                }
+
+                // Apply incremental rotation
+                coord.rotationAngle += Float(gesture.rotation)
+                gesture.rotation = 0.0
+
+                // Keep shared anchor pinned
+                let target = (activeOwner == .rotation) ? loc : anchorScreen
+                coord.panOffset = solvePanOffsetForAnchor(anchorWorld: anchorWorld,
+                                                          desiredScreen: target,
+                                                          viewSize: bounds.size,
+                                                          zoomScale: coord.zoomScale,
+                                                          rotationAngle: coord.rotationAngle)
+                if activeOwner == .rotation { anchorScreen = target }
+
+            case .ended, .cancelled, .failed:
+                if activeOwner == .rotation {
+                    if pinchGesture.state == .changed || pinchGesture.state == .began {
+                        let ploc = pinchGesture.location(in: self)
+                        handoffAnchor(to: .pinch, screenPt: ploc, coord: coord)
+                    } else {
+                        clearAnchorIfUnused()
+                    }
+                }
+                lastRotationTouchCount = 0
+
+            default: break
+            }
+        }
+
+
+
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             guard event?.allTouches?.count == 1, let touch = touches.first else { return }
@@ -366,6 +572,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     var panOffset: SIMD2<Float> = .zero
     var zoomScale: Float = 1.0
+    var rotationAngle: Float = 0.0
 
     override init() {
         super.init()
@@ -407,7 +614,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             panOffset: panOffset,
             zoomScale: zoomScale,
             screenWidth: Float(view.bounds.width),
-            screenHeight: Float(view.bounds.height)
+            screenHeight: Float(view.bounds.height),
+            rotationAngle: rotationAngle
         )
         let transformBuffer = device.makeBuffer(
             bytes: &transform,
@@ -486,7 +694,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         let worldPoint = screenToWorldPixels(point,
                                              viewSize: view.bounds.size,
                                              panOffset: panOffset,
-                                             zoomScale: zoomScale)
+                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
         currentTouchPoints = [worldPoint]
     }
 
@@ -495,7 +703,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         let worldPoint = screenToWorldPixels(point,
                                              viewSize: view.bounds.size,
                                              panOffset: panOffset,
-                                             zoomScale: zoomScale)
+                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
         currentTouchPoints.append(worldPoint)
     }
 
@@ -504,7 +712,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         let worldPoint = screenToWorldPixels(point,
                                              viewSize: view.bounds.size,
                                              panOffset: panOffset,
-                                             zoomScale: zoomScale)
+                                             zoomScale: zoomScale, rotationAngle: rotationAngle)
         currentTouchPoints.append(worldPoint)
 
         guard currentTouchPoints.count >= 4 else {
