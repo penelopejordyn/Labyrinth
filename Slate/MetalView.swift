@@ -42,7 +42,8 @@ func tessellateStroke(centerPoints: [CGPoint],
                       width: CGFloat,
                       viewSize: CGSize,
                       panOffset: SIMD2<Float> = .zero,
-                      zoomScale: Float = 1.0) -> [SIMD2<Float>] {
+                      zoomScale: Float = 1.0,
+                      originNDC: SIMD2<Float> = .zero) -> [SIMD2<Float>] {
     var vertices: [SIMD2<Float>] = []
 
     guard centerPoints.count >= 2 else {
@@ -51,7 +52,8 @@ func tessellateStroke(centerPoints: [CGPoint],
                                 radius: width / 2.0,
                                 viewSize: viewSize,
                                 panOffset: panOffset,
-                                zoomScale: zoomScale)
+                                zoomScale: zoomScale,
+                                originNDC: originNDC)
         }
         return vertices
     }
@@ -64,7 +66,8 @@ func tessellateStroke(centerPoints: [CGPoint],
         radius: width / 2.0,
         viewSize: viewSize,
         panOffset: panOffset,
-        zoomScale: zoomScale
+        zoomScale: zoomScale,
+        originNDC: originNDC
     )
     vertices.append(contentsOf: startCapVertices)
 
@@ -90,8 +93,8 @@ func tessellateStroke(centerPoints: [CGPoint],
         let T2 = p2 + perp * widthInNDC
         let B2 = p2 - perp * widthInNDC
 
-        vertices.append(T1); vertices.append(B1); vertices.append(T2)
-        vertices.append(B1); vertices.append(B2); vertices.append(T2)
+        vertices.append(T1 - originNDC); vertices.append(B1 - originNDC); vertices.append(T2 - originNDC)
+        vertices.append(B1 - originNDC); vertices.append(B2 - originNDC); vertices.append(T2 - originNDC)
 
         if i < centerPoints.count - 2 {
             let jointVertices = createCircle(
@@ -100,6 +103,7 @@ func tessellateStroke(centerPoints: [CGPoint],
                 viewSize: viewSize,
                 panOffset: panOffset,
                 zoomScale: zoomScale,
+                originNDC: originNDC,
                 segments: 16
             )
             vertices.append(contentsOf: jointVertices)
@@ -112,7 +116,8 @@ func tessellateStroke(centerPoints: [CGPoint],
         radius: width / 2.0,
         viewSize: viewSize,
         panOffset: panOffset,
-        zoomScale: zoomScale
+        zoomScale: zoomScale,
+        originNDC: originNDC
     )
     vertices.append(contentsOf: endCapVertices)
 
@@ -125,6 +130,7 @@ func createCircle(at point: CGPoint,
                   viewSize: CGSize,
                   panOffset: SIMD2<Float> = .zero,
                   zoomScale: Float = 1.0,
+                  originNDC: SIMD2<Float> = .zero,
                   segments: Int = 30) -> [SIMD2<Float>] {
     var vertices: [SIMD2<Float>] = []
 
@@ -140,9 +146,9 @@ func createCircle(at point: CGPoint,
         let p2 = SIMD2<Float>(center.x + cos(a2) * radiusInNDC,
                               center.y + sin(a2) * radiusInNDC)
 
-        vertices.append(center)
-        vertices.append(p1)
-        vertices.append(p2)
+        vertices.append(center - originNDC)
+        vertices.append(p1 - originNDC)
+        vertices.append(p2 - originNDC)
     }
     return vertices
 }
@@ -564,6 +570,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     var commandQueue: MTLCommandQueue!
     var pipelineState: MTLRenderPipelineState!
     var vertexBuffer: MTLBuffer!
+    var originBuffer: MTLBuffer!
 
     var currentTouchPoints: [CGPoint] = []
     var allStrokes: [Stroke] = []
@@ -586,22 +593,34 @@ class Coordinator: NSObject, MTKViewDelegate {
         let startTime = Date()
 
         var allVertices: [SIMD2<Float>] = []
+        var allOrigins: [SIMD2<Float>] = []
 
         // Use cached vertices (tessellated at identity)
         for stroke in allStrokes {
             allVertices.append(contentsOf: stroke.vertices)
+            if !stroke.vertices.isEmpty {
+                let repeatedOrigins = Array(repeating: stroke.originModelNDC, count: stroke.vertices.count)
+                allOrigins.append(contentsOf: repeatedOrigins)
+            }
         }
 
         // Current stroke - ALSO tessellate at identity!
         if currentTouchPoints.count >= 2 {
+            let currentOriginPoint = currentTouchPoints.first ?? .zero
+            let currentOriginNDC = worldToModelNDC(currentOriginPoint, viewSize: view.bounds.size)
             let currentVertices = tessellateStroke(
                 centerPoints: currentTouchPoints,
                 width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
                 viewSize: view.bounds.size,
                 panOffset: .zero,      // ← Identity, not current!
-                zoomScale: 1.0
+                zoomScale: 1.0,
+                originNDC: currentOriginNDC
             )
             allVertices.append(contentsOf: currentVertices)
+            if !currentVertices.isEmpty {
+                let repeatedOrigins = Array(repeating: currentOriginNDC, count: currentVertices.count)
+                allOrigins.append(contentsOf: repeatedOrigins)
+            }
         }
 
         let tessellationTime = Date().timeIntervalSince(startTime)
@@ -623,6 +642,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             options: .storageModeShared
         )
 
+        assert(allVertices.count == allOrigins.count, "Vertex/origin count mismatch")
+
         if allVertices.isEmpty {
             let commandBuffer = commandQueue.makeCommandBuffer()!
             guard let rpd = view.currentRenderPassDescriptor else { return }
@@ -631,7 +652,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.setCullMode(.none)
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+            enc.setVertexBuffer(originBuffer, offset: 0, index: 1)
+            enc.setVertexBuffer(transformBuffer, offset: 0, index: 2)
 
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
             enc.endEncoding()
@@ -641,6 +663,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         updateVertexBuffer(with: allVertices)
+        updateOriginBuffer(with: allOrigins)
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
@@ -648,7 +671,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         enc.setCullMode(.none)
 
         enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        enc.setVertexBuffer(originBuffer, offset: 0, index: 1)
+        enc.setVertexBuffer(transformBuffer, offset: 0, index: 2)
 
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
         enc.endEncoding()
@@ -679,12 +703,23 @@ class Coordinator: NSObject, MTKViewDelegate {
         vertexBuffer = device.makeBuffer(bytes: &positions,
                                          length: positions.count * MemoryLayout<SIMD2<Float>>.stride,
                                          options: [])
+
+        var origins = Array(repeating: SIMD2<Float>(repeating: 0.0), count: positions.count)
+        originBuffer = device.makeBuffer(bytes: &origins,
+                                         length: origins.count * MemoryLayout<SIMD2<Float>>.stride,
+                                         options: [])
     }
 
     func updateVertexBuffer(with vertices: [SIMD2<Float>]) {
         guard !vertices.isEmpty else { return }
         let bufferSize = vertices.count * MemoryLayout<SIMD2<Float>>.stride
         vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
+    }
+
+    func updateOriginBuffer(with origins: [SIMD2<Float>]) {
+        guard !origins.isEmpty else { return }
+        let bufferSize = origins.count * MemoryLayout<SIMD2<Float>>.stride
+        originBuffer = device.makeBuffer(bytes: origins, length: bufferSize, options: .storageModeShared)
     }
 
     // MARK: - Touch Handling

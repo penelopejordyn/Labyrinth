@@ -12,21 +12,27 @@ struct Stroke {
     let centerPoints: [CGPoint]
     let width: CGFloat
     let color: SIMD4<Float>
-    let vertices: [SIMD2<Float>]  // ← Pre-tessellated at identity
-    
+    let originModelNDC: SIMD2<Float>
+    let vertices: [SIMD2<Float>]  // ← Local offsets in model NDC
+
     init(centerPoints: [CGPoint], width: CGFloat, color: SIMD4<Float>, viewSize: CGSize) {
         self.id = UUID()
         self.centerPoints = centerPoints
         self.width = width
         self.color = color
-        
+
+        let anchor = centerPoints.first ?? .zero
+        let origin = worldToModelNDC(anchor, viewSize: viewSize)
+        self.originModelNDC = origin
+
         // Tessellate ONCE at identity transform
         self.vertices = tessellateStroke(
             centerPoints: centerPoints,
             width: width,
             viewSize: viewSize,
             panOffset: .zero,    // ← Identity
-            zoomScale: 1.0
+            zoomScale: 1.0,
+            originNDC: origin
         )
     }
 }
