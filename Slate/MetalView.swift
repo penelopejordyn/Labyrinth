@@ -4,146 +4,99 @@ import MetalKit
 
 // MARK: - Geometry / Tessellation
 
-/// Convert a world (canvas pixel) point to NDC, applying pan/zoom.
-func worldPixelToNDC(point w: CGPoint,
-                     viewSize: CGSize,
-                     panOffset: SIMD2<Float>,
-                     zoomScale: Float) -> SIMD2<Float> {
-    let cx = Float(viewSize.width)  * 0.5
-    let cy = Float(viewSize.height) * 0.5
-
-    let wx = Float(w.x), wy = Float(w.y)
-
-    // Remove center (world -> centered)
-    let centeredX = wx - cx
-    let centeredY = wy - cy
-
-    // Apply zoom (centered -> zoomed)
-    let zx = centeredX * zoomScale
-    let zy = centeredY * zoomScale
-
-    // Apply pan (in pixels)
-    let px = zx + panOffset.x
-    let py = zy + panOffset.y
-
-    // Back to screen pixels
-    let sx = px + cx
-    let sy = py + cy
-
-    // Screen pixels -> NDC
-    let ndcX = (sx / Float(viewSize.width)) * 2.0 - 1.0
-    let ndcY = -((sy / Float(viewSize.height)) * 2.0 - 1.0)
-
-    return SIMD2<Float>(ndcX, ndcY)
-}
-
-/// Create triangles for a stroke from world (canvas pixel) center points.
+/// Tessellate a stroke into world-space triangle vertices.
 func tessellateStroke(centerPoints: [CGPoint],
                       width: CGFloat,
-                      viewSize: CGSize,
-                      panOffset: SIMD2<Float> = .zero,
-                      zoomScale: Float = 1.0) -> [SIMD2<Float>] {
+                      segmentsPerCap: Int = 30) -> [SIMD2<Float>] {
+    guard width > 0 else { return [] }
+
     var vertices: [SIMD2<Float>] = []
 
     guard centerPoints.count >= 2 else {
-        if centerPoints.count == 1 {
-            return createCircle(at: centerPoints[0],
+        if let point = centerPoints.first {
+            return createCircle(at: point,
                                 radius: width / 2.0,
-                                viewSize: viewSize,
-                                panOffset: panOffset,
-                                zoomScale: zoomScale)
+                                segments: segmentsPerCap)
         }
         return vertices
     }
 
-    let halfWidth = Float(width / 2.0)
+    let halfWidth = Double(width) * 0.5
 
-    // 1) START CAP
-    let startCapVertices = createCircle(
-        at: centerPoints[0],
-        radius: width / 2.0,
-        viewSize: viewSize,
-        panOffset: panOffset,
-        zoomScale: zoomScale
-    )
-    vertices.append(contentsOf: startCapVertices)
+    // Start cap
+    vertices.append(contentsOf: createCircle(at: centerPoints[0],
+                                            radius: width / 2.0,
+                                            segments: segmentsPerCap))
 
-    // 2) SEGMENTS + JOINTS
-    for i in 0..<(centerPoints.count - 1) {
-        let current = centerPoints[i]
-        let next = centerPoints[i + 1]
+    for index in 0..<(centerPoints.count - 1) {
+        let current = centerPoints[index]
+        let next = centerPoints[index + 1]
 
-        let p1 = worldPixelToNDC(point: current, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
-        let p2 = worldPixelToNDC(point: next, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
+        let p1 = SIMD2<Double>(Double(current.x), Double(current.y))
+        let p2 = SIMD2<Double>(Double(next.x), Double(next.y))
 
         let dir = p2 - p1
-        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
-        guard len > 0 else { continue }
-        let n = dir / len
+        let lengthSq = dir.x * dir.x + dir.y * dir.y
+        guard lengthSq > .ulpOfOne else { continue }
+        let invLen = 1.0 / sqrt(lengthSq)
+        let normal = dir * invLen
+        let perp = SIMD2<Double>(-normal.y, normal.x)
 
-        let perp = SIMD2<Float>(-n.y, n.x)
+        let offset = perp * halfWidth
 
-        let widthInNDC = (halfWidth / Float(viewSize.width)) * 2.0 * zoomScale
+        let t1 = p1 + offset
+        let b1 = p1 - offset
+        let t2 = p2 + offset
+        let b2 = p2 - offset
 
-        let T1 = p1 + perp * widthInNDC
-        let B1 = p1 - perp * widthInNDC
-        let T2 = p2 + perp * widthInNDC
-        let B2 = p2 - perp * widthInNDC
+        vertices.append(SIMD2<Float>(Float(t1.x), Float(t1.y)))
+        vertices.append(SIMD2<Float>(Float(b1.x), Float(b1.y)))
+        vertices.append(SIMD2<Float>(Float(t2.x), Float(t2.y)))
 
-        vertices.append(T1); vertices.append(B1); vertices.append(T2)
-        vertices.append(B1); vertices.append(B2); vertices.append(T2)
+        vertices.append(SIMD2<Float>(Float(b1.x), Float(b1.y)))
+        vertices.append(SIMD2<Float>(Float(b2.x), Float(b2.y)))
+        vertices.append(SIMD2<Float>(Float(t2.x), Float(t2.y)))
 
-        if i < centerPoints.count - 2 {
-            let jointVertices = createCircle(
-                at: next,
-                radius: width / 2.0,
-                viewSize: viewSize,
-                panOffset: panOffset,
-                zoomScale: zoomScale,
-                segments: 16
-            )
-            vertices.append(contentsOf: jointVertices)
+        if index < centerPoints.count - 2 {
+            vertices.append(contentsOf: createCircle(at: next,
+                                                    radius: width / 2.0,
+                                                    segments: 16))
         }
     }
 
-    // 4) END CAP
-    let endCapVertices = createCircle(
-        at: centerPoints[centerPoints.count - 1],
-        radius: width / 2.0,
-        viewSize: viewSize,
-        panOffset: panOffset,
-        zoomScale: zoomScale
-    )
-    vertices.append(contentsOf: endCapVertices)
+    vertices.append(contentsOf: createCircle(at: centerPoints.last!,
+                                            radius: width / 2.0,
+                                            segments: segmentsPerCap))
 
     return vertices
 }
 
-/// Triangle fan circle in NDC.
+/// Triangle fan circle expressed in world coordinates.
 func createCircle(at point: CGPoint,
                   radius: CGFloat,
-                  viewSize: CGSize,
-                  panOffset: SIMD2<Float> = .zero,
-                  zoomScale: Float = 1.0,
                   segments: Int = 30) -> [SIMD2<Float>] {
+    guard radius > 0, segments >= 3 else { return [] }
+
     var vertices: [SIMD2<Float>] = []
 
-    let center = worldPixelToNDC(point: point, viewSize: viewSize, panOffset: panOffset, zoomScale: zoomScale)
-    let radiusInNDC = (Float(radius) / Float(viewSize.width)) * 2.0 * zoomScale
+    let center = SIMD2<Double>(Double(point.x), Double(point.y))
+    let radiusValue = Double(radius)
+    let step = 2.0 * Double.pi / Double(segments)
 
     for i in 0..<segments {
-        let a1 = Float(i) * (2.0 * .pi / Float(segments))
-        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
+        let angle0 = Double(i) * step
+        let angle1 = Double(i + 1) * step
 
-        let p1 = SIMD2<Float>(center.x + cos(a1) * radiusInNDC,
-                              center.y + sin(a1) * radiusInNDC)
-        let p2 = SIMD2<Float>(center.x + cos(a2) * radiusInNDC,
-                              center.y + sin(a2) * radiusInNDC)
+        let p1 = SIMD2<Double>(center.x + cos(angle0) * radiusValue,
+                               center.y + sin(angle0) * radiusValue)
+        let p2 = SIMD2<Double>(center.x + cos(angle1) * radiusValue,
+                               center.y + sin(angle1) * radiusValue)
 
-        vertices.append(center)
-        vertices.append(p1)
-        vertices.append(p2)
+        vertices.append(SIMD2<Float>(Float(center.x), Float(center.y)))
+        vertices.append(SIMD2<Float>(Float(p1.x), Float(p1.y)))
+        vertices.append(SIMD2<Float>(Float(p2.x), Float(p2.y)))
     }
+
     return vertices
 }
 
@@ -587,19 +540,16 @@ class Coordinator: NSObject, MTKViewDelegate {
 
         var allVertices: [SIMD2<Float>] = []
 
-        // Use cached vertices (tessellated at identity)
+        // Use cached vertices (tessellated once in world space)
         for stroke in allStrokes {
             allVertices.append(contentsOf: stroke.vertices)
         }
 
-        // Current stroke - ALSO tessellate at identity!
+        // Current stroke - tessellate in world space each frame for preview
         if currentTouchPoints.count >= 2 {
             let currentVertices = tessellateStroke(
                 centerPoints: currentTouchPoints,
                 width: 10.0 / CGFloat(zoomScale),  // ← Fixed width in world pixels
-                viewSize: view.bounds.size,
-                panOffset: .zero,      // ← Identity, not current!
-                zoomScale: 1.0
             )
             allVertices.append(contentsOf: currentVertices)
         }
@@ -617,28 +567,6 @@ class Coordinator: NSObject, MTKViewDelegate {
             screenHeight: Float(view.bounds.height),
             rotationAngle: rotationAngle
         )
-        let transformBuffer = device.makeBuffer(
-            bytes: &transform,
-            length: MemoryLayout<GPUTransform>.stride,
-            options: .storageModeShared
-        )
-
-        if allVertices.isEmpty {
-            let commandBuffer = commandQueue.makeCommandBuffer()!
-            guard let rpd = view.currentRenderPassDescriptor else { return }
-            let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-            enc.setRenderPipelineState(pipelineState)
-            enc.setCullMode(.none)
-
-            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
-
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            enc.endEncoding()
-            commandBuffer.present(view.currentDrawable!)
-            commandBuffer.commit()
-            return
-        }
 
         updateVertexBuffer(with: allVertices)
         let commandBuffer = commandQueue.makeCommandBuffer()!
@@ -647,10 +575,12 @@ class Coordinator: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(pipelineState)
         enc.setCullMode(.none)
 
-        enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-        enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        if !allVertices.isEmpty {
+            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            enc.setVertexBytes(&transform, length: MemoryLayout<GPUTransform>.stride, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
+        }
 
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: allVertices.count)
         enc.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
@@ -668,16 +598,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func makeVertexBuffer() {
-        var positions: [SIMD2<Float>] = [
-            SIMD2<Float>(-0.8,  0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.8, -0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.3,  0.5),
-            SIMD2<Float>(-0.8,  0.5),
-        ]
-        vertexBuffer = device.makeBuffer(bytes: &positions,
-                                         length: positions.count * MemoryLayout<SIMD2<Float>>.stride,
+        vertexBuffer = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride,
                                          options: [])
     }
 
