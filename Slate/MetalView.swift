@@ -16,8 +16,9 @@ struct TileKey: Hashable {
 struct ViewUniforms {
     var anchorLocal: SIMD2<Float>
     var anchorNDC: SIMD2<Float>
-    var tileBaseScale: SIMD2<Float>
+    var tileToNDC: SIMD2<Float>
     var zoomMantissa: Float
+    var zoomExponent: Int32
     var cosTheta: Float
     var sinTheta: Float
     var padding: Float = 0
@@ -46,14 +47,25 @@ final class TileGeometry {
 
 func splitZoomScale(_ zoom: Float) -> (Int32, Float) {
     let safeZoom = max(zoom, 1e-6)
-    let level = Int32(floor(log2f(safeZoom)))
-    let levelScale = powf(2.0, Float(level))
-    let mantissa = safeZoom / levelScale
-    return (level, mantissa)
+    let clampedZoom = clampZoomScale(safeZoom)
+
+    let rawLevel = Int32(floor(log2f(clampedZoom)))
+    let clampedLevel = max(min(rawLevel, maxTileLevel), minTileLevel)
+    let levelScale = powf(2.0, Float(clampedLevel))
+    let mantissa = clampedZoom / levelScale
+    let safeMantissa = mantissa.isFinite ? mantissa : 1.0
+    return (clampedLevel, safeMantissa)
 }
 
 private let maxTileLevel: Int32 = 60
 private let minTileLevel: Int32 = -60
+private let maxZoomScale: Float = powf(2.0, Float(maxTileLevel))
+private let minZoomScale: Float = powf(2.0, Float(minTileLevel))
+
+@inline(__always)
+private func clampZoomScale(_ zoom: Float) -> Float {
+    return min(max(zoom, minZoomScale), maxZoomScale)
+}
 
 func tileSize(for level: Int32) -> Double {
     let clampedLevel = max(min(level, maxTileLevel), minTileLevel)
@@ -486,7 +498,7 @@ struct MetalView: UIViewRepresentable {
                 }
 
                 // Normal incremental zoom
-                coord.zoomScale = coord.zoomScale * Float(gesture.scale)
+                coord.zoomScale = clampZoomScale(coord.zoomScale * Float(gesture.scale))
                 gesture.scale = 1.0
 
                 // Keep the shared anchor pinned
@@ -677,7 +689,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             return
         }
 
-        let (level, zoomMantissa) = splitZoomScale(zoomScale)
+        let (rawLevel, zoomMantissa) = splitZoomScale(zoomScale)
+        let level = max(min(rawLevel, maxTileLevel), minTileLevel)
         let tileSide = tileSize(for: level)
         let viewSize = view.bounds.size
 
@@ -701,9 +714,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         let (anchorTileKey, anchorLocal) = tileKeyAndLocal(for: anchorWorldD, tileSize: tileSide)
         let anchorNDC = screenToNDC(anchorScreen, viewSize: viewSize)
 
-        let tileBaseScale = SIMD2<Float>(
-            Float(baseTileSize / Double(viewSize.width) * 2.0),
-            Float(-baseTileSize / Double(viewSize.height) * 2.0)
+        let tileToNDC = SIMD2<Float>(
+            Float(tileSide / Double(viewSize.width) * 2.0),
+            Float(-tileSide / Double(viewSize.height) * 2.0)
         )
 
         let cosTheta = Float(cos(Double(rotationAngle)))
@@ -712,8 +725,9 @@ class Coordinator: NSObject, MTKViewDelegate {
         var viewUniforms = ViewUniforms(
             anchorLocal: anchorLocal,
             anchorNDC: anchorNDC,
-            tileBaseScale: tileBaseScale,
+            tileToNDC: tileToNDC,
             zoomMantissa: zoomMantissa,
+            zoomExponent: level,
             cosTheta: cosTheta,
             sinTheta: sinTheta,
             padding: 0
