@@ -9,15 +9,20 @@ import SwiftUI
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
+/// **🟢 COMMIT 4: Local Realism**
+/// Strokes are "locally aware" - they only know their position within the current Frame.
+/// They are ignorant of the infinite universe and never see large numbers.
+///
 /// **Key Concept:** Instead of storing absolute world coordinates (which cause precision
 /// issues at high zoom), we store:
-/// - An `origin` (anchor point) in Double precision (absolute world coords)
+/// - An `origin` (anchor point) within the current Frame (Double precision, but always small)
 /// - All vertices as Float offsets from that origin (local coords)
 ///
 /// This ensures the GPU only ever receives small Float values, eliminating precision gaps.
+/// The stroke never needs to know if it exists at 10^100 zoom or 10^-50 zoom.
 struct Stroke {
     let id: UUID
-    let origin: SIMD2<Double>           // Anchor point in world space (Double precision)
+    let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
     let localVertices: [SIMD2<Float>]   // Vertices relative to origin (Float precision)
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
@@ -65,19 +70,20 @@ struct Stroke {
         // 🟢 Calculate shape directly from screen deltas: (ScreenPoint - FirstScreenPoint) / Zoom
         // This preserves perfect smoothness regardless of world coordinates.
         let zoom = zoomAtCreation
-        let cosAngle = Double(cos(-rotationAngle))  // Negative to un-rotate
-        let sinAngle = Double(sin(-rotationAngle))
+        let angle = Double(rotationAngle)
+        let c = cos(angle)
+        let s = sin(angle)
 
         let relativePoints: [SIMD2<Float>] = screenPoints.map { pt in
-            // Screen-space delta (high precision)
             let dx = Double(pt.x) - Double(firstScreenPt.x)
             let dy = Double(pt.y) - Double(firstScreenPt.y)
 
-            // Un-rotate if needed (to match world space orientation)
-            let unrotatedX = dx * cosAngle - dy * sinAngle
-            let unrotatedY = dx * sinAngle + dy * cosAngle
+            // 🟢 FIX: Match the CPU Inverse Rotation (Screen -> World)
+            // Inverse of Shader's CW matrix: [c, s; -s, c]
+            let unrotatedX = dx * c + dy * s
+            let unrotatedY = -dx * s + dy * c
 
-            // Convert to world units by dividing by zoom
+            // Convert to world units
             let worldDx = unrotatedX / zoom
             let worldDy = unrotatedY / zoom
 

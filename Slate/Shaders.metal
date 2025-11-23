@@ -29,10 +29,13 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
     float2 worldRelative = localPositions[vertexID] + transform->relativeOffset;
 
     // Step B: Rotation - Rotate around (0,0) which is now the camera center
+    // 🟢 FIX: Use Standard Clockwise Rotation Matrix
+    // x' = x*cos - y*sin
+    // y' = x*sin + y*cos
     float c = cos(transform->rotationAngle);
     float s = sin(transform->rotationAngle);
-    float rotX =  worldRelative.x * c + worldRelative.y * s;
-    float rotY = -worldRelative.x * s + worldRelative.y * c;
+    float rotX = worldRelative.x * c - worldRelative.y * s;
+    float rotY = worldRelative.x * s + worldRelative.y * c;
 
     // Step C: Zoom - Scale by zoom factor
     float2 zoomed = float2(rotX, rotY) * transform->zoomScale;

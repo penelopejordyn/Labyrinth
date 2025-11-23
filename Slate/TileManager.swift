@@ -16,7 +16,7 @@ class TileManager {
     // MARK: - Debug Mode
 
     /// Enable/disable debug output (toggle with long-press)
-    var debugMode: Bool = true
+    var debugMode: Bool = false
 
     // MARK: - Current Transform State
 

@@ -747,45 +747,37 @@ func screenToWorldPixels_Double(_ p: SIMD2<Float>,
     return SIMD2<Float>(Float(wx), Float(wy))
 }
 
-/// 🟢 PURE DOUBLE PRECISION: Screen pixels -> World pixels
-/// Used for calculating Camera Center and Stroke Origins without truncation.
-/// This is the FINAL precision fix - all inputs and outputs are Double.
+/// 🟢 PURE DOUBLE PRECISION (Pixel Space Rotation)
+/// Converts Screen Pixels -> World Pixels avoiding NDC distortion.
+/// Rotates in PIXEL SPACE to match the shader's pixel-space rotation.
 func screenToWorldPixels_PureDouble(_ p: CGPoint,
                                     viewSize: CGSize,
                                     panOffset: SIMD2<Double>,
                                     zoomScale: Double,
                                     rotationAngle: Float) -> SIMD2<Double> {
-    let W = Double(viewSize.width)
-    let H = Double(viewSize.height)
 
-    // 1. Screen -> NDC (Double)
-    let ndcX = (Double(p.x) / W) * 2.0 - 1.0
-    let ndcY = -((Double(p.y) / H) * 2.0 - 1.0)
+    let center = SIMD2<Double>(Double(viewSize.width) / 2.0, Double(viewSize.height) / 2.0)
+    let screenPt = SIMD2<Double>(Double(p.x), Double(p.y))
 
-    // 2. Unpan in NDC (using Double panOffset)
-    // Note: panOffset is in screen pixels, so we convert it to NDC scaling
-    let panNDCx = (panOffset.x / W) * 2.0
-    let panNDCy = -(panOffset.y / H) * 2.0
+    // 1. Screen offset from center
+    let offsetX = screenPt.x - center.x - panOffset.x
+    let offsetY = screenPt.y - center.y - panOffset.y
 
-    let upX = ndcX - panNDCx
-    let upY = ndcY - panNDCy
-
-    // 3. Unzoom (Double)
-    let uzX = upX / zoomScale
-    let uzY = upY / zoomScale
-
-    // 4. Unrotate (R(-θ))
+    // 2. Unrotate (Inverse of Shader's CW Matrix)
+    // Shader uses: [c, -s; s, c]
+    // Inverse:     [c,  s; -s, c]
     let angle = Double(rotationAngle)
     let c = cos(angle)
     let s = sin(angle)
-    let posX =  uzX * c - uzY * s
-    let posY =  uzX * s + uzY * c
 
-    // 5. NDC -> World Pixels
-    let wx = ((posX + 1.0) * 0.5) * W
-    let wy = ((1.0 - posY) * 0.5) * H
+    let unrotatedX = offsetX * c + offsetY * s
+    let unrotatedY = -offsetX * s + offsetY * c
 
-    return SIMD2<Double>(wx, wy)
+    // 3. Unzoom
+    let worldX = unrotatedX / zoomScale
+    let worldY = unrotatedY / zoomScale
+
+    return SIMD2<Double>(worldX, worldY)
 }
 
 /// Solve the pixel panOffset that keeps `anchorWorld` under `desiredScreen`
@@ -824,38 +816,33 @@ func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
 /// 🟢 HIGH-PRECISION VERSION: Solve for Pan Offset using pure Double precision
 /// This prevents stepping/stuttering at extreme zoom levels (1,000,000x+)
 /// where Float precision (7 digits) is insufficient for smooth camera motion.
+/// Works in PIXEL SPACE to match the new rotation logic.
 func solvePanOffsetForAnchor_Double(anchorWorld: SIMD2<Double>,
                                     desiredScreen: CGPoint,
                                     viewSize: CGSize,
                                     zoomScale: Double,
                                     rotationAngle: Float) -> SIMD2<Double> {
-    let W = Double(viewSize.width)
-    let H = Double(viewSize.height)
+    let center = SIMD2<Double>(Double(viewSize.width) / 2.0, Double(viewSize.height) / 2.0)
 
-    // 1. World -> Model NDC (using Double)
-    let mx = (anchorWorld.x / W) * 2.0 - 1.0
-    let my = -((anchorWorld.y / H) * 2.0 - 1.0)
+    // Forward transform: screen = (world * rot * zoom) + pan + center
+    // Solve for pan: pan = screen - center - (world * rot * zoom)
 
-    // 2. Rotate: R(θ) * m
-    let ang = Double(rotationAngle)
-    let c = cos(ang)
-    let s = sin(ang)
-    let rx =  mx * c + my * s
-    let ry = -mx * s + my * c
+    // 1. Rotate world point using CW matrix [c, -s; s, c]
+    let angle = Double(rotationAngle)
+    let c = cos(angle)
+    let s = sin(angle)
+    let rotatedX = anchorWorld.x * c - anchorWorld.y * s
+    let rotatedY = anchorWorld.x * s + anchorWorld.y * c
 
-    // 3. Desired Screen -> Screen NDC
-    let sNDCx = (Double(desiredScreen.x) / W) * 2.0 - 1.0
-    let sNDCy = -((Double(desiredScreen.y) / H) * 2.0 - 1.0)
+    // 2. Zoom
+    let zoomedX = rotatedX * zoomScale
+    let zoomedY = rotatedY * zoomScale
 
-    // 4. Solve Pan in NDC: panNDC = sNDC - zoom * R*m
-    let panNDCx = sNDCx - zoomScale * rx
-    let panNDCy = sNDCy - zoomScale * ry
+    // 3. Solve for pan
+    let panX = Double(desiredScreen.x) - center.x - zoomedX
+    let panY = Double(desiredScreen.y) - center.y - zoomedY
 
-    // 5. NDC -> Pixel Pan (inverse of shader conversion)
-    let panPx = panNDCx * (W * 0.5)
-    let panPy = -panNDCy * (H * 0.5)
-
-    return SIMD2<Double>(panPx, panPy)
+    return SIMD2<Double>(panX, panY)
 }
 
 
@@ -910,6 +897,9 @@ struct MetalView: UIViewRepresentable {
         var rotationGesture: UIRotationGestureRecognizer!
         var longPressGesture: UILongPressGestureRecognizer!
 
+        // 🟢 COMMIT 4: Debug HUD
+        var debugLabel: UILabel!
+
         // 🟢 UPGRADED: Anchors now use Double for infinite precision at extreme zoom
         var pinchAnchorScreen: CGPoint = .zero
         var pinchAnchorWorld: SIMD2<Double> = .zero
@@ -935,29 +925,28 @@ struct MetalView: UIViewRepresentable {
         func lockAnchor(owner: AnchorOwner, at screenPt: CGPoint, coord: Coordinator) {
             activeOwner = owner
             anchorScreen = screenPt
-            // 🟢 Cast to Float temporarily for legacy screenToWorldPixels function
-            let w = screenToWorldPixels(screenPt,
-                                        viewSize: bounds.size,
-                                        panOffset: SIMD2<Float>(Float(coord.panOffset.x), Float(coord.panOffset.y)),
-                                        zoomScale: Float(coord.zoomScale),
-                                        rotationAngle: coord.rotationAngle)
-            // Store as Double for infinite precision
-            anchorWorld = SIMD2<Double>(Double(w.x), Double(w.y))
+
+            // 🟢 FIX: Use Pure Double precision.
+            // Previously this was using the Float version, causing the "Jump" on rotation.
+            anchorWorld = screenToWorldPixels_PureDouble(screenPt,
+                                                         viewSize: bounds.size,
+                                                         panOffset: coord.panOffset, // SIMD2<Double>
+                                                         zoomScale: coord.zoomScale, // Double
+                                                         rotationAngle: coord.rotationAngle)
         }
 
         // Re-lock anchor to a new screen point *without changing the transform*
         func relockAnchorAtCurrentCentroid(owner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
             activeOwner = owner
             anchorScreen = screenPt
-            // IMPORTANT: recompute world under the *new* centroid using current pan/zoom/rotation.
-            // 🟢 Cast to Float temporarily for legacy screenToWorldPixels function
-            let w = screenToWorldPixels(screenPt,
-                                        viewSize: bounds.size,
-                                        panOffset: SIMD2<Float>(Float(coord.panOffset.x), Float(coord.panOffset.y)),
-                                        zoomScale: Float(coord.zoomScale),
-                                        rotationAngle: coord.rotationAngle)
-            // Store as Double for infinite precision
-            anchorWorld = SIMD2<Double>(Double(w.x), Double(w.y))
+
+            // 🟢 FIX: Use Pure Double precision here too.
+            // This prevents jumps when you add/remove a finger (changing the centroid).
+            anchorWorld = screenToWorldPixels_PureDouble(screenPt,
+                                                         viewSize: bounds.size,
+                                                         panOffset: coord.panOffset,
+                                                         zoomScale: coord.zoomScale,
+                                                         rotationAngle: coord.rotationAngle)
         }
 
         func handoffAnchor(to newOwner: AnchorOwner, screenPt: CGPoint, coord: Coordinator) {
@@ -966,8 +955,177 @@ struct MetalView: UIViewRepresentable {
 
         func clearAnchorIfUnused() { activeOwner = .none }
 
+        // MARK: - 🟢 COMMIT 3: Telescoping Transitions
 
-        
+        /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
+        func checkTelescopingTransitions(coord: Coordinator) {
+            // DRILL DOWN: Zoom exceeded upper limit → Create child frame
+            if coord.zoomScale > 1000.0 {
+                drillDownToNewFrame(coord: coord)
+            }
+            // POP UP: Zoom fell below lower limit → Return to parent frame
+            else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
+                popUpToParentFrame(coord: coord)
+            }
+        }
+
+        /// "The Silent Teleport" - Drill down into a child frame.
+        /// 🟢 FIX: Now searches for existing frames and reuses them to preserve strokes.
+        func drillDownToNewFrame(coord: Coordinator) {
+            // Step 1: Calculate where the camera is looking in the CURRENT frame
+            let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+
+            // 🟢 STEP 2: SEARCH FOR EXISTING FRAME
+            // If we are close to an existing child frame, reuse it.
+            // "Close" means within ~100,000 pixels. Float precision is good up to 16M,
+            // but we balance between avoiding duplicate frames and creating sectors for distant areas.
+            let searchRadius: Double = 100_000.0
+
+            var targetFrame: Frame? = nil
+
+            for child in coord.activeFrame.children {
+                let dist = distance(child.originInParent, cameraCenterWorld)
+                if dist < searchRadius {
+                    targetFrame = child
+                    break
+                }
+            }
+
+            if let existing = targetFrame {
+                // ♻️ RE-ENTER EXISTING FRAME
+                coord.activeFrame = existing
+
+                // 1. Reset Zoom (Relative to frame's natural scale)
+                // If frame was created at 1000x, and we enter at 1000x, local zoom becomes 1.0
+                coord.zoomScale = coord.zoomScale / existing.scaleRelativeToParent
+
+                // 2. Calculate where we are inside this frame
+                // Convert parent position to child position: (parentPos - frameOrigin) * scale
+                let diffX = cameraCenterWorld.x - existing.originInParent.x
+                let diffY = cameraCenterWorld.y - existing.originInParent.y
+
+                let localX = diffX * existing.scaleRelativeToParent
+                let localY = diffY * existing.scaleRelativeToParent
+
+                // 3. 🟢 FIX: Solve for Pan correctly (Handles Rotation & Screen Space)
+                // We want the Center of the Screen to point at (localX, localY)
+                let viewCenterX = Double(bounds.width) / 2.0
+                let viewCenterY = Double(bounds.height) / 2.0
+
+                coord.panOffset = solvePanOffsetForAnchor_Double(
+                    anchorWorld: SIMD2<Double>(localX, localY),
+                    desiredScreen: CGPoint(x: viewCenterX, y: viewCenterY),
+                    viewSize: bounds.size,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+
+                print("♻️ Re-entered existing frame. Depth: \(frameDepth(coord.activeFrame)), Strokes: \(existing.strokes.count)")
+
+            } else {
+                // CREATE NEW UNIVERSE
+                let newFrame = Frame(
+                    parent: coord.activeFrame,
+                    origin: cameraCenterWorld,
+                    scale: coord.zoomScale
+                )
+                coord.activeFrame.children.append(newFrame) // 🟢 Save it!
+
+                coord.activeFrame = newFrame
+                coord.zoomScale = 1.0
+                coord.panOffset = .zero // New frame is centered on us by definition
+
+                print("✨ Created NEW frame. Depth: \(frameDepth(coord.activeFrame))")
+            }
+
+            // Step 4: Re-anchor to prevent jump
+            if activeOwner != .none {
+                // Recalculate anchor in new frame's coordinate system
+                anchorWorld = screenToWorldPixels_PureDouble(
+                    anchorScreen,
+                    viewSize: bounds.size,
+                    panOffset: coord.panOffset,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+            }
+        }
+
+        /// Helper: Calculate Euclidean distance between two points
+        func distance(_ a: SIMD2<Double>, _ b: SIMD2<Double>) -> Double {
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            return sqrt(dx * dx + dy * dy)
+        }
+
+        /// "The Reverse Teleport" - Pop up to the parent frame.
+        /// 🟢 FIX: Now preserves camera position inside the child frame.
+        func popUpToParentFrame(coord: Coordinator) {
+            guard let parent = coord.activeFrame.parent else { return }
+
+            let currentFrame = coord.activeFrame
+
+            // Step 1: Calculate the new zoom in parent space
+            // We're at 0.5x in child, child is 1000x smaller than parent
+            // So we're at 0.5 * 1000 = 500x in parent
+            let newZoom = coord.zoomScale * currentFrame.scaleRelativeToParent
+
+            // 🟢 STEP 2 FIX: Calculate the new pan in parent space
+            // We must account for the camera's movement INSIDE the child frame.
+
+            // Where is the camera inside the child frame? (current position)
+            let cameraPosInChild = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+
+            // Convert Child Position -> Parent Position
+            // Parent = Origin + (Child / Scale)
+            let cameraPosInParentX = currentFrame.originInParent.x + (cameraPosInChild.x / currentFrame.scaleRelativeToParent)
+            let cameraPosInParentY = currentFrame.originInParent.y + (cameraPosInChild.y / currentFrame.scaleRelativeToParent)
+
+            // Solve Pan to center the camera on this point in Parent Space
+            // Using the solver helper for proper rotation handling
+            let viewCenterX = Double(bounds.width) / 2.0
+            let viewCenterY = Double(bounds.height) / 2.0
+
+            let newPanOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: SIMD2<Double>(cameraPosInParentX, cameraPosInParentY),
+                desiredScreen: CGPoint(x: viewCenterX, y: viewCenterY),
+                viewSize: bounds.size,
+                zoomScale: newZoom,
+                rotationAngle: coord.rotationAngle
+            )
+
+            // Step 3: THE HANDOFF - Switch to parent and restore state
+            coord.activeFrame = parent
+            coord.zoomScale = newZoom
+            coord.panOffset = newPanOffset
+
+            // Step 4: Re-anchor to prevent jump
+            if activeOwner != .none {
+                anchorWorld = screenToWorldPixels_PureDouble(
+                    anchorScreen,
+                    viewSize: bounds.size,
+                    panOffset: coord.panOffset,
+                    zoomScale: coord.zoomScale,
+                    rotationAngle: coord.rotationAngle
+                )
+            }
+
+            print("⬆️ Popped up to parent frame. Position preserved. Depth: \(frameDepth(coord.activeFrame))")
+        }
+
+        /// Helper: Calculate the depth of a frame (how many parents it has)
+        func frameDepth(_ frame: Frame) -> Int {
+            var depth = 0
+            var current: Frame? = frame
+            while current?.parent != nil {
+                depth += 1
+                current = current?.parent
+            }
+            return depth
+        }
+
+
+
 
         override init(frame: CGRect, device: MTLDevice?) {
             super.init(frame: frame, device: device)
@@ -999,6 +1157,34 @@ struct MetalView: UIViewRepresentable {
             pinchGesture.delegate = self
             rotationGesture.delegate = self
             longPressGesture.delegate = self
+
+            // 🟢 COMMIT 4: Setup Debug HUD
+            setupDebugHUD()
+        }
+
+        func setupDebugHUD() {
+            debugLabel = UILabel()
+            debugLabel.translatesAutoresizingMaskIntoConstraints = false
+            debugLabel.font = UIFont.monospacedSystemFont(ofSize: 14, weight: .medium)
+            debugLabel.textColor = .white
+            debugLabel.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+            debugLabel.numberOfLines = 0
+            debugLabel.textAlignment = .left
+            debugLabel.layer.cornerRadius = 8
+            debugLabel.layer.masksToBounds = true
+            debugLabel.text = "Frame: 0 | Zoom: 1.0×"
+            debugLabel.isUserInteractionEnabled = false
+
+            // Add padding to the label
+            debugLabel.layoutMargins = UIEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+
+            addSubview(debugLabel)
+
+            // Position in top-left corner with padding
+            NSLayoutConstraint.activate([
+                debugLabel.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 16),
+                debugLabel.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 16)
+            ])
         }
 
         @objc func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -1024,6 +1210,10 @@ struct MetalView: UIViewRepresentable {
                 // 🟢 Normal incremental zoom - multiply using Double precision
                 coord.zoomScale = coord.zoomScale * Double(gesture.scale)
                 gesture.scale = 1.0
+
+                // 🟢 COMMIT 3: TELESCOPING TRANSITIONS
+                // Check if we need to drill down (zoom in) or pop up (zoom out)
+                checkTelescopingTransitions(coord: coord)
 
                 // 🟢 Keep the shared anchor pinned - use Double-precision solver
                 let target = (activeOwner == .pinch) ? loc : anchorScreen
@@ -1179,7 +1369,11 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     var currentTouchPoints: [CGPoint] = []  // Stored in SCREEN space during drawing
     var liveStrokeOrigin: SIMD2<Double>?    // Temporary origin for live stroke (Double precision)
-    var allStrokes: [Stroke] = []
+
+    // 🟢 COMMIT 1: Telescoping Reference Frames
+    // Instead of a flat array, we use a linked list of Frames for infinite zoom
+    let rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
+    lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
     weak var metalView: MTKView?
 
@@ -1218,9 +1412,143 @@ class Coordinator: NSObject, MTKViewDelegate {
         tileManager.viewSize = size
     }
 
-    func draw(in view: MTKView) {
-        let startTime = Date()
+    // MARK: - Commit 2: Recursive Renderer
 
+    /// Recursively render a frame and adjacent depth levels (depth ±1).
+    ///
+    /// **🟢 BIDIRECTIONAL RENDERING:**
+    /// We now render in three layers:
+    /// 1. Parent frame (background - depth -1)
+    /// 2. Current frame (middle layer - depth 0)
+    /// 3. Child frames (foreground details - depth +1)
+    ///
+    /// This ensures strokes remain visible when transitioning between depths.
+    ///
+    /// - Parameters:
+    ///   - frame: The frame to render
+    ///   - cameraCenterInThisFrame: Where the camera is positioned in this frame's coordinate system
+    ///   - viewSize: The view dimensions
+    ///   - currentZoom: The current zoom level (adjusted for each frame level)
+    ///   - currentRotation: The rotation angle
+    ///   - encoder: The Metal render encoder
+    func renderFrame(_ frame: Frame,
+                     cameraCenterInThisFrame: SIMD2<Double>,
+                     viewSize: CGSize,
+                     currentZoom: Double,
+                     currentRotation: Float,
+                     encoder: MTLRenderCommandEncoder) {
+
+        // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
+        if let parent = frame.parent {
+            // Convert camera position from child coordinates to parent coordinates
+            // Formula: parent_pos = originInParent + (child_pos / scale)
+            let cameraCenterInParent = SIMD2<Double>(
+                frame.originInParent.x + (cameraCenterInThisFrame.x / frame.scaleRelativeToParent),
+                frame.originInParent.y + (cameraCenterInThisFrame.y / frame.scaleRelativeToParent)
+            )
+
+            // Zoom in parent frame is reduced (parent is "bigger")
+            let parentZoom = currentZoom / frame.scaleRelativeToParent
+
+            // Optimization: Stop rendering parents if they are too huge/blown out
+            if parentZoom > 0.0001 {
+                renderFrame(parent,
+                           cameraCenterInThisFrame: cameraCenterInParent,
+                           viewSize: viewSize,
+                           currentZoom: parentZoom,
+                           currentRotation: currentRotation,
+                           encoder: encoder)
+            }
+        }
+
+        // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
+        for stroke in frame.strokes {
+            guard !stroke.localVertices.isEmpty else { continue }
+
+            let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
+            let relativeOffset = SIMD2<Float>(
+                Float(relativeOffsetDouble.x),
+                Float(relativeOffsetDouble.y)
+            )
+
+            var transform = StrokeTransform(
+                relativeOffset: relativeOffset,
+                zoomScale: Float(currentZoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: currentRotation
+            )
+
+            drawStroke(stroke, with: &transform, encoder: encoder)
+        }
+
+        // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
+        // 🟢 FIX: Look down into child frames so they don't disappear when zooming out
+        for child in frame.children {
+            // 1. Calculate effective zoom for the child
+            // Child is smaller, so we zoom out (divide by scale)
+            let childZoom = currentZoom / child.scaleRelativeToParent
+
+            // Optimization: Culling
+            // If child is too small to see (< 1 pixel equivalent), skip it
+            if childZoom < 0.001 { continue }
+
+            // 2. Calculate the Frame's offset relative to the camera (in Parent Units)
+            let frameOffsetInParentUnits = child.originInParent - cameraCenterInThisFrame
+
+            // 3. Convert that offset into Child Units
+            // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
+            let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
+
+            // 4. Render each stroke individually
+            for stroke in child.strokes {
+                guard !stroke.localVertices.isEmpty else { continue }
+
+                // 🟢 FIX: Add the Stroke's own origin to the Frame's offset
+                // Before, this was missing 'stroke.origin', collapsing everything to (0,0)
+                let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
+
+                var childTransform = StrokeTransform(
+                    relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
+                    zoomScale: Float(childZoom),
+                    screenWidth: Float(viewSize.width),
+                    screenHeight: Float(viewSize.height),
+                    rotationAngle: currentRotation
+                )
+
+                drawStroke(stroke, with: &childTransform, encoder: encoder)
+            }
+
+            // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
+            // Just immediate children (depth +1) is enough for visual continuity
+        }
+    }
+
+    /// Helper to draw a stroke with a given transform.
+    /// Reduces code duplication across parent/current/child rendering.
+    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, encoder: MTLRenderCommandEncoder) {
+        guard !stroke.localVertices.isEmpty else { return }
+
+        let vertexBuffer = device.makeBuffer(
+            bytes: stroke.localVertices,
+            length: stroke.localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
+            options: .storageModeShared
+        )
+
+        let transformBuffer = device.makeBuffer(
+            bytes: &transform,
+            length: MemoryLayout<StrokeTransform>.stride,
+            options: .storageModeShared
+        )
+
+        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        encoder.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+        encoder.drawPrimitives(type: .triangle,
+                             vertexStart: 0,
+                             vertexCount: stroke.localVertices.count)
+    }
+
+    func draw(in view: MTKView) {
         // Update tile manager view size (only changes when view resizes)
         if tileManager.viewSize != view.bounds.size {
             tileManager.viewSize = view.bounds.size
@@ -1230,52 +1558,44 @@ class Coordinator: NSObject, MTKViewDelegate {
         // This is the "View Center" - where the center of the screen is in the infinite world.
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        var allVertices: [SIMD2<Float>] = []
-        var allTransforms: [StrokeTransform] = []
+        // 🟢 COMMIT 2: Start rendering pipeline
+        let commandBuffer = commandQueue.makeCommandBuffer()!
+        guard let rpd = view.currentRenderPassDescriptor else { return }
+        let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
+        enc.setRenderPipelineState(pipelineState)
+        enc.setCullMode(.none)
 
-        // COMMITTED STROKES: Calculate relative offset for each stroke
-        for stroke in allStrokes {
-            guard !stroke.localVertices.isEmpty else { continue }
+        // 🟢 COMMIT 2: RECURSIVE RENDERING
+        // Render all committed strokes using the recursive renderer
+        // This will automatically render parent frames (background) before the active frame (foreground)
+        renderFrame(activeFrame,
+                   cameraCenterInThisFrame: cameraCenterWorld,
+                   viewSize: view.bounds.size,
+                   currentZoom: zoomScale,
+                   currentRotation: rotationAngle,
+                   encoder: enc)
 
-            // THE GREAT SUBTRACTION™ (in Double precision on CPU!)
-            // This is the critical operation that prevents precision loss.
-            let relativeOffsetDouble = stroke.origin - cameraCenterWorld
-            let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
-                                             Float(relativeOffsetDouble.y))
-
-            // Create per-stroke transform
-            // 🟢 Cast Double to Float only here, at the GPU boundary
-            let transform = StrokeTransform(
-                relativeOffset: relativeOffset,
-                zoomScale: Float(zoomScale),
-                screenWidth: Float(view.bounds.width),
-                screenHeight: Float(view.bounds.height),
-                rotationAngle: rotationAngle
-            )
-
-            allVertices.append(contentsOf: stroke.localVertices)
-            allTransforms.append(transform)
-        }
-
-        // PHASE 5: LIVE STROKE with Screen-Space Deltas
+        // 🟢 COMMIT 2: LIVE STROKE RENDERING
+        // Live strokes are rendered on top of all committed strokes (foreground)
         if currentTouchPoints.count >= 2, let tempOrigin = liveStrokeOrigin {
-            // 🟢 NEW: Calculate geometry using screen-space deltas (infinite precision)
+            // Calculate geometry using screen-space deltas (infinite precision)
             // Formula: (ScreenPoint - FirstScreenPoint) / Zoom
             let firstScreenPt = currentTouchPoints[0]
             let zoom = Double(zoomScale)
-            let cosAngle = Double(cos(-rotationAngle))
-            let sinAngle = Double(sin(-rotationAngle))
+            let angle = Double(rotationAngle)
+            let c = cos(angle)
+            let s = sin(angle)
 
             let localPoints = currentTouchPoints.map { pt in
-                // Screen-space delta (high precision)
                 let dx = Double(pt.x) - Double(firstScreenPt.x)
                 let dy = Double(pt.y) - Double(firstScreenPt.y)
 
-                // Un-rotate to match world space orientation
-                let unrotatedX = dx * cosAngle - dy * sinAngle
-                let unrotatedY = dx * sinAngle + dy * cosAngle
+                // Match the CPU Inverse Rotation (Screen -> World)
+                // Inverse of Shader's CW matrix: [c, s; -s, c]
+                let unrotatedX = dx * c + dy * s
+                let unrotatedY = -dx * s + dy * c
 
-                // Convert to world units by dividing by zoom
+                // Convert to world units
                 let worldDx = unrotatedX / zoom
                 let worldDy = unrotatedY / zoom
 
@@ -1288,14 +1608,20 @@ class Coordinator: NSObject, MTKViewDelegate {
                 width: 10.0  // Constant 10px width in world units
             )
 
+            guard !localVertices.isEmpty else {
+                enc.endEncoding()
+                commandBuffer.present(view.currentDrawable!)
+                commandBuffer.commit()
+                return
+            }
+
             // Calculate relative offset for live stroke
             let relativeOffsetDouble = tempOrigin - cameraCenterWorld
             let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
                                              Float(relativeOffsetDouble.y))
 
             // Create transform for live stroke
-            // 🟢 Cast Double to Float only here, at the GPU boundary
-            let liveTransform = StrokeTransform(
+            var liveTransform = StrokeTransform(
                 relativeOffset: relativeOffset,
                 zoomScale: Float(zoomScale),
                 screenWidth: Float(view.bounds.width),
@@ -1303,88 +1629,82 @@ class Coordinator: NSObject, MTKViewDelegate {
                 rotationAngle: rotationAngle
             )
 
-            allVertices.append(contentsOf: localVertices)
-            allTransforms.append(liveTransform)
-        }
-
-        let tessellationTime = Date().timeIntervalSince(startTime)
-        if tessellationTime > 0.016 {
-            print("⚠️ Tessellation taking \(String(format: "%.1f", tessellationTime * 1000))ms - \(allStrokes.count) strokes")
-        }
-
-        // PHASE 4: Render with per-stroke transforms
-        guard !allVertices.isEmpty, !allTransforms.isEmpty else { return }
-
-        let commandBuffer = commandQueue.makeCommandBuffer()!
-        guard let rpd = view.currentRenderPassDescriptor else { return }
-        let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-        enc.setRenderPipelineState(pipelineState)
-        enc.setCullMode(.none)
-
-        // Render each stroke separately with its own transform
-        var vertexOffset = 0
-        for (index, stroke) in allStrokes.enumerated() {
-            guard index < allTransforms.count else { break }
-            let vertexCount = stroke.localVertices.count
-
-            // Create vertex buffer for this stroke
+            // Create buffers and render
             let vertexBuffer = device.makeBuffer(
-                bytes: stroke.localVertices,
-                length: vertexCount * MemoryLayout<SIMD2<Float>>.stride,
+                bytes: localVertices,
+                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
                 options: .storageModeShared
             )
 
-            // Create transform buffer for this stroke
-            var transform = allTransforms[index]
             let transformBuffer = device.makeBuffer(
-                bytes: &transform,
+                bytes: &liveTransform,
                 length: MemoryLayout<StrokeTransform>.stride,
                 options: .storageModeShared
             )
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-
-            vertexOffset += vertexCount
-        }
-
-        // Render live stroke if present
-        if currentTouchPoints.count >= 2,
-           liveStrokeOrigin != nil,
-           allTransforms.count > allStrokes.count {
-            // Extract live stroke vertices (last appended)
-            let liveVertexCount = allVertices.count - vertexOffset
-            let liveVertices = Array(allVertices.suffix(liveVertexCount))
-
-            guard liveVertexCount > 0 else {
-                enc.endEncoding()
-                commandBuffer.present(view.currentDrawable!)
-                commandBuffer.commit()
-                return
-            }
-
-            let vertexBuffer = device.makeBuffer(
-                bytes: liveVertices,
-                length: liveVertexCount * MemoryLayout<SIMD2<Float>>.stride,
-                options: .storageModeShared
-            )
-
-            var transform = allTransforms[allTransforms.count - 1]
-            let transformBuffer = device.makeBuffer(
-                bytes: &transform,
-                length: MemoryLayout<StrokeTransform>.stride,
-                options: .storageModeShared
-            )
-
-            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveVertexCount)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
         }
 
         enc.endEncoding()
         commandBuffer.present(view.currentDrawable!)
         commandBuffer.commit()
+
+        // 🟢 COMMIT 4: Update Debug HUD
+        updateDebugHUD(view: view)
+    }
+
+    /// Update the debug HUD with current frame depth and zoom level
+    func updateDebugHUD(view: MTKView) {
+        // Access debugLabel through the stored metalView reference
+        guard let mtkView = metalView else { return }
+
+        // Find the debug label subview
+        guard let debugLabel = mtkView.subviews.compactMap({ $0 as? UILabel }).first else { return }
+
+        // Calculate frame depth
+        var depth = 0
+        var current: Frame? = activeFrame
+        while current?.parent != nil {
+            depth += 1
+            current = current?.parent
+        }
+
+        // Format zoom scale nicely
+        let zoomText: String
+        if zoomScale >= 1000.0 {
+            zoomText = String(format: "%.1fk×", zoomScale / 1000.0)
+        } else if zoomScale >= 1.0 {
+            zoomText = String(format: "%.1f×", zoomScale)
+        } else {
+            zoomText = String(format: "%.3f×", zoomScale)
+        }
+
+        // Calculate effective zoom (depth multiplier)
+        let effectiveZoom = pow(1000.0, Double(depth)) * zoomScale
+        let effectiveText: String
+        if effectiveZoom >= 1e12 {
+            let exponent = Int(log10(effectiveZoom))
+            effectiveText = String(format: "10^%d", exponent)
+        } else if effectiveZoom >= 1e9 {
+            effectiveText = String(format: "%.1fB×", effectiveZoom / 1e9)
+        } else if effectiveZoom >= 1e6 {
+            effectiveText = String(format: "%.1fM×", effectiveZoom / 1e6)
+        } else if effectiveZoom >= 1e3 {
+            effectiveText = String(format: "%.1fk×", effectiveZoom / 1e3)
+        } else {
+            effectiveText = String(format: "%.1f×", effectiveZoom)
+        }
+
+        // Update label on main thread
+        DispatchQueue.main.async {
+            debugLabel.text = """
+            Depth: \(depth) | Zoom: \(zoomText)
+            Effective: \(effectiveText)
+            Strokes: \(self.activeFrame.strokes.count)
+            """
+        }
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -1422,7 +1742,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     /// Calculate the camera center in world coordinates using Double precision.
     /// This is the inverse of the pan/zoom/rotate transform applied to strokes.
-    private func calculateCameraCenterWorld(viewSize: CGSize) -> SIMD2<Double> {
+    func calculateCameraCenterWorld(viewSize: CGSize) -> SIMD2<Double> {
         // The center of the screen in screen coordinates
         let screenCenter = CGPoint(x: viewSize.width / 2.0, y: viewSize.height / 2.0)
 
@@ -1528,7 +1848,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                             rotationAngle: rotationAngle,
                             color: SIMD4<Float>(1.0, 0.0, 0.0, 1.0))
 
-        allStrokes.append(stroke)
+        activeFrame.strokes.append(stroke)
         currentTouchPoints = []
         liveStrokeOrigin = nil  // Clear temporary origin
     }
