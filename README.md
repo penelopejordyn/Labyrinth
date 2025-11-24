@@ -13,11 +13,11 @@ Slate demonstrates how to build a high-performance drawing app that breaks the t
 
 ## Features
 
-  - ✅ **True Infinite Zoom** - Zoom seamlessly from the macro to the micro (and back) without jitter or limits.
-  - ✅ **Smooth Stroke Rendering** - Catmull-Rom spline interpolation for high-quality curves.
-  - ✅ **Two-Finger Pan Navigation** - Intuitive canvas navigation without interfering with drawing.
-  - ✅ **Recursive Rendering** - Visual continuity across depth levels (seeing parent drawings in the background).
-  - ✅ **High Performance** - 60fps Metal rendering with precision-managed coordinate systems.
+  - **True Infinite Zoom** - Zoom seamlessly from the macro to the micro (and back) without jitter or limits.
+  - **Smooth Stroke Rendering** - Catmull-Rom spline interpolation for high-quality curves.
+  - **Two-Finger Pan Navigation** - Intuitive canvas navigation without interfering with drawing.
+  - **Recursive Rendering** - Visual continuity across depth levels (seeing parent drawings in the background).
+  - **High Performance** - 60fps Metal rendering with precision-managed coordinate systems.
 
 ## Architecture Highlights
 
