@@ -958,34 +958,48 @@ struct MetalView: UIViewRepresentable {
         // MARK: - 🟢 COMMIT 3: Telescoping Transitions
 
         /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
-        func checkTelescopingTransitions(coord: Coordinator) {
+        /// Returns TRUE if a transition occurred (caller should return early).
+        func checkTelescopingTransitions(coord: Coordinator, currentCentroid: CGPoint) -> Bool {
             // DRILL DOWN: Zoom exceeded upper limit → Create child frame
             if coord.zoomScale > 1000.0 {
-                drillDownToNewFrame(coord: coord)
+                // 🟢 Pass the shared anchor instead of recomputing
+                drillDownToNewFrame(coord: coord,
+                                   anchorWorld: anchorWorld,
+                                   anchorScreen: anchorScreen)
+                return true // 🟢 Transition happened
             }
             // POP UP: Zoom fell below lower limit → Return to parent frame
             else if coord.zoomScale < 0.5, coord.activeFrame.parent != nil {
-                popUpToParentFrame(coord: coord)
+                // 🟢 Pass the shared anchor instead of recomputing
+                popUpToParentFrame(coord: coord,
+                                  anchorWorld: anchorWorld,
+                                  anchorScreen: anchorScreen)
+                return true // 🟢 Transition happened
             }
+
+            return false // No change
         }
 
         /// "The Silent Teleport" - Drill down into a child frame.
-        /// 🟢 FIX: Now searches for existing frames and reuses them to preserve strokes.
-        func drillDownToNewFrame(coord: Coordinator) {
-            // Step 1: Calculate where the camera is looking in the CURRENT frame
-            let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+        /// 🟢 FIX: Uses the shared anchor instead of recomputing to prevent micro-jumps.
+        func drillDownToNewFrame(coord: Coordinator,
+                                 anchorWorld: SIMD2<Double>,
+                                 anchorScreen: CGPoint) {
+            // 1. CAPTURE STATE (CRITICAL: Do this BEFORE resetting zoom)
+            let currentZoom = coord.zoomScale // This should be ~1000.0
 
-            // 🟢 STEP 2: SEARCH FOR EXISTING FRAME
-            // If we are close to an existing child frame, reuse it.
-            // "Close" means within ~100,000 pixels. Float precision is good up to 16M,
-            // but we balance between avoiding duplicate frames and creating sectors for distant areas.
-            let searchRadius: Double = 100_000.0
+            // 2. USE THE EXACT ANCHOR (Don't recompute from screen!)
+            // This is the key fix - we use the exact same world point that the gesture handler
+            // has been tracking, preventing floating point discrepancies.
+            let pinchPointWorld = anchorWorld // EXACT same world point as gesture anchor
+            let currentCentroid = anchorScreen // Reuse for solving pan
+
+            // 3. Search radius: Keep it reasonable to avoid snapping to far-away frames
+            let searchRadius: Double = 50.0
 
             var targetFrame: Frame? = nil
-
             for child in coord.activeFrame.children {
-                let dist = distance(child.originInParent, cameraCenterWorld)
-                if dist < searchRadius {
+                if distance(child.originInParent, pinchPointWorld) < searchRadius {
                     targetFrame = child
                     break
                 }
@@ -995,59 +1009,72 @@ struct MetalView: UIViewRepresentable {
                 // ♻️ RE-ENTER EXISTING FRAME
                 coord.activeFrame = existing
 
-                // 1. Reset Zoom (Relative to frame's natural scale)
-                // If frame was created at 1000x, and we enter at 1000x, local zoom becomes 1.0
-                coord.zoomScale = coord.zoomScale / existing.scaleRelativeToParent
+                // 4. Calculate where the FINGER is inside this frame
+                // LocalPinch = (ParentPinch - Origin) * Scale
+                let diffX = pinchPointWorld.x - existing.originInParent.x
+                let diffY = pinchPointWorld.y - existing.originInParent.y
 
-                // 2. Calculate where we are inside this frame
-                // Convert parent position to child position: (parentPos - frameOrigin) * scale
-                let diffX = cameraCenterWorld.x - existing.originInParent.x
-                let diffY = cameraCenterWorld.y - existing.originInParent.y
+                let localPinchX = diffX * existing.scaleRelativeToParent
+                let localPinchY = diffY * existing.scaleRelativeToParent
 
-                let localX = diffX * existing.scaleRelativeToParent
-                let localY = diffY * existing.scaleRelativeToParent
+                // 5. RESET ZOOM
+                // We do this AFTER calculating positions
+                coord.zoomScale = currentZoom / existing.scaleRelativeToParent
 
-                // 3. 🟢 FIX: Solve for Pan correctly (Handles Rotation & Screen Space)
-                // We want the Center of the Screen to point at (localX, localY)
-                let viewCenterX = Double(bounds.width) / 2.0
-                let viewCenterY = Double(bounds.height) / 2.0
-
+                // 6. SOLVE PAN
                 coord.panOffset = solvePanOffsetForAnchor_Double(
-                    anchorWorld: SIMD2<Double>(localX, localY),
-                    desiredScreen: CGPoint(x: viewCenterX, y: viewCenterY),
+                    anchorWorld: SIMD2<Double>(localPinchX, localPinchY),
+                    desiredScreen: currentCentroid,
                     viewSize: bounds.size,
-                    zoomScale: coord.zoomScale,
+                    zoomScale: coord.zoomScale, // Now ~1.0
                     rotationAngle: coord.rotationAngle
                 )
 
-                print("♻️ Re-entered existing frame. Depth: \(frameDepth(coord.activeFrame)), Strokes: \(existing.strokes.count)")
+                print("♻️ Re-entered frame. Strokes: \(existing.strokes.count)")
 
             } else {
-                // CREATE NEW UNIVERSE
+                // ✨ CREATE NEW FRAME
+                let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+
                 let newFrame = Frame(
                     parent: coord.activeFrame,
                     origin: cameraCenterWorld,
-                    scale: coord.zoomScale
+                    scale: currentZoom // Use captured high zoom
                 )
-                coord.activeFrame.children.append(newFrame) // 🟢 Save it!
+                coord.activeFrame.children.append(newFrame)
 
                 coord.activeFrame = newFrame
                 coord.zoomScale = 1.0
-                coord.panOffset = .zero // New frame is centered on us by definition
 
-                print("✨ Created NEW frame. Depth: \(frameDepth(coord.activeFrame))")
+                // Calculate pan to keep finger stable
+                let diffX = pinchPointWorld.x - cameraCenterWorld.x
+                let diffY = pinchPointWorld.y - cameraCenterWorld.y
+
+                // In new frame space (scale = currentZoom):
+                let localPinchX = diffX * currentZoom
+                let localPinchY = diffY * currentZoom
+
+                coord.panOffset = solvePanOffsetForAnchor_Double(
+                    anchorWorld: SIMD2<Double>(localPinchX, localPinchY),
+                    desiredScreen: currentCentroid,
+                    viewSize: bounds.size,
+                    zoomScale: 1.0,
+                    rotationAngle: coord.rotationAngle
+                )
+
+                print("✨ Created NEW frame.")
             }
 
-            // Step 4: Re-anchor to prevent jump
+            // 7. RE-ANCHOR GESTURES (update with new coordinate system)
             if activeOwner != .none {
-                // Recalculate anchor in new frame's coordinate system
-                anchorWorld = screenToWorldPixels_PureDouble(
-                    anchorScreen,
+                self.anchorWorld = screenToWorldPixels_PureDouble(
+                    currentCentroid,
                     viewSize: bounds.size,
                     panOffset: coord.panOffset,
                     zoomScale: coord.zoomScale,
                     rotationAngle: coord.rotationAngle
                 )
+                self.anchorScreen = currentCentroid
             }
         }
 
@@ -1059,58 +1086,54 @@ struct MetalView: UIViewRepresentable {
         }
 
         /// "The Reverse Teleport" - Pop up to the parent frame.
-        /// 🟢 FIX: Now preserves camera position inside the child frame.
-        func popUpToParentFrame(coord: Coordinator) {
+        /// 🟢 FIX: Uses the shared anchor instead of recomputing to prevent micro-jumps.
+        func popUpToParentFrame(coord: Coordinator,
+                                anchorWorld: SIMD2<Double>,
+                                anchorScreen: CGPoint) {
             guard let parent = coord.activeFrame.parent else { return }
 
             let currentFrame = coord.activeFrame
 
-            // Step 1: Calculate the new zoom in parent space
-            // We're at 0.5x in child, child is 1000x smaller than parent
-            // So we're at 0.5 * 1000 = 500x in parent
+            // 1. Calculate new zoom in parent space
             let newZoom = coord.zoomScale * currentFrame.scaleRelativeToParent
 
-            // 🟢 STEP 2 FIX: Calculate the new pan in parent space
-            // We must account for the camera's movement INSIDE the child frame.
+            // 2. USE THE EXACT ANCHOR (Don't recompute from screen!)
+            // This is in the active (child) frame's coordinates
+            let pinchPosInChild = anchorWorld
+            let currentCentroid = anchorScreen
 
-            // Where is the camera inside the child frame? (current position)
-            let cameraPosInChild = coord.calculateCameraCenterWorld(viewSize: bounds.size)
-
-            // Convert Child Position -> Parent Position
+            // 3. Convert Child Pinch Position -> Parent Pinch Position
             // Parent = Origin + (Child / Scale)
-            let cameraPosInParentX = currentFrame.originInParent.x + (cameraPosInChild.x / currentFrame.scaleRelativeToParent)
-            let cameraPosInParentY = currentFrame.originInParent.y + (cameraPosInChild.y / currentFrame.scaleRelativeToParent)
+            let pinchPosInParentX = currentFrame.originInParent.x + (pinchPosInChild.x / currentFrame.scaleRelativeToParent)
+            let pinchPosInParentY = currentFrame.originInParent.y + (pinchPosInChild.y / currentFrame.scaleRelativeToParent)
 
-            // Solve Pan to center the camera on this point in Parent Space
-            // Using the solver helper for proper rotation handling
-            let viewCenterX = Double(bounds.width) / 2.0
-            let viewCenterY = Double(bounds.height) / 2.0
-
+            // 4. Solve Pan to lock FINGER position
             let newPanOffset = solvePanOffsetForAnchor_Double(
-                anchorWorld: SIMD2<Double>(cameraPosInParentX, cameraPosInParentY),
-                desiredScreen: CGPoint(x: viewCenterX, y: viewCenterY),
+                anchorWorld: SIMD2<Double>(pinchPosInParentX, pinchPosInParentY),
+                desiredScreen: currentCentroid,
                 viewSize: bounds.size,
                 zoomScale: newZoom,
                 rotationAngle: coord.rotationAngle
             )
 
-            // Step 3: THE HANDOFF - Switch to parent and restore state
+            // 5. THE HANDOFF - Switch to parent
             coord.activeFrame = parent
             coord.zoomScale = newZoom
             coord.panOffset = newPanOffset
 
-            // Step 4: Re-anchor to prevent jump
+            // 6. RE-ANCHOR GESTURES (update with new coordinate system)
             if activeOwner != .none {
-                anchorWorld = screenToWorldPixels_PureDouble(
-                    anchorScreen,
+                self.anchorWorld = screenToWorldPixels_PureDouble(
+                    currentCentroid,
                     viewSize: bounds.size,
                     panOffset: coord.panOffset,
                     zoomScale: coord.zoomScale,
                     rotationAngle: coord.rotationAngle
                 )
+                self.anchorScreen = currentCentroid
             }
 
-            print("⬆️ Popped up to parent frame. Position preserved. Depth: \(frameDepth(coord.activeFrame))")
+            print("⬆️ Popped up to parent frame. Depth: \(frameDepth(coord.activeFrame))")
         }
 
         /// Helper: Calculate the depth of a frame (how many parents it has)
@@ -1213,9 +1236,16 @@ struct MetalView: UIViewRepresentable {
 
                 // 🟢 COMMIT 3: TELESCOPING TRANSITIONS
                 // Check if we need to drill down (zoom in) or pop up (zoom out)
-                checkTelescopingTransitions(coord: coord)
+                // Pass the current touch centroid to anchor transitions to finger position
+                // 🟢 FIX: If we switched frames, STOP here.
+                // The transition logic has already calculated the perfect panOffset
+                // to keep the finger pinned. Running the standard solver below
+                // would overwrite it with a "glitched" value.
+                if checkTelescopingTransitions(coord: coord, currentCentroid: loc) {
+                    return
+                }
 
-                // 🟢 Keep the shared anchor pinned - use Double-precision solver
+                // Standard Solver (Only runs if we did NOT switch frames)
                 let target = (activeOwner == .pinch) ? loc : anchorScreen
                 coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
                                                                  desiredScreen: target,
@@ -1448,7 +1478,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             )
 
             // Zoom in parent frame is reduced (parent is "bigger")
-            let parentZoom = currentZoom / frame.scaleRelativeToParent
+            let parentZoom = currentZoom * frame.scaleRelativeToParent
 
             // Optimization: Stop rendering parents if they are too huge/blown out
             if parentZoom > 0.0001 {
@@ -1697,12 +1727,17 @@ class Coordinator: NSObject, MTKViewDelegate {
             effectiveText = String(format: "%.1f×", effectiveZoom)
         }
 
+        // Calculate camera position in current frame
+        let cameraPos = calculateCameraCenterWorld(viewSize: view.bounds.size)
+        let cameraPosText = String(format: "(%.1f, %.1f)", cameraPos.x, cameraPos.y)
+
         // Update label on main thread
         DispatchQueue.main.async {
             debugLabel.text = """
             Depth: \(depth) | Zoom: \(zoomText)
             Effective: \(effectiveText)
             Strokes: \(self.activeFrame.strokes.count)
+            Camera: \(cameraPosText)
             """
         }
     }
