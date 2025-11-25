@@ -1,10 +1,4 @@
-//
-//  SlateApp.swift
-//  Slate
-//
-//  Created by Penny Marshall on 10/27/25.
-//
-
+// SlateApp.swift bootstraps the Slate application, providing the entry point and root scene.
 import SwiftUI
 
 @main

@@ -1,15 +1,9 @@
-//
-//  Stroke.swift
-//  Slate
-//
-//  Created by Penny Marshall on 10/28/25.
-//
-
+// Stroke.swift models pen and pencil strokes, including coordinate transforms and tessellation helpers.
 import SwiftUI
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
-/// **🟢 COMMIT 4: Local Realism**
+/// ** COMMIT 4: Local Realism**
 /// Strokes are "locally aware" - they only know their position within the current Frame.
 /// They are ignorant of the infinite universe and never see large numbers.
 ///
@@ -39,7 +33,7 @@ struct Stroke {
     ///   - viewSize: View dimensions
     ///   - rotationAngle: Camera rotation angle
     ///   - color: Stroke color
-    /// 🟢 UPGRADED: Now accepts Double for zoom and pan to maintain precision
+    ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
     init(screenPoints: [CGPoint],
          zoomAtCreation: Double,
          panAtCreation: SIMD2<Double>,
@@ -56,7 +50,7 @@ struct Stroke {
             return
         }
 
-        // 1. CALCULATE ORIGIN (ABSOLUTE) - 🟢 HIGH PRECISION FIX
+        // 1. CALCULATE ORIGIN (ABSOLUTE) -  HIGH PRECISION FIX
         // We still need the absolute world position for the anchor, so we know WHERE the stroke is.
         // Only convert the FIRST point to world coordinates.
         // Use the Pure Double helper so the anchor is precise at 1,000,000x zoom
@@ -67,7 +61,7 @@ struct Stroke {
                                                      rotationAngle: rotationAngle)
 
         // 2. CALCULATE GEOMETRY (RELATIVE) - THE FIX for Double precision
-        // 🟢 Calculate shape directly from screen deltas: (ScreenPoint - FirstScreenPoint) / Zoom
+        //  Calculate shape directly from screen deltas: (ScreenPoint - FirstScreenPoint) / Zoom
         // This preserves perfect smoothness regardless of world coordinates.
         let zoom = zoomAtCreation
         let angle = Double(rotationAngle)
@@ -78,7 +72,7 @@ struct Stroke {
             let dx = Double(pt.x) - Double(firstScreenPt.x)
             let dy = Double(pt.y) - Double(firstScreenPt.y)
 
-            // 🟢 FIX: Match the CPU Inverse Rotation (Screen -> World)
+            //  FIX: Match the CPU Inverse Rotation (Screen -> World)
             // Inverse of Shader's CW matrix: [c, s; -s, c]
             let unrotatedX = dx * c + dy * s
             let unrotatedY = -dx * s + dy * c

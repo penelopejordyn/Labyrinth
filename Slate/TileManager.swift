@@ -1,9 +1,4 @@
-//
-//  TileManager.swift
-//
-//  Created by Penny Marshall on 11/13/25.
-//
-
+// TileManager.swift manages the floating reference tiling grid used for infinite zoom and pan.
 import Foundation
 import CoreGraphics
 
@@ -95,7 +90,7 @@ class TileManager {
     /// Example at zoom 1,000,000x:
     /// - widthWorld = 10.0 / 1,000,000 = 0.00001 world pixels
     /// - level = 20, tileSize = 1024 / 2^20 = 0.000976 world pixels
-    /// - widthTile = 0.00001 / 0.000976 = 0.0102 tile units ✅
+    /// - widthTile = 0.00001 / 0.000976 = 0.0102 tile units 
     ///
     /// This keeps width in a stable range (~0.01) regardless of zoom!
     ///
@@ -218,7 +213,7 @@ class TileManager {
         let tileSizeWorld = tileSizeForLevel(tileKey.level)
 
         var output = """
-        🎯 TOUCH EVENT (Grid-Based Tiling)
+         TOUCH EVENT (Grid-Based Tiling)
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         Zoom State:
           Scale: \(currentZoomScale)x
@@ -241,9 +236,9 @@ class TileManager {
 
         // Check if coordinates are in valid range
         if localPoint.x < 0 || localPoint.x > 1024 || localPoint.y < 0 || localPoint.y > 1024 {
-            output += "\n  ⚠️ WARNING: OUT OF RANGE!"
+            output += "\n   WARNING: OUT OF RANGE!"
         } else {
-            output += "\n  ✅ Coordinates in valid range [0, 1024]"
+            output += "\n   Coordinates in valid range [0, 1024]"
         }
 
         output += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
