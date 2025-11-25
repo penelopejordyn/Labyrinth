@@ -1,10 +1,4 @@
-//
-//  TileKey.swift
-//  Slate
-//
-//  Created by Penny Marshall on 11/13/25.
-//
-
+// TileKey.swift defines the tile addressing structure used by the tiling system.
 import Foundation
 
 /// Represents a unique tile address using a simple grid-based system.

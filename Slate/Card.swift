@@ -1,10 +1,4 @@
-//
-//  Card.swift
-//  Slate
-//
-//  Created by Penny Marshall on 11/24/25.
-//
-
+// Card.swift defines the Card model, covering metadata, stroke contents, and size/transform state.
 import SwiftUI
 import Metal
 

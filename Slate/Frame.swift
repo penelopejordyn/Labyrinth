@@ -1,10 +1,6 @@
-//
-//  Frame.swift
-//  Slate
-//
-//  Commit 1: The Data Model
-//  Telescoping Reference Frames for Infinite Zoom
-//
+// Frame.swift defines the Frame data model used for telescoping reference frames
+// that enable hierarchical zooming without precision loss.
+
 //  A "Frame" is a Local Universe - a coordinate system that stays bounded.
 //  By chaining Frames together (parent → child), we achieve infinite zoom
 //  without ever exceeding Double precision limits.
@@ -43,7 +39,7 @@ class Frame: Identifiable {
     /// This tells us: "1 unit in parent space = 1000 units in this frame"
     var scaleRelativeToParent: Double
 
-    /// 🟢 COMMIT 4 FIX: Track the sub-universes created inside this frame
+    ///  COMMIT 4 FIX: Track the sub-universes created inside this frame
     /// This allows us to re-enter existing frames instead of creating parallel universes
     var children: [Frame] = []
 

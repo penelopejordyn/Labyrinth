@@ -1,10 +1,4 @@
-//
-//  CatmullRom.swift
-//  Slate
-//
-//  Created by Penny Marshall on 10/28/25.
-//
-
+// CatmullRom.swift implements Catmull-Rom spline sampling utilities for smooth stroke interpolation.
 import Foundation
 import CoreGraphics
 

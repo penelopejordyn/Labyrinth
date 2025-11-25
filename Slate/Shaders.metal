@@ -1,10 +1,4 @@
-//
-//  Shaders.metal
-//  Slate
-//
-//  Created by Penny Marshall on 10/27/25.
-//
-
+// Shaders.metal houses the Metal shading functions for strokes, cards, and color utilities.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -29,7 +23,7 @@ vertex float4 vertex_main(uint vertexID [[vertex_id]],
     float2 worldRelative = localPositions[vertexID] + transform->relativeOffset;
 
     // Step B: Rotation - Rotate around (0,0) which is now the camera center
-    // 🟢 FIX: Use Standard Clockwise Rotation Matrix
+    //  FIX: Use Standard Clockwise Rotation Matrix
     // x' = x*cos - y*sin
     // y' = x*sin + y*cos
     float c = cos(transform->rotationAngle);

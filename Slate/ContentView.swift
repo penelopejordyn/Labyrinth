@@ -1,10 +1,4 @@
-//
-//  ContentView.swift
-//  Slate
-//
-//  Created by Penny Marshall on 10/27/25.
-//
-
+// ContentView.swift wires the SwiftUI interface, hosting the toolbar and MetalView canvas binding.
 import SwiftUI
 
 struct ContentView: View {
@@ -18,11 +12,11 @@ struct ContentView: View {
 
             // Add Card Button
             Button(action: {
-                print("🔘 Add Card button tapped")
+                print(" Add Card button tapped")
                 if metalViewCoordinator == nil {
-                    print("❌ ERROR: Coordinator is nil!")
+                    print(" ERROR: Coordinator is nil!")
                 } else {
-                    print("✅ Coordinator exists, calling addCard()")
+                    print(" Coordinator exists, calling addCard()")
                     metalViewCoordinator?.addCard()
                 }
             }) {
