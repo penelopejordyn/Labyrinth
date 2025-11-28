@@ -2,6 +2,15 @@
 import SwiftUI
 import Metal
 
+/// A sub-section of a stroke for geometry chunking.
+/// Large strokes are divided into chunks to enable sub-stroke culling.
+/// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
+struct StrokeChunk {
+    let vertexStart: Int
+    let vertexCount: Int
+    let boundingBox: CGRect
+}
+
 /// A stroke on the infinite canvas using Floating Origin architecture.
 ///
 /// Local Realism:
@@ -34,6 +43,11 @@ class Stroke: Identifiable {
     //  OPTIMIZATION: Bounding Box for Culling
     // Calculated once in init, used to skip off-screen strokes
     var localBounds: CGRect = .zero
+
+    //  OPTIMIZATION: Geometry Chunking
+    // Large strokes are divided into chunks for sub-stroke culling
+    // Only visible chunks are rendered, drastically reducing GPU vertex processing
+    var chunks: [StrokeChunk] = []
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -123,26 +137,61 @@ class Stroke: Identifiable {
             )
         }
 
-        // 6.  OPTIMIZATION: Calculate Bounding Box for Culling
-        if !localVertices.isEmpty {
-            var minX = localVertices[0].x
-            var maxX = minX
-            var minY = localVertices[0].y
-            var maxY = minY
+        // 6.  OPTIMIZATION: Generate Chunks for Sub-Stroke Culling
+        // Break the stroke into smaller pieces so we can cull them individually
+        self.generateChunks()
 
-            for vertex in localVertices {
-                if vertex.x < minX { minX = vertex.x }
-                if vertex.x > maxX { maxX = vertex.x }
-                if vertex.y < minY { minY = vertex.y }
-                if vertex.y > maxY { maxY = vertex.y }
+        // 7.  OPTIMIZATION: Calculate Global Bounding Box
+        // Union of all chunk bounding boxes
+        if !chunks.isEmpty {
+            self.localBounds = chunks.reduce(CGRect.null) { $0.union($1.boundingBox) }
+        }
+    }
+
+    /// Generate chunks for sub-stroke culling.
+    /// Large strokes are divided into blocks of vertices to enable fine-grained culling.
+    /// Only visible chunks are sent to the GPU, reducing vertex processing overhead.
+    private func generateChunks() {
+        guard !localVertices.isEmpty else { return }
+
+        // Chunk Size: How many vertices per chunk?
+        // Too small = Too many CPU draw calls
+        // Too big = Ineffective culling
+        // 192 vertices = 32 quads (64 triangles). Good balance.
+        let chunkSize = 192
+        var offset = 0
+
+        while offset < localVertices.count {
+            let count = min(chunkSize, localVertices.count - offset)
+
+            // Calculate Bounding Box for THIS chunk
+            var minX = Float.greatestFiniteMagnitude
+            var maxX = -Float.greatestFiniteMagnitude
+            var minY = Float.greatestFiniteMagnitude
+            var maxY = -Float.greatestFiniteMagnitude
+
+            for i in offset..<(offset + count) {
+                let v = localVertices[i]
+                if v.x < minX { minX = v.x }
+                if v.x > maxX { maxX = v.x }
+                if v.y < minY { minY = v.y }
+                if v.y > maxY { maxY = v.y }
             }
 
-            self.localBounds = CGRect(
+            let chunkBounds = CGRect(
                 x: Double(minX),
                 y: Double(minY),
                 width: Double(maxX - minX),
                 height: Double(maxY - minY)
             )
+
+            chunks.append(StrokeChunk(
+                vertexStart: offset,
+                vertexCount: count,
+                boundingBox: chunkBounds
+            ))
+
+            offset += count
         }
     }
 }

@@ -167,7 +167,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 rotationAngle: currentRotation
             )
 
-            drawStroke(stroke, with: &transform, encoder: encoder)
+            drawStroke(stroke, with: &transform, visibleRect: visibleRect, encoder: encoder)
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes) 
@@ -251,7 +251,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                         screenHeight: Float(viewSize.height),
                         rotationAngle: totalRotation
                     )
-                    drawStroke(stroke, with: &strokeTransform, encoder: encoder)
+                    drawStroke(stroke, with: &strokeTransform, visibleRect: visibleRect, encoder: encoder)
                 }
             }
 
@@ -329,7 +329,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                     rotationAngle: currentRotation
                 )
 
-                drawStroke(stroke, with: &childTransform, encoder: encoder)
+                drawStroke(stroke, with: &childTransform, visibleRect: visibleRect, encoder: encoder)
             }
 
             // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
@@ -339,22 +339,37 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     /// Helper to draw a stroke with a given transform.
     /// Reduces code duplication across parent/current/child rendering.
-    ///  OPTIMIZATION: Now uses cached vertex buffer from stroke
-    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, encoder: MTLRenderCommandEncoder) {
+    ///  OPTIMIZATION: Now uses cached vertex buffer and chunk-based culling
+    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, visibleRect: CGRect, encoder: MTLRenderCommandEncoder) {
         //  USE CACHED BUFFER
         // The stroke's buffer was created once in init, not 60 times per second here
         guard let vertexBuffer = stroke.vertexBuffer else { return }
 
-        // Bind the cached vertex buffer
+        // Bind the cached vertex buffer once
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
 
-        // Bind the transform (small, can use setVertexBytes instead of makeBuffer)
+        // Bind the transform once (small, can use setVertexBytes instead of makeBuffer)
         encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-        // Draw
-        encoder.drawPrimitives(type: .triangle,
-                             vertexStart: 0,
-                             vertexCount: stroke.localVertices.count)
+        // Calculate the stroke's offset in world space
+        let offsetX = Double(transform.relativeOffset.x)
+        let offsetY = Double(transform.relativeOffset.y)
+
+        //  OPTIMIZATION: Chunk-based Culling
+        // Only render chunks that are visible on screen
+        for chunk in stroke.chunks {
+            // Transform chunk bounds to world space
+            let chunkWorldBounds = chunk.boundingBox.offsetBy(dx: offsetX, dy: offsetY)
+
+            // Only draw this chunk if it's visible
+            if visibleRect.intersects(chunkWorldBounds) {
+                encoder.drawPrimitives(
+                    type: .triangle,
+                    vertexStart: chunk.vertexStart,
+                    vertexCount: chunk.vertexCount
+                )
+            }
+        }
     }
 
     ///  CONSTANT SCREEN SIZE HANDLES
