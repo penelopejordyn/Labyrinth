@@ -3,6 +3,7 @@
 import SwiftUI
 import Metal
 import MetalKit
+import simd
 
 // MARK: - Vertex Structures
 
@@ -212,8 +213,74 @@ func tessellateStrokeLocal(centerPoints: [SIMD2<Float>],
         cumulativeDistances[i] = totalLength
     }
 
-    // Normalize distances to 0...1 to keep uv.x in a compact range
-    let scale: Float = totalLength > 0 ? 1.0 / totalLength : 0
+    // 3) END CAP
+    let endCapVertices = createCircleLocal(at: centerPoints[centerPoints.count - 1], radius: halfWidth)
+    vertices.append(contentsOf: endCapVertices)
+
+    return vertices
+}
+
+/// Build a two-vertex-per-point strip for stroke rendering.
+/// Left/right vertices are generated using averaged normals so every point maps to
+/// a predictable pair of vertices for BVH-driven draws.
+func buildStrokeStripVertices(centerPoints: [SIMD2<Float>],
+                              width: Float,
+                              color: SIMD4<Float>) -> [StrokeVertex] {
+    guard !centerPoints.isEmpty else { return [] }
+
+    // Fallback to a circle for a single point to avoid degenerate strips.
+    guard centerPoints.count > 1 else {
+        return createCircleLocal(at: centerPoints[0], radius: width / 2.0).map {
+            StrokeVertex(position: $0, uv: .zero, color: color)
+        }
+    }
+
+    let halfWidth = width * 0.5
+    let count = centerPoints.count
+
+    // Precompute tangents for each segment.
+    var tangents: [SIMD2<Float>] = Array(repeating: .zero, count: count - 1)
+    for i in 0..<(count - 1) {
+        let dir = centerPoints[i + 1] - centerPoints[i]
+        let len = max(length(dir), 0.0001)
+        tangents[i] = dir / len
+    }
+
+    // Build averaged normals per point.
+    var normals: [SIMD2<Float>] = Array(repeating: .zero, count: count)
+    for i in 0..<count {
+        let prevTangent = i == 0 ? tangents[0] : tangents[i - 1]
+        let nextTangent = i == count - 1 ? tangents[count - 2] : tangents[i]
+        var blended = prevTangent + nextTangent
+        if length(blended) < 0.0001 {
+            blended = nextTangent
+        }
+        let normal = SIMD2<Float>(-blended.y, blended.x)
+        let normalized = normal / max(length(normal), 0.0001)
+        normals[i] = normalized * halfWidth
+    }
+
+    // Emit two vertices per center point (left/right).
+    var vertices: [StrokeVertex] = []
+    vertices.reserveCapacity(count * 2)
+
+    for i in 0..<count {
+        let base = centerPoints[i]
+        let offset = normals[i]
+        // UV.x encodes side (0 = left, 1 = right) to keep future shading options open.
+        vertices.append(StrokeVertex(position: base + offset, uv: SIMD2<Float>(0, 0), color: color))
+        vertices.append(StrokeVertex(position: base - offset, uv: SIMD2<Float>(1, 0), color: color))
+    }
+
+    return vertices
+}
+
+/// Create circle cap in local space.
+/// Returns vertices relative to (0,0), not in NDC or screen space.
+func createCircleLocal(at center: SIMD2<Float>,
+                      radius: Float,
+                      segments: Int = 30) -> [SIMD2<Float>] {
+    var vertices: [SIMD2<Float>] = []
 
     var vertices: [StrokeVertex] = []
     vertices.reserveCapacity(centerPoints.count * 2)

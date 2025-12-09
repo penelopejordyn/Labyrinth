@@ -59,8 +59,17 @@ class Coordinator: NSObject, MTKViewDelegate {
     var zoomScale: Double = 1.0
     var rotationAngle: Float = 0.0
 
+    // MARK: - Tile Rendering Controls
+
+    /// Use baked tiles between these zoom ranges. Outside, fall back to raw strokes for fidelity.
+    let tileZoomRange = 0.01...50.0
+
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
+
+    // MARK: - Debug Stats
+    var debugDrawnVerticesThisFrame: Int = 0
+    var debugDrawnNodesThisFrame: Int = 0
 
     override init() {
         super.init()
@@ -97,6 +106,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                      currentRotation: Float,
                      encoder: MTLRenderCommandEncoder,
                      excludedChild: Frame? = nil) { //  NEW: Prevent double-rendering
+
+        let shouldUseTiles = shouldUseTileCache(for: currentZoom)
 
         // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
         if let parent = frame.parent {
@@ -148,28 +159,37 @@ class Coordinator: NSObject, MTKViewDelegate {
         var totalStrokes = 0
         var culledStrokes = 0
 
+        if shouldUseTiles {
+            drawTileLayer(frame: frame,
+                          cameraCenter: cameraCenterInThisFrame,
+                          viewSize: viewSize,
+                          zoom: currentZoom,
+                          rotation: currentRotation,
+                          encoder: encoder)
+        }
+
         // GPU-Offset Rendering: Direct draw with GPU applying offset
         encoder.setRenderPipelineState(pipelineState)
 
         for stroke in frame.strokes {
+            if shouldUseTiles && isStrokeCoveredByTiles(stroke, in: frame) {
+                continue // Tile already represents this stroke and is clean
+            }
+
             guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
             totalStrokes += 1
 
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
-
-            // SCREEN SPACE CULLING: Check if stroke is visible
-            let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
-            let worldCenter = relativeOffsetDouble + boundsCenter
-            let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
-            let distScreen = distWorld * currentZoom
-
-            let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
-            let strokeRadiusScreen = strokeRadiusWorld * currentZoom
-
-            if (distScreen - strokeRadiusScreen) > cullRadius {
+            let ranges = stroke.visibleVertexRanges(relativeOffset: relativeOffsetDouble,
+                                                   zoomScale: currentZoom,
+                                                   cullRadius: cullRadius)
+            if ranges.isEmpty {
                 culledStrokes += 1
                 continue // CULL!
             }
+
+            debugDrawnVerticesThisFrame += stroke.localVertices.count
+            debugDrawnNodesThisFrame += stroke.flatNodes.count
 
             let relativeOffset = SIMD2<Float>(
                 Float(relativeOffsetDouble.x),
@@ -188,7 +208,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            for range in ranges {
+                encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+            }
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
@@ -325,7 +347,20 @@ class Coordinator: NSObject, MTKViewDelegate {
                 for stroke in card.strokes {
                     guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
                     let strokeOffset = stroke.origin
-                    let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
+                    let strokeRelativeOffsetDouble = SIMD2<Double>(Double(offset.x) + strokeOffset.x,
+                                                                   Double(offset.y) + strokeOffset.y)
+
+                    let ranges = stroke.visibleVertexRanges(relativeOffset: strokeRelativeOffsetDouble,
+                                                           zoomScale: currentZoom,
+                                                           cullRadius: cullRadius)
+
+                    if ranges.isEmpty { continue }
+
+                    let strokeRelativeOffset = SIMD2<Float>(Float(strokeRelativeOffsetDouble.x),
+                                                            Float(strokeRelativeOffsetDouble.y))
+
+                    debugDrawnVerticesThisFrame += stroke.localVertices.count
+                    debugDrawnNodesThisFrame += stroke.flatNodes.count
 
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
@@ -339,7 +374,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                     encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                    for range in ranges {
+                        encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                    }
                 }
             }
 
@@ -402,19 +439,15 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                 //  FIX: Add the Stroke's own origin to the Frame's offset
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
-
-                // SCREEN SPACE CULLING for child strokes
-                let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
-                let worldCenter = totalRelativeOffset + boundsCenter
-                let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
-                let distScreen = distWorld * childZoom
-
-                let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
-                let strokeRadiusScreen = strokeRadiusWorld * childZoom
-
-                if (distScreen - strokeRadiusScreen) > cullRadius {
+                let ranges = stroke.visibleVertexRanges(relativeOffset: totalRelativeOffset,
+                                                        zoomScale: childZoom,
+                                                        cullRadius: cullRadius)
+                if ranges.isEmpty {
                     continue // Cull!
                 }
+
+                debugDrawnVerticesThisFrame += stroke.localVertices.count
+                debugDrawnNodesThisFrame += stroke.flatNodes.count
 
                 let childRelativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
                 var childTransform = StrokeTransform(
@@ -429,7 +462,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                for range in ranges {
+                    encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                }
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -543,6 +578,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                     for stroke in card.strokes {
                         guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
 
+                        debugDrawnVerticesThisFrame += stroke.localVertices.count
+                        debugDrawnNodesThisFrame += stroke.flatNodes.count
+
                         // Transform Stroke Origin: Card Local -> Frame Local -> Camera Relative
                         let sx = stroke.origin.x
                         let sy = stroke.origin.y
@@ -551,6 +589,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                         let rotY = sx * s + sy * c
 
                         let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
+                        let ranges = stroke.visibleVertexRanges(relativeOffset: strokePos,
+                                                                zoomScale: childZoom,
+                                                                cullRadius: cullRadius)
+
+                        if ranges.isEmpty { continue }
+
                         let strokeRelativeOffset = SIMD2<Float>(Float(strokePos.x), Float(strokePos.y))
 
                         var strokeTrans = StrokeTransform(
@@ -565,7 +609,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                         encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        for range in ranges {
+                            encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                        }
                     }
                 }
 
@@ -582,6 +628,191 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             // Note: We do NOT recurse into grandchildren to avoid rendering depth ±2, ±3, etc.
             // Just immediate children (depth +1) is enough for visual continuity
+        }
+    }
+
+    /// Determine if tiles should be used for the current zoom level.
+    func shouldUseTileCache(for zoom: Double) -> Bool {
+        return tileZoomRange.contains(zoom)
+    }
+
+    /// Calculate the visible world rect for the current camera and view size.
+    func visibleWorldRect(cameraCenter: SIMD2<Double>, viewSize: CGSize, zoom: Double) -> CGRect {
+        let halfWidth = Double(viewSize.width) * 0.5 / zoom
+        let halfHeight = Double(viewSize.height) * 0.5 / zoom
+        return CGRect(
+            x: cameraCenter.x - halfWidth,
+            y: cameraCenter.y - halfHeight,
+            width: halfWidth * 2.0,
+            height: halfHeight * 2.0
+        )
+    }
+
+    /// Render baked tiles for the visible region of a frame.
+    func drawTileLayer(frame: Frame,
+                       cameraCenter: SIMD2<Double>,
+                       viewSize: CGSize,
+                       zoom: Double,
+                       rotation: Float,
+                       encoder: MTLRenderCommandEncoder) {
+        guard shouldUseTileCache(for: zoom) else { return }
+
+        let visibleRect = visibleWorldRect(cameraCenter: cameraCenter, viewSize: viewSize, zoom: zoom)
+        let visibleKeys = frame.tileKeys(overlapping: visibleRect)
+
+        guard !visibleKeys.isEmpty else { return }
+
+        let halfW = Float(Frame.tileWorldSize / 2.0)
+        let halfH = Float(Frame.tileWorldSize / 2.0)
+        let white = SIMD4<Float>(1, 1, 1, 1)
+        let quad: [StrokeVertex] = [
+            StrokeVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(0, 1), color: white),
+            StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 0), color: white),
+            StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 1), color: white),
+            StrokeVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(0, 0), color: white),
+            StrokeVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1, 0), color: white),
+            StrokeVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1, 1), color: white)
+        ]
+
+        let quadBuffer = device.makeBuffer(bytes: quad,
+                                           length: quad.count * MemoryLayout<StrokeVertex>.stride,
+                                           options: .storageModeShared)
+
+        encoder.setRenderPipelineState(cardPipelineState)
+        encoder.setDepthStencilState(stencilStateDefault)
+
+        for key in visibleKeys {
+            guard let tile = frame.tiles[key], let texture = tile.texture, !tile.dirty else { continue }
+
+            let center = CGPoint(x: tile.worldRect.midX, y: tile.worldRect.midY)
+            let relativeOffset = SIMD2<Float>(
+                Float(center.x - cameraCenter.x),
+                Float(center.y - cameraCenter.y)
+            )
+
+            var transform = CardTransform(
+                relativeOffset: relativeOffset,
+                zoomScale: Float(zoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: rotation
+            )
+
+            encoder.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+            encoder.setFragmentTexture(texture, index: 0)
+            encoder.setFragmentSamplerState(samplerState, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: quad.count)
+        }
+    }
+
+    /// Check if a stroke is fully covered by non-dirty tiles.
+    func isStrokeCoveredByTiles(_ stroke: Stroke, in frame: Frame) -> Bool {
+        let bounds = stroke.localBounds
+        let rect = CGRect(
+            x: stroke.origin.x + Double(bounds.origin.x),
+            y: stroke.origin.y + Double(bounds.origin.y),
+            width: Double(bounds.width),
+            height: Double(bounds.height)
+        )
+
+        let keys = frame.tileKeys(overlapping: rect)
+        guard !keys.isEmpty else { return false }
+
+        for key in keys {
+            guard let tile = frame.tiles[key], !tile.dirty, tile.texture != nil else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Bake any dirty tiles on the frame into fixed-size textures.
+    func bakeDirtyTiles(for frame: Frame, commandBuffer: MTLCommandBuffer) {
+        let dirtyTiles = frame.tiles.values.filter { $0.dirty }
+        guard !dirtyTiles.isEmpty else { return }
+
+        let tileZoom = Double(Frame.tileTextureSize) / Frame.tileWorldSize
+        let clearColor = metalView?.clearColor ?? MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+        for var tile in dirtyTiles {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: Frame.tileTextureSize,
+                height: Frame.tileTextureSize,
+                mipmapped: false
+            )
+            descriptor.usage = [.renderTarget, .shaderRead]
+
+            if tile.texture == nil || tile.texture?.width != Frame.tileTextureSize {
+                tile.texture = device.makeTexture(descriptor: descriptor)
+            }
+            guard let texture = tile.texture else { continue }
+
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = texture
+            rpd.colorAttachments[0].loadAction = .clear
+            rpd.colorAttachments[0].storeAction = .store
+            rpd.colorAttachments[0].clearColor = clearColor
+
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { continue }
+            encoder.setRenderPipelineState(pipelineState)
+            encoder.setViewport(MTLViewport(originX: 0,
+                                            originY: 0,
+                                            width: Double(Frame.tileTextureSize),
+                                            height: Double(Frame.tileTextureSize),
+                                            znear: 0,
+                                            zfar: 1))
+
+            let tileCenter = SIMD2<Double>(tile.worldRect.midX, tile.worldRect.midY)
+
+            for stroke in frame.strokes {
+                let bounds = stroke.localBounds
+                let rect = CGRect(
+                    x: stroke.origin.x + Double(bounds.origin.x),
+                    y: stroke.origin.y + Double(bounds.origin.y),
+                    width: Double(bounds.width),
+                    height: Double(bounds.height)
+                )
+
+                guard rect.intersects(tile.worldRect) else { continue }
+                guard let vertexBuffer = stroke.vertexBuffer, !stroke.localVertices.isEmpty else { continue }
+
+                let relativeOffsetDouble = stroke.origin - tileCenter
+                let relativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x), Float(relativeOffsetDouble.y))
+
+                var transform = StrokeTransform(
+                    relativeOffset: relativeOffset,
+                    zoomScale: Float(tileZoom),
+                    screenWidth: Float(Frame.tileTextureSize),
+                    screenHeight: Float(Frame.tileTextureSize),
+                    rotationAngle: 0
+                )
+
+                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            }
+
+            encoder.endEncoding()
+            tile.dirty = false
+            frame.tiles[tile.key] = tile
+        }
+    }
+
+    /// Bake tiles in the active hierarchy before presenting the drawable.
+    func bakeVisibleTiles(commandBuffer: MTLCommandBuffer, viewSize: CGSize) {
+        guard shouldUseTileCache(for: zoomScale) else { return }
+        _ = viewSize // Reserved for future viewport-aware baking heuristics
+
+        var framesToBake: [Frame] = [activeFrame]
+        if let parent = activeFrame.parent {
+            framesToBake.append(parent)
+        }
+        framesToBake.append(contentsOf: activeFrame.children)
+
+        for frame in framesToBake {
+            bakeDirtyTiles(for: frame, commandBuffer: commandBuffer)
         }
     }
 
@@ -672,12 +903,20 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        // Reset per-frame debug counters
+        debugDrawnVerticesThisFrame = 0
+        debugDrawnNodesThisFrame = 0
+
         // Calculate Camera Center in World Space (Double precision)
         // This is the "View Center" - where the center of the screen is in the infinite world.
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
         // Start rendering pipeline
         let commandBuffer = commandQueue.makeCommandBuffer()!
+
+        // Bake dirty tiles in the background before drawing the frame
+        bakeVisibleTiles(commandBuffer: commandBuffer, viewSize: view.bounds.size)
+
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
         enc.setRenderPipelineState(pipelineState)
@@ -906,13 +1145,13 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Tessellate in LOCAL space
-            let localVertices = tessellateStrokeLocal(
+            let liveStrokeVertices = buildStrokeStripVertices(
                 centerPoints: localPoints,
                 width: Float(worldWidth),
                 color: brushSettings.color
             )
 
-            guard !localVertices.isEmpty else {
+            guard !liveStrokeVertices.isEmpty else {
                 enc.endEncoding()
                 commandBuffer.present(view.currentDrawable!)
                 commandBuffer.commit()
@@ -1009,6 +1248,8 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Create buffers and render live stroke (GPU applies offset)
+            let livePrimitive: MTLPrimitiveType = localPoints.count > 1 ? .triangleStrip : .triangle
+
             let vertexBuffer = device.makeBuffer(
                 bytes: localVertices,
                 length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
@@ -1018,7 +1259,9 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: localVertices.count)
+            debugDrawnVerticesThisFrame += liveStrokeVertices.count
+
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1151,6 +1394,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             Depth: \(depth) | Zoom: \(zoomText)
             Effective: \(effectiveText)
             Strokes: \(self.activeFrame.strokes.count)
+            Debug: Verts \(self.debugDrawnVerticesThisFrame) | Nodes \(self.debugDrawnNodesThisFrame)
             Camera: \(cameraPosText)
             """
         }
@@ -1522,6 +1766,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                                 baseWidth: brushSettings.size,
                                 device: device)
             frame.strokes.append(stroke)
+            frame.markTilesDirty(for: stroke)
 
         case .card(let card, let frame):
             // DRAW ON CARD (Cross-Depth Compatible)
@@ -1533,6 +1778,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 viewSize: view.bounds.size
             )
             card.strokes.append(cardStroke)
+            frame.markTilesDirty(for: cardStroke)
         }
 
         currentTouchPoints = []
