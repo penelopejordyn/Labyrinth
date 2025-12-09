@@ -181,12 +181,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: currentRotation
+                rotationAngle: currentRotation,
+                halfPixelWidth: Float(stroke.worldWidth * currentZoom * 0.5),
+                vertexCount: UInt32(stroke.localVertices.count)
             )
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
@@ -330,12 +332,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                         zoomScale: Float(currentZoom),
                         screenWidth: Float(viewSize.width),
                         screenHeight: Float(viewSize.height),
-                        rotationAngle: totalRotation
+                        rotationAngle: totalRotation,
+                        halfPixelWidth: Float(stroke.worldWidth * currentZoom * 0.5),
+                        vertexCount: UInt32(stroke.localVertices.count)
                     )
 
                     encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
                 }
             }
 
@@ -418,12 +422,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(childZoom),
                     screenWidth: Float(viewSize.width),
                     screenHeight: Float(viewSize.height),
-                    rotationAngle: currentRotation
+                    rotationAngle: currentRotation,
+                    halfPixelWidth: Float(stroke.worldWidth * childZoom * 0.5),
+                    vertexCount: UInt32(stroke.localVertices.count)
                 )
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -552,12 +558,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                             zoomScale: Float(childZoom),
                             screenWidth: Float(viewSize.width),
                             screenHeight: Float(viewSize.height),
-                            rotationAngle: totalRot
+                            rotationAngle: totalRot,
+                            halfPixelWidth: Float(stroke.worldWidth * childZoom * 0.5),
+                            vertexCount: UInt32(stroke.localVertices.count)
                         )
 
                         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                         encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
                     }
                 }
 
@@ -648,7 +656,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomScale: Float(zoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
-                rotationAngle: rotation
+                rotationAngle: rotation,
+                halfPixelWidth: 0,
+                vertexCount: UInt32(handleVertices.count)
             )
 
             // Create buffer and draw
@@ -723,6 +733,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             var localPoints: [SIMD2<Float>]
             var liveTransform: StrokeTransform
             var liveRelativeOffset: SIMD2<Float>
+            var strokeZoomForWidth: Double = zoom
 
             //  Handle card vs canvas drawing differently
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -854,8 +865,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(renderZoom),  // Use effective zoom for the card's frame!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle + card.rotation
+                    rotationAngle: rotationAngle + card.rotation,
+                    halfPixelWidth: 0,
+                    vertexCount: 0
                 )
+                strokeZoomForWidth = renderZoom
             } else {
                 // CANVAS DRAWING: Use original approach
                 let firstScreenPt = currentTouchPoints[0]  // Origin is always the REAL first point
@@ -884,14 +898,18 @@ class Coordinator: NSObject, MTKViewDelegate {
                     zoomScale: Float(zoomScale),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
-                    rotationAngle: rotationAngle
+                    rotationAngle: rotationAngle,
+                    halfPixelWidth: 0,
+                    vertexCount: 0
                 )
+                strokeZoomForWidth = zoomScale
             }
 
             // Tessellate in LOCAL space
             let localVertices = tessellateStrokeLocal(
                 centerPoints: localPoints,
-                width: Float(worldWidth)
+                width: Float(worldWidth),
+                color: brushSettings.color
             )
 
             guard !localVertices.isEmpty else {
@@ -900,6 +918,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 commandBuffer.commit()
                 return
             }
+
+            liveTransform.halfPixelWidth = Float(worldWidth * strokeZoomForWidth * 0.5)
+            liveTransform.vertexCount = UInt32(localVertices.count)
 
             //  If drawing on a card, set up stencil clipping for the live preview
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -988,25 +1009,16 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Create buffers and render live stroke (GPU applies offset)
-            // Convert positions to StrokeVertex with color baked in
-            let liveStrokeVertices = localVertices.map { pos in
-                StrokeVertex(
-                    position: pos,  // GPU will apply offset via transform
-                    uv: .zero,
-                    color: brushSettings.color
-                )
-            }
-
             let vertexBuffer = device.makeBuffer(
-                bytes: liveStrokeVertices,
-                length: liveStrokeVertices.count * MemoryLayout<StrokeVertex>.stride,
+                bytes: localVertices,
+                length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: localVertices.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {

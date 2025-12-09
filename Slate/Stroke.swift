@@ -122,16 +122,12 @@ class Stroke: Identifiable {
         self.worldWidth = worldWidth
 
         // 4. Tessellate in LOCAL space (no view-specific transforms)
-        // Tessellator returns positions, we map them to full vertices with color
-        let positions = tessellateStrokeLocal(
+        // Centerline vertices are generated with baked side flags and UVs
+        self.localVertices = tessellateStrokeLocal(
             centerPoints: relativePoints,
-            width: Float(worldWidth)
+            width: Float(worldWidth),
+            color: color
         )
-
-        // 4.5. Bake color into vertices for batched rendering
-        self.localVertices = positions.map { pos in
-            StrokeVertex(position: pos, uv: .zero, color: color)
-        }
 
         // 5.  OPTIMIZATION: Create Cached Buffer
         // This is done ONCE here, not 60 times per second in drawStroke

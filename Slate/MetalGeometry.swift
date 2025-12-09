@@ -8,9 +8,9 @@ import MetalKit
 
 /// Vertex structure with position, UV coordinates, and color for batched rendering
 struct StrokeVertex {
-    var position: SIMD2<Float>  // Position in local space
-    var uv: SIMD2<Float>         // Texture coordinate (U = along stroke, V = across width)
-    var color: SIMD4<Float>      // Vertex color (baked for batching)
+    var position: SIMD2<Float>  // Centerline position in local space
+    var uv: SIMD2<Float>        // uv.x = along-stroke parameter, uv.y = side flag (-1 or +1)
+    var color: SIMD4<Float>     // Vertex color (baked for batching)
 }
 
 // MARK: - Transform Structures
@@ -22,6 +22,8 @@ struct StrokeTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+    var halfPixelWidth: Float
+    var vertexCount: UInt32
 }
 
 /// Transform for card rendering (not batched, includes offset)
@@ -194,85 +196,32 @@ func createCircle(at point: CGPoint,
 /// **Key Principle:** All inputs and outputs are in the same unit system
 /// (world pixels), just centered around (0,0) instead of absolute world coords.
 func tessellateStrokeLocal(centerPoints: [SIMD2<Float>],
-                           width: Float) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
+                           width: Float,
+                           color: SIMD4<Float>) -> [StrokeVertex] {
+    guard !centerPoints.isEmpty else { return [] }
 
-    guard centerPoints.count >= 2 else {
-        if centerPoints.count == 1 {
-            return createCircleLocal(at: centerPoints[0], radius: width / 2.0)
-        }
-        return vertices
+    _ = width // Width retained for potential future thickness-aware sampling
+
+    // Precompute cumulative lengths to populate uv.x
+    var cumulativeDistances: [Float] = Array(repeating: 0, count: centerPoints.count)
+    var totalLength: Float = 0
+
+    for i in 1..<centerPoints.count {
+        let delta = centerPoints[i] - centerPoints[i - 1]
+        totalLength += length(delta)
+        cumulativeDistances[i] = totalLength
     }
 
-    let halfWidth = width / 2.0
+    // Normalize distances to 0...1 to keep uv.x in a compact range
+    let scale: Float = totalLength > 0 ? 1.0 / totalLength : 0
 
-    // 1) START CAP
-    let startCapVertices = createCircleLocal(at: centerPoints[0], radius: halfWidth)
-    vertices.append(contentsOf: startCapVertices)
+    var vertices: [StrokeVertex] = []
+    vertices.reserveCapacity(centerPoints.count * 2)
 
-    // 2) SEGMENTS + JOINTS
-    for i in 0..<(centerPoints.count - 1) {
-        let p0 = centerPoints[i]
-        let p1 = centerPoints[i + 1]
-
-        // Direction vector
-        let dir = p1 - p0
-        let len = sqrt(dir.x * dir.x + dir.y * dir.y)
-        guard len > 0 else { continue }
-
-        let normalized = dir / len
-        let perpendicular = SIMD2<Float>(-normalized.y, normalized.x)
-
-        // Offset vertices by half-width
-        let offset = perpendicular * halfWidth
-
-        let top0 = p0 + offset
-        let bot0 = p0 - offset
-        let top1 = p1 + offset
-        let bot1 = p1 - offset
-
-        // Two triangles forming a quad
-        vertices.append(top0)
-        vertices.append(bot0)
-        vertices.append(top1)
-
-        vertices.append(bot0)
-        vertices.append(bot1)
-        vertices.append(top1)
-
-        // Add joint circle at segment connections
-        if i < centerPoints.count - 2 {
-            let jointVertices = createCircleLocal(at: p1, radius: halfWidth, segments: 16)
-            vertices.append(contentsOf: jointVertices)
-        }
-    }
-
-    // 3) END CAP
-    let endCapVertices = createCircleLocal(at: centerPoints[centerPoints.count - 1], radius: halfWidth)
-    vertices.append(contentsOf: endCapVertices)
-
-    return vertices
-}
-
-/// Create circle cap in local space.
-/// Returns vertices relative to (0,0), not in NDC or screen space.
-func createCircleLocal(at center: SIMD2<Float>,
-                      radius: Float,
-                      segments: Int = 30) -> [SIMD2<Float>] {
-    var vertices: [SIMD2<Float>] = []
-
-    for i in 0..<segments {
-        let a1 = Float(i) * (2.0 * .pi / Float(segments))
-        let a2 = Float(i + 1) * (2.0 * .pi / Float(segments))
-
-        let p1 = SIMD2<Float>(center.x + cos(a1) * radius,
-                              center.y + sin(a1) * radius)
-        let p2 = SIMD2<Float>(center.x + cos(a2) * radius,
-                              center.y + sin(a2) * radius)
-
-        vertices.append(center)
-        vertices.append(p1)
-        vertices.append(p2)
+    for (index, center) in centerPoints.enumerated() {
+        let u = cumulativeDistances[index] * scale
+        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, -1), color: color))
+        vertices.append(StrokeVertex(position: center, uv: SIMD2<Float>(u, 1), color: color))
     }
 
     return vertices
