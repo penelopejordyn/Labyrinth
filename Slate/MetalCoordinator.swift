@@ -156,17 +156,10 @@ class Coordinator: NSObject, MTKViewDelegate {
             totalStrokes += 1
 
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
-
-            // SCREEN SPACE CULLING: Check if stroke is visible
-            let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
-            let worldCenter = relativeOffsetDouble + boundsCenter
-            let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
-            let distScreen = distWorld * currentZoom
-
-            let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
-            let strokeRadiusScreen = strokeRadiusWorld * currentZoom
-
-            if (distScreen - strokeRadiusScreen) > cullRadius {
+            let ranges = stroke.visibleVertexRanges(relativeOffset: relativeOffsetDouble,
+                                                   zoomScale: currentZoom,
+                                                   cullRadius: cullRadius)
+            if ranges.isEmpty {
                 culledStrokes += 1
                 continue // CULL!
             }
@@ -186,7 +179,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            for range in ranges {
+                encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+            }
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
@@ -323,7 +318,17 @@ class Coordinator: NSObject, MTKViewDelegate {
                 for stroke in card.strokes {
                     guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
                     let strokeOffset = stroke.origin
-                    let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
+                    let strokeRelativeOffsetDouble = SIMD2<Double>(Double(offset.x) + strokeOffset.x,
+                                                                   Double(offset.y) + strokeOffset.y)
+
+                    let ranges = stroke.visibleVertexRanges(relativeOffset: strokeRelativeOffsetDouble,
+                                                           zoomScale: currentZoom,
+                                                           cullRadius: cullRadius)
+
+                    if ranges.isEmpty { continue }
+
+                    let strokeRelativeOffset = SIMD2<Float>(Float(strokeRelativeOffsetDouble.x),
+                                                            Float(strokeRelativeOffsetDouble.y))
 
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
@@ -335,7 +340,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                     encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                    for range in ranges {
+                        encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                    }
                 }
             }
 
@@ -398,17 +405,10 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                 //  FIX: Add the Stroke's own origin to the Frame's offset
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
-
-                // SCREEN SPACE CULLING for child strokes
-                let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
-                let worldCenter = totalRelativeOffset + boundsCenter
-                let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
-                let distScreen = distWorld * childZoom
-
-                let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
-                let strokeRadiusScreen = strokeRadiusWorld * childZoom
-
-                if (distScreen - strokeRadiusScreen) > cullRadius {
+                let ranges = stroke.visibleVertexRanges(relativeOffset: totalRelativeOffset,
+                                                        zoomScale: childZoom,
+                                                        cullRadius: cullRadius)
+                if ranges.isEmpty {
                     continue // Cull!
                 }
 
@@ -423,7 +423,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                for range in ranges {
+                    encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                }
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -545,6 +547,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                         let rotY = sx * s + sy * c
 
                         let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
+                        let ranges = stroke.visibleVertexRanges(relativeOffset: strokePos,
+                                                                zoomScale: childZoom,
+                                                                cullRadius: cullRadius)
+
+                        if ranges.isEmpty { continue }
+
                         let strokeRelativeOffset = SIMD2<Float>(Float(strokePos.x), Float(strokePos.y))
 
                         var strokeTrans = StrokeTransform(
@@ -557,7 +565,9 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                         encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        for range in ranges {
+                            encoder.drawPrimitives(type: stroke.primitiveType, vertexStart: range.0, vertexCount: range.1)
+                        }
                     }
                 }
 
@@ -889,12 +899,13 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Tessellate in LOCAL space
-            let localVertices = tessellateStrokeLocal(
+            let liveStrokeVertices = buildStrokeStripVertices(
                 centerPoints: localPoints,
-                width: Float(worldWidth)
+                width: Float(worldWidth),
+                color: brushSettings.color
             )
 
-            guard !localVertices.isEmpty else {
+            guard !liveStrokeVertices.isEmpty else {
                 enc.endEncoding()
                 commandBuffer.present(view.currentDrawable!)
                 commandBuffer.commit()
@@ -988,14 +999,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             }
 
             // Create buffers and render live stroke (GPU applies offset)
-            // Convert positions to StrokeVertex with color baked in
-            let liveStrokeVertices = localVertices.map { pos in
-                StrokeVertex(
-                    position: pos,  // GPU will apply offset via transform
-                    uv: .zero,
-                    color: brushSettings.color
-                )
-            }
+            let livePrimitive: MTLPrimitiveType = localPoints.count > 1 ? .triangleStrip : .triangle
 
             let vertexBuffer = device.makeBuffer(
                 bytes: liveStrokeVertices,
@@ -1006,7 +1010,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
+            enc.drawPrimitives(type: livePrimitive, vertexStart: 0, vertexCount: liveStrokeVertices.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {

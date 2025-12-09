@@ -5,8 +5,8 @@ import Metal
 /// A compact, value-type node for cache-friendly traversal
 struct FlatBVHNode {
     let bounds: CGRect
-    let vertexStart: Int
-    let vertexCount: Int
+    let segmentStart: Int
+    let segmentCount: Int
     let leftIndex: Int // Index in the flat array (-1 if leaf)
     let rightIndex: Int // Index in the flat array (-1 if leaf)
 }
@@ -32,9 +32,11 @@ struct FlatBVHNode {
 class Stroke: Identifiable {
     let id: UUID
     let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
+    let centerline: [SIMD2<Float>]      // Raw center points in local space for BVH construction
     let localVertices: [StrokeVertex]   // Vertices with color baked in for batching
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
+    var primitiveType: MTLPrimitiveType
 
     //  OPTIMIZATION: Cached GPU Buffer
     // Created once in init, reused every frame
@@ -48,6 +50,7 @@ class Stroke: Identifiable {
     // Linear memory layout allows CPU pre-fetching, drastically reducing frame time
     // Root is at the end of the array, leaves are 32-vertex chunks
     var flatNodes: [FlatBVHNode] = []
+    var bvhRootIndex: Int?
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -75,9 +78,11 @@ class Stroke: Identifiable {
          device: MTLDevice?) {
         self.id = UUID()
         self.color = color
+        self.primitiveType = .triangleStrip
 
         guard let firstScreenPt = screenPoints.first else {
             self.origin = .zero
+            self.centerline = []
             self.localVertices = []
             self.worldWidth = 0
             return
@@ -117,20 +122,22 @@ class Stroke: Identifiable {
             return SIMD2<Float>(Float(worldDx), Float(worldDy))
         }
 
+        self.centerline = relativePoints
+
         // 3. World width is the base width divided by zoom
         let worldWidth = baseWidth / zoom
         self.worldWidth = worldWidth
 
         // 4. Tessellate in LOCAL space (no view-specific transforms)
-        // Tessellator returns positions, we map them to full vertices with color
-        let positions = tessellateStrokeLocal(
+        self.localVertices = buildStrokeStripVertices(
             centerPoints: relativePoints,
-            width: Float(worldWidth)
+            width: Float(worldWidth),
+            color: color
         )
 
-        // 4.5. Bake color into vertices for batched rendering
-        self.localVertices = positions.map { pos in
-            StrokeVertex(position: pos, uv: .zero, color: color)
+        // 4.5 Primitive type depends on tessellation output
+        if relativePoints.count < 2 {
+            self.primitiveType = .triangle
         }
 
         // 5.  OPTIMIZATION: Create Cached Buffer
@@ -145,60 +152,130 @@ class Stroke: Identifiable {
 
         // 6.  OPTIMIZATION: Build Linear BVH for Cache-Friendly Culling
         // Flat array structure eliminates pointer chasing and fits in CPU cache
-        if !localVertices.isEmpty {
+        let segmentCount = max(centerline.count - 1, 0)
+        if segmentCount > 0 {
             // Reserve capacity to avoid allocations during build
-            // A binary tree has approx 2*N nodes where N is number of leaves
-            let leafCount = (localVertices.count / 32) + 1
+            let leafCount = (segmentCount / 8) + 1
             flatNodes.reserveCapacity(leafCount * 2)
 
-            let rootIndex = buildLinearBVH(start: 0, count: localVertices.count)
+            let rootIndex = buildLinearBVH(segmentStart: 0, segmentCount: segmentCount)
             if rootIndex >= 0 {
                 self.localBounds = flatNodes[rootIndex].bounds
+                self.bvhRootIndex = rootIndex
             }
+        } else if let first = centerline.first {
+            let radius = Float(worldWidth * 0.5)
+            self.localBounds = CGRect(x: Double(first.x - radius),
+                                      y: Double(first.y - radius),
+                                      width: Double(radius * 2),
+                                      height: Double(radius * 2))
         }
     }
 
     /// Recursive builder that populates the flat array
     /// Returns the index of the node created
-    /// Uses 32-vertex leaves for balanced performance between culling precision and tree depth
-    private func buildLinearBVH(start: Int, count: Int) -> Int {
-        // LEAF CASE (32 vertices = 16 triangles)
-        // Larger leaves reduce tree depth and traversal overhead
-        if count <= 32 {
-            let bounds = calculateBounds(start: start, count: count)
-            let node = FlatBVHNode(bounds: bounds, vertexStart: start, vertexCount: count, leftIndex: -1, rightIndex: -1)
+    /// Uses small segment strips for balanced precision and tree depth
+    private func buildLinearBVH(segmentStart: Int, segmentCount: Int) -> Int {
+        // LEAF CASE (small segment batches)
+        if segmentCount <= 8 {
+            let bounds = calculateBounds(startSegment: segmentStart, segmentCount: segmentCount)
+            let node = FlatBVHNode(bounds: bounds, segmentStart: segmentStart, segmentCount: segmentCount, leftIndex: -1, rightIndex: -1)
             flatNodes.append(node)
             return flatNodes.count - 1
         }
 
         // INTERNAL CASE: Split in half
-        // Children must be created first so their indices are valid
-        let mid = count / 2
-        let leftIdx = buildLinearBVH(start: start, count: mid)
-        let rightIdx = buildLinearBVH(start: start + mid, count: count - mid)
+        let mid = segmentCount / 2
+        let leftIdx = buildLinearBVH(segmentStart: segmentStart, segmentCount: mid)
+        let rightIdx = buildLinearBVH(segmentStart: segmentStart + mid, segmentCount: segmentCount - mid)
 
         // Parent bounds is the union of children
         let totalBounds = flatNodes[leftIdx].bounds.union(flatNodes[rightIdx].bounds)
-        let node = FlatBVHNode(bounds: totalBounds, vertexStart: 0, vertexCount: 0, leftIndex: leftIdx, rightIndex: rightIdx)
+        let node = FlatBVHNode(bounds: totalBounds, segmentStart: 0, segmentCount: 0, leftIndex: leftIdx, rightIndex: rightIdx)
         flatNodes.append(node)
         return flatNodes.count - 1
     }
 
-    private func calculateBounds(start: Int, count: Int) -> CGRect {
+    private func calculateBounds(startSegment: Int, segmentCount: Int) -> CGRect {
         var minX = Float.greatestFiniteMagnitude
         var maxX = -Float.greatestFiniteMagnitude
         var minY = Float.greatestFiniteMagnitude
         var maxY = -Float.greatestFiniteMagnitude
 
-        let end = min(start + count, localVertices.count)
-        for i in start..<end {
-            let pos = localVertices[i].position
+        let startPoint = startSegment
+        let endPoint = min(startSegment + segmentCount, centerline.count - 1)
+
+        for i in startPoint...(endPoint) {
+            let pos = centerline[i]
             if pos.x < minX { minX = pos.x }
             if pos.x > maxX { maxX = pos.x }
             if pos.y < minY { minY = pos.y }
             if pos.y > maxY { maxY = pos.y }
         }
 
+        let halfWidth = Float(worldWidth * 0.5)
+        minX -= halfWidth
+        maxX += halfWidth
+        minY -= halfWidth
+        maxY += halfWidth
+
         return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))
+    }
+
+    /// Traverse the BVH and return contiguous vertex ranges that intersect the culling radius.
+    /// Leaf ranges are aligned to the two-vertex-per-point strip format for contiguous draws.
+    func visibleVertexRanges(relativeOffset: SIMD2<Double>,
+                             zoomScale: Double,
+                             cullRadius: Double) -> [(Int, Int)] {
+        guard !localVertices.isEmpty else { return [] }
+
+        // Early out using whole-stroke bounds
+        let boundsCenter = SIMD2<Double>(localBounds.midX, localBounds.midY)
+        let worldCenter = relativeOffset + boundsCenter
+        let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
+        let distScreen = distWorld * zoomScale
+
+        let strokeRadiusWorld = sqrt(pow(localBounds.width, 2) + pow(localBounds.height, 2)) * 0.5
+        let strokeRadiusScreen = strokeRadiusWorld * zoomScale
+
+        if (distScreen - strokeRadiusScreen) > cullRadius {
+            return []
+        }
+
+        guard let rootIndex = bvhRootIndex else {
+            // No BVH (likely a point stroke) - draw everything.
+            return localVertices.count >= 3 ? [(0, localVertices.count)] : []
+        }
+
+        var ranges: [(Int, Int)] = []
+        var stack: [Int] = [rootIndex]
+
+        while let nodeIndex = stack.popLast() {
+            let node = flatNodes[nodeIndex]
+            let nodeCenter = SIMD2<Double>(node.bounds.midX, node.bounds.midY)
+            let nodeWorldCenter = relativeOffset + nodeCenter
+            let nodeDistWorld = sqrt(nodeWorldCenter.x * nodeWorldCenter.x + nodeWorldCenter.y * nodeWorldCenter.y)
+            let nodeDistScreen = nodeDistWorld * zoomScale
+            let nodeRadiusWorld = sqrt(pow(node.bounds.width, 2) + pow(node.bounds.height, 2)) * 0.5
+            let nodeRadiusScreen = nodeRadiusWorld * zoomScale
+
+            if (nodeDistScreen - nodeRadiusScreen) > cullRadius {
+                continue
+            }
+
+            // Leaf
+            if node.leftIndex == -1 && node.rightIndex == -1 {
+                let vertexStart = node.segmentStart * 2
+                let vertexCount = (node.segmentCount + 1) * 2
+                if vertexCount >= 3 {
+                    ranges.append((vertexStart, vertexCount))
+                }
+            } else {
+                if node.leftIndex != -1 { stack.append(node.leftIndex) }
+                if node.rightIndex != -1 { stack.append(node.rightIndex) }
+            }
+        }
+
+        return ranges
     }
 }
