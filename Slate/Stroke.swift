@@ -2,24 +2,13 @@
 import SwiftUI
 import Metal
 
-/// A node in the Bounding Volume Hierarchy tree.
-/// Can be an Internal Node (has children) or a Leaf Node (has geometry).
-class StrokeBVHNode {
+/// A compact, value-type node for cache-friendly traversal
+struct FlatBVHNode {
     let bounds: CGRect
-    let left: StrokeBVHNode?
-    let right: StrokeBVHNode?
-
-    // Leaf properties (only if left/right are nil)
     let vertexStart: Int
     let vertexCount: Int
-
-    init(bounds: CGRect, left: StrokeBVHNode?, right: StrokeBVHNode?, vertexStart: Int = 0, vertexCount: Int = 0) {
-        self.bounds = bounds
-        self.left = left
-        self.right = right
-        self.vertexStart = vertexStart
-        self.vertexCount = vertexCount
-    }
+    let leftIndex: Int // Index in the flat array (-1 if leaf)
+    let rightIndex: Int // Index in the flat array (-1 if leaf)
 }
 
 /// A stroke on the infinite canvas using Floating Origin architecture.
@@ -43,7 +32,7 @@ class StrokeBVHNode {
 class Stroke: Identifiable {
     let id: UUID
     let origin: SIMD2<Double>           // Anchor point within the Frame (Double precision, always small)
-    let localVertices: [SIMD2<Float>]   // Vertices relative to origin (Float precision)
+    let localVertices: [StrokeVertex]   // Vertices with color baked in for batching
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
 
@@ -55,10 +44,10 @@ class Stroke: Identifiable {
     // Calculated once in init, used to skip off-screen strokes
     var localBounds: CGRect = .zero
 
-    //  OPTIMIZATION: BVH Tree for Hierarchical Culling
-    // Tree structure allows O(log N) culling instead of O(N)
-    // Root node contains the entire stroke, leaves are small 32-vertex chunks
-    var rootNode: StrokeBVHNode?
+    //  OPTIMIZATION: Flat Array BVH for Cache-Friendly Culling
+    // Linear memory layout allows CPU pre-fetching, drastically reducing frame time
+    // Root is at the end of the array, leaves are 32-vertex chunks
+    var flatNodes: [FlatBVHNode] = []
 
     /// Initialize stroke from screen-space points using direct delta calculation.
     /// This avoids Double precision loss at extreme zoom levels by calculating
@@ -133,51 +122,66 @@ class Stroke: Identifiable {
         self.worldWidth = worldWidth
 
         // 4. Tessellate in LOCAL space (no view-specific transforms)
-        self.localVertices = tessellateStrokeLocal(
+        // Tessellator returns positions, we map them to full vertices with color
+        let positions = tessellateStrokeLocal(
             centerPoints: relativePoints,
             width: Float(worldWidth)
         )
+
+        // 4.5. Bake color into vertices for batched rendering
+        self.localVertices = positions.map { pos in
+            StrokeVertex(position: pos, uv: .zero, color: color)
+        }
 
         // 5.  OPTIMIZATION: Create Cached Buffer
         // This is done ONCE here, not 60 times per second in drawStroke
         if let device = device, !localVertices.isEmpty {
             self.vertexBuffer = device.makeBuffer(
                 bytes: localVertices,
-                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
+                length: localVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
         }
 
-        // 6.  OPTIMIZATION: Build BVH Tree for Hierarchical Culling
-        // Recursively splits stroke into a tree structure for O(log N) culling
+        // 6.  OPTIMIZATION: Build Linear BVH for Cache-Friendly Culling
+        // Flat array structure eliminates pointer chasing and fits in CPU cache
         if !localVertices.isEmpty {
-            self.rootNode = buildBVH(start: 0, count: localVertices.count)
-            if let root = self.rootNode {
-                self.localBounds = root.bounds
+            // Reserve capacity to avoid allocations during build
+            // A binary tree has approx 2*N nodes where N is number of leaves
+            let leafCount = (localVertices.count / 32) + 1
+            flatNodes.reserveCapacity(leafCount * 2)
+
+            let rootIndex = buildLinearBVH(start: 0, count: localVertices.count)
+            if rootIndex >= 0 {
+                self.localBounds = flatNodes[rootIndex].bounds
             }
         }
     }
 
-    /// Recursive function to build the BVH Tree
-    /// Splits vertices in half until they fit into a leaf node (32 vertices)
-    /// This creates a logarithmic tree structure for efficient culling
-    private func buildBVH(start: Int, count: Int) -> StrokeBVHNode {
-        // LEAF CASE: Small enough to be a chunk
-        // 32 vertices = 16 triangles. Good granularity for culling.
+    /// Recursive builder that populates the flat array
+    /// Returns the index of the node created
+    /// Uses 32-vertex leaves for balanced performance between culling precision and tree depth
+    private func buildLinearBVH(start: Int, count: Int) -> Int {
+        // LEAF CASE (32 vertices = 16 triangles)
+        // Larger leaves reduce tree depth and traversal overhead
         if count <= 32 {
             let bounds = calculateBounds(start: start, count: count)
-            return StrokeBVHNode(bounds: bounds, left: nil, right: nil, vertexStart: start, vertexCount: count)
+            let node = FlatBVHNode(bounds: bounds, vertexStart: start, vertexCount: count, leftIndex: -1, rightIndex: -1)
+            flatNodes.append(node)
+            return flatNodes.count - 1
         }
 
         // INTERNAL CASE: Split in half
+        // Children must be created first so their indices are valid
         let mid = count / 2
-        let leftNode = buildBVH(start: start, count: mid)
-        let rightNode = buildBVH(start: start + mid, count: count - mid)
+        let leftIdx = buildLinearBVH(start: start, count: mid)
+        let rightIdx = buildLinearBVH(start: start + mid, count: count - mid)
 
         // Parent bounds is the union of children
-        let totalBounds = leftNode.bounds.union(rightNode.bounds)
-
-        return StrokeBVHNode(bounds: totalBounds, left: leftNode, right: rightNode)
+        let totalBounds = flatNodes[leftIdx].bounds.union(flatNodes[rightIdx].bounds)
+        let node = FlatBVHNode(bounds: totalBounds, vertexStart: 0, vertexCount: 0, leftIndex: leftIdx, rightIndex: rightIdx)
+        flatNodes.append(node)
+        return flatNodes.count - 1
     }
 
     private func calculateBounds(start: Int, count: Int) -> CGRect {
@@ -188,11 +192,11 @@ class Stroke: Identifiable {
 
         let end = min(start + count, localVertices.count)
         for i in start..<end {
-            let v = localVertices[i]
-            if v.x < minX { minX = v.x }
-            if v.x > maxX { maxX = v.x }
-            if v.y < minY { minY = v.y }
-            if v.y > maxY { maxY = v.y }
+            let pos = localVertices[i].position
+            if pos.x < minX { minX = pos.x }
+            if pos.x > maxX { maxX = pos.x }
+            if pos.y < minY { minY = pos.y }
+            if pos.y > maxY { maxY = pos.y }
         }
 
         return CGRect(x: Double(minX), y: Double(minY), width: Double(maxX - minX), height: Double(maxY - minY))

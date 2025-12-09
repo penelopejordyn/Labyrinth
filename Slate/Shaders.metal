@@ -2,51 +2,68 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Floating Origin Transform
-/// The GPU receives ONLY small relative coordinates - never large world coordinates.
-/// This eliminates float32 precision issues at extreme zoom levels.
+/// Batched Rendering Transform
+/// Position is pre-calculated on CPU (camera-relative), so we only need projection params
 struct StrokeTransform {
-    float2 relativeOffset;  // Stroke origin - Camera center (world units, but small!)
     float zoomScale;        // Current zoom level
     float screenWidth;      // Screen dimensions for NDC conversion
     float screenHeight;
     float rotationAngle;    // Camera rotation
 };
 
-vertex float4 vertex_main(uint vertexID [[vertex_id]],
-                         constant float2 *localPositions [[buffer(0)]],
-                         constant StrokeTransform *transform [[buffer(1)]]) {
-    // Step A: Position - Add relative offset to local vertex
-    // localPosition is small (e.g., 0-100 world units from stroke origin)
-    // relativeOffset is small (e.g., ±500 world units from camera center)
-    // Result: Small number ± small number = small number (no precision loss!)
-    float2 worldRelative = localPositions[vertexID] + transform->relativeOffset;
+/// Vertex input for batched stroke rendering
+struct VertexIn {
+    float2 position [[attribute(0)]];  // Camera-relative position (calculated on CPU)
+    float2 uv       [[attribute(1)]];  // Texture coordinate
+    float4 color    [[attribute(2)]];  // Vertex color (baked for batching)
+};
 
-    // Step B: Rotation - Rotate around (0,0) which is now the camera center
-    //  FIX: Use Standard Clockwise Rotation Matrix
-    // x' = x*cos - y*sin
-    // y' = x*sin + y*cos
+/// Vertex output passed to fragment shader
+struct VertexOut {
+    float4 position [[position]];
+    float2 uv;
+    float4 color;
+};
+
+vertex VertexOut vertex_main(VertexIn in [[stage_in]],
+                             constant StrokeTransform *transform [[buffer(1)]]) {
+    // Position is ALREADY relative to camera (calculated on CPU during batching)
+    // We just need to rotate and project
+
+    // Step A: Rotation around camera center (0,0)
     float c = cos(transform->rotationAngle);
     float s = sin(transform->rotationAngle);
-    float rotX = worldRelative.x * c - worldRelative.y * s;
-    float rotY = worldRelative.x * s + worldRelative.y * c;
+    float rotX = in.position.x * c - in.position.y * s;
+    float rotY = in.position.x * s + in.position.y * c;
 
-    // Step C: Zoom - Scale by zoom factor
+    // Step B: Zoom - Scale by zoom factor
     float2 zoomed = float2(rotX, rotY) * transform->zoomScale;
 
-    // Step D: Projection - Convert to NDC [-1, 1]
+    // Step C: Projection - Convert to NDC [-1, 1]
     float ndcX = (zoomed.x / transform->screenWidth) * 2.0;
     float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
 
-    return float4(ndcX, ndcY, 0.0, 1.0);
+    VertexOut out;
+    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
 }
 
-fragment float4 fragment_main(float4 in [[stage_in]],
-                              constant float4 &color [[buffer(0)]]) {
-    return color;
+fragment float4 fragment_main(VertexOut in [[stage_in]]) {
+    return in.color;
 }
 
 // MARK: - Card Rendering Shaders
+
+/// Transform for cards (not batched, so needs relativeOffset)
+struct CardTransform {
+    float2 relativeOffset;  // Card position relative to camera
+    float zoomScale;
+    float screenWidth;
+    float screenHeight;
+    float rotationAngle;
+};
 
 /// Vertex input structure for cards - matches Swift's StrokeVertex
 struct CardVertexIn {
@@ -62,7 +79,7 @@ struct CardVertexOut {
 
 /// Vertex shader for cards - applies floating origin transform
 vertex CardVertexOut vertex_card(CardVertexIn in [[stage_in]],
-                                 constant StrokeTransform *transform [[buffer(1)]]) {
+                                 constant CardTransform *transform [[buffer(1)]]) {
     // Same transform logic as strokes
     float2 worldRelative = in.position + transform->relativeOffset;
 

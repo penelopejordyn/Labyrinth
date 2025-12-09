@@ -6,10 +6,30 @@ import MetalKit
 
 // MARK: - Vertex Structures
 
-/// Vertex structure with position and UV coordinates for textured rendering
+/// Vertex structure with position, UV coordinates, and color for batched rendering
 struct StrokeVertex {
     var position: SIMD2<Float>  // Position in local space
     var uv: SIMD2<Float>         // Texture coordinate (U = along stroke, V = across width)
+    var color: SIMD4<Float>      // Vertex color (baked for batching)
+}
+
+// MARK: - Transform Structures
+
+/// Transform for batched stroke rendering (position calculated on CPU)
+struct StrokeTransform {
+    var zoomScale: Float
+    var screenWidth: Float
+    var screenHeight: Float
+    var rotationAngle: Float
+}
+
+/// Transform for card rendering (not batched, includes offset)
+struct CardTransform {
+    var relativeOffset: SIMD2<Float>
+    var zoomScale: Float
+    var screenWidth: Float
+    var screenHeight: Float
+    var rotationAngle: Float
 }
 
 // MARK: - Geometry / Tessellation
@@ -742,16 +762,6 @@ func solvePanOffsetForAnchor_Double(anchorWorld: SIMD2<Double>,
 
 
 // MARK: - GPU Transform Struct (Floating Origin Architecture)
-
-/// Per-stroke transform using relative coordinates.
-/// The GPU never sees absolute world coordinates - only small relative offsets.
-struct StrokeTransform {
-    var relativeOffset: SIMD2<Float>  // Stroke origin - Camera center (in world units)
-    var zoomScale: Float              // Current zoom level
-    var screenWidth: Float            // Screen dimensions
-    var screenHeight: Float
-    var rotationAngle: Float          // Camera rotation
-}
 
 /// Legacy global transform (for reference, not used in floating origin system)
 struct GPUTransform {

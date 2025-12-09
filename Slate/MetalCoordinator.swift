@@ -18,6 +18,11 @@ class Coordinator: NSObject, MTKViewDelegate {
     var samplerState: MTLSamplerState!                  // Sampler for card textures
     var vertexBuffer: MTLBuffer!
 
+    //  OPTIMIZATION: Transient Batch Buffer for Vertex Batching
+    // Capacity: 1 Million vertices (approx 48MB). Reset every frame.
+    var transientVertexBuffer: MTLBuffer!
+    let maxBatchVertices = 1_000_000
+
     //  Stencil States for Card Clipping
     var stencilStateDefault: MTLDepthStencilState! // Default passthrough (no testing)
     var stencilStateWrite: MTLDepthStencilState!   // Writes 1s to stencil (card background)
@@ -64,6 +69,13 @@ class Coordinator: NSObject, MTKViewDelegate {
         super.init()
         device = MTLCreateSystemDefaultDevice()!
         commandQueue = device.makeCommandQueue()!
+
+        // Create transient batch buffer for vertex batching
+        transientVertexBuffer = device.makeBuffer(
+            length: maxBatchVertices * MemoryLayout<StrokeVertex>.stride,
+            options: .storageModeShared
+        )!
+
         makePipeLine()
         makeVertexBuffer()
     }
@@ -139,11 +151,19 @@ class Coordinator: NSObject, MTKViewDelegate {
         // Apply Culling Multiplier for testing
         let cullRadius = screenRadius * brushSettings.cullingMultiplier
 
+        // Convert cullRadius from screen pixels to world units for inverse culling
+        let visibleRectRadius = cullRadius / currentZoom
+
         // DEBUG: Track culling stats
         var totalStrokes = 0
         var culledStrokes = 0
 
+        // BATCHING: Gather ALL stroke vertices into transient buffer, then draw once
         encoder.setRenderPipelineState(pipelineState)
+
+        let bufferPointer = transientVertexBuffer.contents().bindMemory(to: StrokeVertex.self, capacity: maxBatchVertices)
+        var totalVertexCount = 0
+
         for stroke in frame.strokes {
             guard !stroke.localVertices.isEmpty else { continue }
             totalStrokes += 1
@@ -163,11 +183,6 @@ class Coordinator: NSObject, MTKViewDelegate {
             let strokeRadiusWorld = sqrt(pow(stroke.localBounds.width, 2) + pow(stroke.localBounds.height, 2)) * 0.5
             let strokeRadiusScreen = strokeRadiusWorld * currentZoom
 
-            // DEBUG: Print first 3 strokes
-            if totalStrokes <= 3 {
-                print("  Stroke #\(totalStrokes): distScreen=\(Int(distScreen))px, strokeRadius=\(Int(strokeRadiusScreen))px, test=\(Int(distScreen - strokeRadiusScreen))px vs cullRadius=\(Int(cullRadius))px -> \((distScreen - strokeRadiusScreen) > cullRadius ? "CULLED" : "VISIBLE")")
-            }
-
             // Cull if stroke is beyond screen radius
             if (distScreen - strokeRadiusScreen) > cullRadius {
                 culledStrokes += 1
@@ -179,20 +194,25 @@ class Coordinator: NSObject, MTKViewDelegate {
                 Float(relativeOffsetDouble.y)
             )
 
+            // Gather visible vertices from this stroke into the batch buffer
+            totalVertexCount += gatherStrokeVertices(stroke,
+                                                     relativeOffset: relativeOffset,
+                                                     visibleRectRadius: visibleRectRadius,
+                                                     bufferPointer: bufferPointer,
+                                                     startOffset: totalVertexCount)
+        }
+
+        // Draw all gathered vertices in a single call
+        if totalVertexCount > 0 {
             var transform = StrokeTransform(
-                relativeOffset: relativeOffset,
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
                 rotationAngle: currentRotation
             )
-
-            drawStroke(stroke, with: &transform, viewSize: viewSize, encoder: encoder)
-        }
-
-        // DEBUG: Print culling stats
-        if totalStrokes > 0 {
-            print("🔍 CULLING: \(culledStrokes)/\(totalStrokes) strokes culled (\(Int((Double(culledStrokes)/Double(totalStrokes))*100))%) | cullRadius: \(Int(cullRadius))px | screenRadius: \(Int(screenRadius))px | multiplier: \(String(format: "%.2f", brushSettings.cullingMultiplier))x | zoom: \(String(format: "%.2f", currentZoom))x")
+            encoder.setVertexBuffer(transientVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: totalVertexCount)
         }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
@@ -218,7 +238,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             // Total Rotation = Camera Rotation + Card Rotation
             let finalRotation = currentRotation + card.rotation
 
-            var transform = StrokeTransform(
+            var transform = CardTransform(
                 relativeOffset: relativeOffset,
                 zoomScale: Float(currentZoom),
                 screenWidth: Float(viewSize.width),
@@ -236,21 +256,21 @@ class Coordinator: NSObject, MTKViewDelegate {
             case .solidColor(let color):
                 // Use solid color pipeline (no texture required)
                 encoder.setRenderPipelineState(cardSolidPipelineState)
-                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 var c = color
                 encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
             case .image(let texture):
                 // Use textured pipeline (requires texture binding)
                 encoder.setRenderPipelineState(cardPipelineState)
-                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 encoder.setFragmentTexture(texture, index: 0)
                 encoder.setFragmentSamplerState(samplerState, index: 0)
 
             case .lined(let config):
                 // Use procedural lined paper pipeline
                 encoder.setRenderPipelineState(cardLinedPipelineState)
-                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
 
                 // 1. Background Color (Paper White)
                 var bg = SIMD4<Float>(1, 1, 1, 1)
@@ -275,7 +295,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             case .grid(let config):
                 // Use procedural grid paper pipeline
                 encoder.setRenderPipelineState(cardGridPipelineState)
-                encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
 
                 // 1. Background Color (Paper White)
                 var bg = SIMD4<Float>(1, 1, 1, 1)
@@ -325,17 +345,32 @@ class Coordinator: NSObject, MTKViewDelegate {
                 let magicOffsetY = distX * s + distY * c
                 let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
 
+                // Batch all card strokes
+                let cardStrokeBufferPointer = transientVertexBuffer.contents().bindMemory(to: StrokeVertex.self, capacity: maxBatchVertices)
+                var cardStrokeVertexCount = 0
+
                 for stroke in card.strokes {
                     guard !stroke.localVertices.isEmpty else { continue }
                     let strokeOffset = stroke.origin
+                    let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
+
+                    cardStrokeVertexCount += gatherStrokeVertices(stroke,
+                                                                   relativeOffset: strokeRelativeOffset,
+                                                                   visibleRectRadius: visibleRectRadius,
+                                                                   bufferPointer: cardStrokeBufferPointer,
+                                                                   startOffset: cardStrokeVertexCount)
+                }
+
+                if cardStrokeVertexCount > 0 {
                     var strokeTransform = StrokeTransform(
-                        relativeOffset: offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y)),
                         zoomScale: Float(currentZoom),
                         screenWidth: Float(viewSize.width),
                         screenHeight: Float(viewSize.height),
                         rotationAngle: totalRotation
                     )
-                    drawStroke(stroke, with: &strokeTransform, viewSize: viewSize, encoder: encoder)
+                    encoder.setVertexBuffer(transientVertexBuffer, offset: 0, index: 0)
+                    encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                    encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cardStrokeVertexCount)
                 }
             }
 
@@ -344,7 +379,7 @@ class Coordinator: NSObject, MTKViewDelegate {
             encoder.setRenderPipelineState(cardSolidPipelineState)
             encoder.setDepthStencilState(stencilStateClear)
             encoder.setStencilReferenceValue(0)
-            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
             var clearColor = SIMD4<Float>(0, 0, 0, 0)
             encoder.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -392,7 +427,11 @@ class Coordinator: NSObject, MTKViewDelegate {
             // (Because the shader multiplies everything by childZoom, we must pre-scale the offset up)
             let frameOffsetInChildUnits = frameOffsetInParentUnits * child.scaleRelativeToParent
 
-            // 4. Render each stroke individually with screen-space culling
+            // 4. Batch render all child strokes with screen-space culling
+            let childStrokeBufferPointer = transientVertexBuffer.contents().bindMemory(to: StrokeVertex.self, capacity: maxBatchVertices)
+            var childStrokeVertexCount = 0
+            let childVisibleRectRadius = cullRadius / childZoom
+
             for stroke in child.strokes {
                 guard !stroke.localVertices.isEmpty else { continue }
 
@@ -414,15 +453,25 @@ class Coordinator: NSObject, MTKViewDelegate {
                     continue // Cull!
                 }
 
+                let childRelativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
+                childStrokeVertexCount += gatherStrokeVertices(stroke,
+                                                                relativeOffset: childRelativeOffset,
+                                                                visibleRectRadius: childVisibleRectRadius,
+                                                                bufferPointer: childStrokeBufferPointer,
+                                                                startOffset: childStrokeVertexCount)
+            }
+
+            // Draw all child strokes in one batch
+            if childStrokeVertexCount > 0 {
                 var childTransform = StrokeTransform(
-                    relativeOffset: SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y)),
                     zoomScale: Float(childZoom),
                     screenWidth: Float(viewSize.width),
                     screenHeight: Float(viewSize.height),
                     rotationAngle: currentRotation
                 )
-
-                drawStroke(stroke, with: &childTransform, viewSize: viewSize, encoder: encoder)
+                encoder.setVertexBuffer(transientVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: childStrokeVertexCount)
             }
 
             // 5. Render Child Cards (Same logic as Layer 2, but with childZoom)
@@ -444,7 +493,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // 2. Setup Transform
                 let relativeOffset = SIMD2<Float>(Float(totalRelativeOffset.x), Float(totalRelativeOffset.y))
 
-                var childCardTransform = StrokeTransform(
+                var childCardTransform = CardTransform(
                     relativeOffset: relativeOffset,
                     zoomScale: Float(childZoom), // Use the calculated childZoom
                     screenWidth: Float(viewSize.width),
@@ -518,7 +567,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 encoder.setVertexBuffer(vBuffer, offset: 0, index: 0)
                 encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
 
-                // 4. Render Card Strokes (Clipped)
+                // 4. Render Card Strokes (Clipped) - Batched
                 // FIX: Proper transform for child card strokes
                 if !card.strokes.isEmpty {
                     encoder.setRenderPipelineState(pipelineState)
@@ -531,6 +580,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                     // Rotation matrix for card rotation
                     let c = cos(Double(card.rotation))
                     let s = sin(Double(card.rotation))
+
+                    // Batch all child card strokes
+                    let childCardStrokeBufferPointer = transientVertexBuffer.contents().bindMemory(to: StrokeVertex.self, capacity: maxBatchVertices)
+                    var childCardStrokeVertexCount = 0
+                    let childVisibleRectRadius = cullRadius / childZoom
 
                     for stroke in card.strokes {
                         guard !stroke.localVertices.isEmpty else { continue }
@@ -546,16 +600,26 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                         // 3. Add to card's frame position (already relative to camera)
                         let strokePos = totalRelativeOffset + SIMD2<Double>(rotX, rotY)
+                        let strokeRelativeOffset = SIMD2<Float>(Float(strokePos.x), Float(strokePos.y))
 
+                        childCardStrokeVertexCount += gatherStrokeVertices(stroke,
+                                                                            relativeOffset: strokeRelativeOffset,
+                                                                            visibleRectRadius: childVisibleRectRadius,
+                                                                            bufferPointer: childCardStrokeBufferPointer,
+                                                                            startOffset: childCardStrokeVertexCount)
+                    }
+
+                    // Draw all child card strokes in one batch
+                    if childCardStrokeVertexCount > 0 {
                         var strokeTrans = StrokeTransform(
-                            relativeOffset: SIMD2<Float>(Float(strokePos.x), Float(strokePos.y)),
                             zoomScale: Float(childZoom),
                             screenWidth: Float(viewSize.width),
                             screenHeight: Float(viewSize.height),
                             rotationAngle: totalRot
                         )
-
-                        drawStroke(stroke, with: &strokeTrans, viewSize: viewSize, encoder: encoder)
+                        encoder.setVertexBuffer(transientVertexBuffer, offset: 0, index: 0)
+                        encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: childCardStrokeVertexCount)
                     }
                 }
 
@@ -575,97 +639,67 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Helper to draw a stroke with a given transform.
-    /// Reduces code duplication across parent/current/child rendering.
-    ///  OPTIMIZATION: Now uses cached vertex buffer and chunk-based culling
-    func drawStroke(_ stroke: Stroke, with transform: inout StrokeTransform, viewSize: CGSize, encoder: MTLRenderCommandEncoder) {
-        //  USE CACHED BUFFER
-        // The stroke's buffer was created once in init, not 60 times per second here
-        guard let vertexBuffer = stroke.vertexBuffer, let root = stroke.rootNode else { return }
+    /// Gathers visible vertices from a stroke into the batch buffer.
+    ///  OPTIMIZATION: Inverse Culling + Linear BVH
+    /// Projects the screen into the stroke's local space ONCE, then does fast AABB checks.
+    /// Writes vertices sequentially into the provided buffer pointer.
+    /// Returns the number of vertices written.
+    func gatherStrokeVertices(_ stroke: Stroke,
+                              relativeOffset: SIMD2<Float>,
+                              visibleRectRadius: Double,
+                              bufferPointer: UnsafeMutablePointer<StrokeVertex>,
+                              startOffset: Int) -> Int {
+        guard !stroke.flatNodes.isEmpty else { return 0 }
 
-        // Bind the cached vertex buffer once
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+        // 1. INVERSE CULLING: Project screen into stroke's local space
+        let camX = -Double(relativeOffset.x)
+        let camY = -Double(relativeOffset.y)
 
-        // Bind the transform once (small, can use setVertexBytes instead of makeBuffer)
-        encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+        let adjustedRadius = visibleRectRadius * brushSettings.cullingMultiplier
+        let localVisibleRect = CGRect(
+            x: camX - adjustedRadius,
+            y: camY - adjustedRadius,
+            width: adjustedRadius * 2,
+            height: adjustedRadius * 2
+        )
 
-        // Bind the stroke color
-        var strokeColor = stroke.color
-        encoder.setFragmentBytes(&strokeColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        var vertexCount = 0
 
-        // Pre-calculate projection constants for Culling
-        let zoom = Double(transform.zoomScale)
-        let offsetX = Double(transform.relativeOffset.x)
-        let offsetY = Double(transform.relativeOffset.y)
-        let rotation = Double(transform.rotationAngle)
-        let c = cos(rotation)
-        let s = sin(rotation)
-        let halfScreenW = Double(viewSize.width) / 2.0
-        let halfScreenH = Double(viewSize.height) / 2.0
+        // 2. Iterative BVH Traversal to gather visible vertices
+        var stackIndex = 0
+        var stack = [Int](repeating: 0, count: 64)
+        stack[0] = stroke.flatNodes.count - 1
 
-        let screenRect = CGRect(x: 0, y: 0, width: Double(viewSize.width), height: Double(viewSize.height))
+        while stackIndex >= 0 {
+            let nodeIdx = stack[stackIndex]
+            stackIndex -= 1
 
-        // DEBUG: Track BVH traversal
-        var nodesVisited = 0
-        var nodesCulled = 0
-        var leavesDrawn = 0
+            let node = stroke.flatNodes[nodeIdx]
 
-        // Recursive BVH Traversal Function
-        func traverseAndDraw(_ node: StrokeBVHNode) {
-            nodesVisited += 1
-
-            // 1. CULLING: Check if this Node's bounds intersect the screen
-            // If the parent is off-screen, we skip ALL its children instantly.
-
-            // Project Node Center
-            let midX = node.bounds.midX + offsetX
-            let midY = node.bounds.midY + offsetY
-
-            // Rotate
-            let rotX = midX * c - midY * s
-            let rotY = midX * s + midY * c
-
-            // Screen Coords
-            let screenX = (rotX * zoom) + halfScreenW
-            let screenY = (-rotY * zoom) + halfScreenH
-
-            // Projected Size (AABB)
-            let w = node.bounds.width * zoom
-            let h = node.bounds.height * zoom
-            let boundsW = w * abs(c) + h * abs(s)
-            let boundsH = w * abs(s) + h * abs(c)
-
-            let nodeScreenRect = CGRect(
-                x: screenX - boundsW/2,
-                y: screenY - boundsH/2,
-                width: boundsW,
-                height: boundsH
-            )
-
-            // If NO intersection, STOP. (Prune this branch)
-            if !screenRect.intersects(nodeScreenRect) {
-                nodesCulled += 1
-                return
+            if !localVisibleRect.intersects(node.bounds) {
+                continue
             }
 
-            // 2. INTERSECTION: Node is visible
-            if let left = node.left, let right = node.right {
-                // Internal Node: Dig deeper
-                traverseAndDraw(left)
-                traverseAndDraw(right)
+            if node.leftIndex != -1 {
+                // Internal Node: Push children
+                stackIndex += 1
+                stack[stackIndex] = node.leftIndex
+                stackIndex += 1
+                stack[stackIndex] = node.rightIndex
             } else {
-                // Leaf Node: Draw it!
-                // We found a small chunk (32 verts) that is definitely on screen
-                leavesDrawn += 1
-                encoder.drawPrimitives(type: .triangle, vertexStart: node.vertexStart, vertexCount: node.vertexCount)
+                // Leaf Node: Gather vertices
+                let end = min(node.vertexStart + node.vertexCount, stroke.localVertices.count)
+                for i in node.vertexStart..<end {
+                    guard (startOffset + vertexCount) < maxBatchVertices else { break }
+                    var vertex = stroke.localVertices[i]
+                    vertex.position += relativeOffset  // Apply floating origin offset
+                    bufferPointer[startOffset + vertexCount] = vertex
+                    vertexCount += 1
+                }
             }
         }
 
-        // Start traversal at Root
-        traverseAndDraw(root)
-
-        // DEBUG: Print BVH stats
-        print("    🌲 BVH: visited \(nodesVisited) nodes, culled \(nodesCulled) branches, drew \(leavesDrawn) leaves")
+        return vertexCount
     }
 
     ///  CONSTANT SCREEN SIZE HANDLES
@@ -695,13 +729,10 @@ class Coordinator: NSObject, MTKViewDelegate {
         // 2. Generate Handle Geometry (A small quad centered at 0,0)
         // We generate this on the fly because the size changes every frame (based on zoom)
         let halfS = handleSizeWorld / 2.0
-        let handleVertices: [StrokeVertex] = [
-            StrokeVertex(position: SIMD2<Float>(-halfS, -halfS), uv: .zero),
-            StrokeVertex(position: SIMD2<Float>(-halfS,  halfS), uv: .zero),
-            StrokeVertex(position: SIMD2<Float>( halfS, -halfS), uv: .zero),
-            StrokeVertex(position: SIMD2<Float>(-halfS,  halfS), uv: .zero),
-            StrokeVertex(position: SIMD2<Float>( halfS, -halfS), uv: .zero),
-            StrokeVertex(position: SIMD2<Float>( halfS,  halfS), uv: .zero)
+        let handleColor = SIMD4<Float>(0.0, 0.47, 1.0, 1.0) // Blue handle color
+        let baseHandleVertices: [SIMD2<Float>] = [
+            SIMD2<Float>(-halfS, -halfS), SIMD2<Float>(-halfS,  halfS), SIMD2<Float>( halfS, -halfS),
+            SIMD2<Float>(-halfS,  halfS), SIMD2<Float>( halfS, -halfS), SIMD2<Float>( halfS,  halfS)
         ]
 
         // 3. Calculate Corner Positions
@@ -709,30 +740,23 @@ class Coordinator: NSObject, MTKViewDelegate {
         // IMPORTANT: The handles must rotate WITH the card
         let corners = card.getLocalCorners() // TL, TR, BL, BR
 
-        // Setup Blue Color for Handles
-        var color = SIMD4<Float>(0.0, 0.47, 1.0, 1.0) // iOS Blue
-        var mode: Int = 1 // Solid Color
-        encoder.setFragmentBytes(&color, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-        encoder.setFragmentBytes(&mode, length: MemoryLayout<Int>.stride, index: 1)
+        // 4. Setup transform (without relativeOffset, applied on CPU)
+        var transform = StrokeTransform(
+            zoomScale: Float(zoom),
+            screenWidth: Float(viewSize.width),
+            screenHeight: Float(viewSize.height),
+            rotationAngle: rotation
+        )
+        encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-        // Reuse a buffer for the geometry (since all 4 handles are same size)
-        let vertexBuffer = device.makeBuffer(bytes: handleVertices,
-                                             length: handleVertices.count * MemoryLayout<StrokeVertex>.stride,
-                                             options: [])
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-
-        // 4. Draw Loop - One handle at each corner
+        // 5. Draw Loop - One handle at each corner
         for cornerLocal in corners {
-            // Position Logic:
-            // 1. Start at Card Origin (World Space)
-            // 2. Add Corner Offset (Rotated by Card Rotation)
-
             // Calculate the Handle's World Origin on CPU
             let cardRot = card.rotation
             let c = cos(cardRot)
             let s = sin(cardRot)
 
-            // Rotate the corner offset (e.g., -50, -50) by card rotation
+            // Rotate the corner offset by card rotation
             let rotatedCornerX = Double(cornerLocal.x) * Double(c) - Double(cornerLocal.y) * Double(s)
             let rotatedCornerY = Double(cornerLocal.x) * Double(s) + Double(cornerLocal.y) * Double(c)
 
@@ -740,19 +764,20 @@ class Coordinator: NSObject, MTKViewDelegate {
             let handleOriginX = card.origin.x + rotatedCornerX
             let handleOriginY = card.origin.y + rotatedCornerY
 
-            // Calculate Relative Offset for Shader
-            let relX = handleOriginX - cameraCenter.x
-            let relY = handleOriginY - cameraCenter.y
+            // Calculate Relative Offset (camera-relative position)
+            let relX = Float(handleOriginX - cameraCenter.x)
+            let relY = Float(handleOriginY - cameraCenter.y)
 
-            var transform = StrokeTransform(
-                relativeOffset: SIMD2<Float>(Float(relX), Float(relY)),
-                zoomScale: Float(zoom),
-                screenWidth: Float(viewSize.width),
-                screenHeight: Float(viewSize.height),
-                rotationAngle: rotation // Rotates the little square itself so it aligns with card
-            )
+            // Apply offset to vertices on CPU (batched rendering approach)
+            let handleVertices = baseHandleVertices.map { pos in
+                StrokeVertex(position: pos + SIMD2<Float>(relX, relY), uv: .zero, color: handleColor)
+            }
 
-            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            // Create buffer and draw
+            let vertexBuffer = device.makeBuffer(bytes: handleVertices,
+                                                 length: handleVertices.count * MemoryLayout<StrokeVertex>.stride,
+                                                 options: [])
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
     }
@@ -818,6 +843,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             var localPoints: [SIMD2<Float>]
             var liveTransform: StrokeTransform
+            var liveRelativeOffset: SIMD2<Float>
 
             //  Handle card vs canvas drawing differently
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -943,8 +969,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                     renderZoom = zoomScale
                 }
 
+                liveRelativeOffset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
                 liveTransform = StrokeTransform(
-                    relativeOffset: SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY)),
                     zoomScale: Float(renderZoom),  // Use effective zoom for the card's frame!
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
@@ -971,9 +997,9 @@ class Coordinator: NSObject, MTKViewDelegate {
                 }
 
                 let relativeOffsetDouble = tempOrigin - cameraCenterWorld
+                liveRelativeOffset = SIMD2<Float>(Float(relativeOffsetDouble.x),
+                                                   Float(relativeOffsetDouble.y))
                 liveTransform = StrokeTransform(
-                    relativeOffset: SIMD2<Float>(Float(relativeOffsetDouble.x),
-                                                 Float(relativeOffsetDouble.y)),
                     zoomScale: Float(zoomScale),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
@@ -1047,7 +1073,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 }
 
                 let cardRotation = rotationAngle + card.rotation
-                var cardTransform = StrokeTransform(
+                var cardTransform = CardTransform(
                     relativeOffset: SIMD2<Float>(Float(stencilOffsetX), Float(stencilOffsetY)),
                     zoomScale: Float(stencilZoom),  // Use effective zoom to match live stroke!
                     screenWidth: Float(view.bounds.width),
@@ -1056,7 +1082,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 )
 
                 // Draw card quad to stencil buffer
-                enc.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                enc.setVertexBytes(&cardTransform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 var clearColor = SIMD4<Float>(0, 0, 0, 0) // Transparent (won't affect color buffer)
                 enc.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
@@ -1080,27 +1106,26 @@ class Coordinator: NSObject, MTKViewDelegate {
                 enc.setDepthStencilState(stencilStateDefault)
             }
 
-            // Create buffers and render live stroke
-            let vertexBuffer = device.makeBuffer(
-                bytes: localVertices,
-                length: localVertices.count * MemoryLayout<SIMD2<Float>>.stride,
-                options: .storageModeShared
-            )
+            // Create buffers and render live stroke with batched approach
+            // Convert positions to StrokeVertex with color baked in and offset applied
+            let liveStrokeVertices = localVertices.map { pos in
+                StrokeVertex(
+                    position: pos + liveRelativeOffset,  // Apply offset on CPU
+                    uv: .zero,
+                    color: brushSettings.color
+                )
+            }
 
-            let transformBuffer = device.makeBuffer(
-                bytes: &liveTransform,
-                length: MemoryLayout<StrokeTransform>.stride,
+            let vertexBuffer = device.makeBuffer(
+                bytes: liveStrokeVertices,
+                length: liveStrokeVertices.count * MemoryLayout<StrokeVertex>.stride,
                 options: .storageModeShared
             )
 
             enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(transformBuffer, offset: 0, index: 1)
+            enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 
-            // Bind the stroke color for live stroke
-            var liveStrokeColor = brushSettings.color
-            enc.setFragmentBytes(&liveStrokeColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-
-            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: localVertices.count)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: liveStrokeVertices.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1149,14 +1174,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                 }
 
                 // Redraw card quad to clear stencil
-                var cardTransform = StrokeTransform(
+                var cardTransform = CardTransform(
                     relativeOffset: SIMD2<Float>(Float(stencilOffsetX), Float(stencilOffsetY)),
                     zoomScale: Float(stencilZoom),
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
                     rotationAngle: rotationAngle + card.rotation
                 )
-                enc.setVertexBytes(&cardTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                enc.setVertexBytes(&cardTransform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 var clearColor = SIMD4<Float>(0, 0, 0, 0)
                 enc.setFragmentBytes(&clearColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
 
@@ -1243,11 +1268,29 @@ class Coordinator: NSObject, MTKViewDelegate {
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
 
-        // Stroke Pipeline
+        // Stroke Pipeline (Batched Rendering with Color per Vertex)
+        let strokeVertexDesc = MTLVertexDescriptor()
+        // Position attribute (attribute 0)
+        strokeVertexDesc.attributes[0].format = .float2
+        strokeVertexDesc.attributes[0].offset = 0
+        strokeVertexDesc.attributes[0].bufferIndex = 0
+        // UV attribute (attribute 1)
+        strokeVertexDesc.attributes[1].format = .float2
+        strokeVertexDesc.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride
+        strokeVertexDesc.attributes[1].bufferIndex = 0
+        // Color attribute (attribute 2) - NEW for batching
+        strokeVertexDesc.attributes[2].format = .float4
+        strokeVertexDesc.attributes[2].offset = MemoryLayout<SIMD2<Float>>.stride * 2
+        strokeVertexDesc.attributes[2].bufferIndex = 0
+        // Layout
+        strokeVertexDesc.layouts[0].stride = MemoryLayout<StrokeVertex>.stride
+        strokeVertexDesc.layouts[0].stepFunction = .perVertex
+
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction   = library.makeFunction(name: "vertex_main")
         desc.fragmentFunction = library.makeFunction(name: "fragment_main")
         desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        desc.vertexDescriptor = strokeVertexDesc
         desc.stencilAttachmentPixelFormat = .stencil8 //  Required for stencil buffer
         pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
 
