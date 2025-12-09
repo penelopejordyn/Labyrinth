@@ -15,8 +15,9 @@ struct StrokeVertex {
 
 // MARK: - Transform Structures
 
-/// Transform for batched stroke rendering (position calculated on CPU)
+/// Transform for ICB stroke rendering (position offset calculated on GPU)
 struct StrokeTransform {
+    var relativeOffset: SIMD2<Float>  // Stroke position relative to camera
     var zoomScale: Float
     var screenWidth: Float
     var screenHeight: Float

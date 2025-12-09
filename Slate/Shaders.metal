@@ -2,9 +2,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Batched Rendering Transform
-/// Position is pre-calculated on CPU (camera-relative), so we only need projection params
+/// GPU-Side Rendering Transform (ICB Optimized)
+/// Position offset is applied in the vertex shader, not on CPU
 struct StrokeTransform {
+    float2 relativeOffset;  // Stroke position relative to camera (Floating Origin)
     float zoomScale;        // Current zoom level
     float screenWidth;      // Screen dimensions for NDC conversion
     float screenHeight;
@@ -27,19 +28,19 @@ struct VertexOut {
 
 vertex VertexOut vertex_main(VertexIn in [[stage_in]],
                              constant StrokeTransform *transform [[buffer(1)]]) {
-    // Position is ALREADY relative to camera (calculated on CPU during batching)
-    // We just need to rotate and project
+    // Step 1: Apply Floating Origin offset (GPU does the math now)
+    float2 worldRelative = in.position + transform->relativeOffset;
 
-    // Step A: Rotation around camera center (0,0)
+    // Step 2: Rotation around camera center (0,0)
     float c = cos(transform->rotationAngle);
     float s = sin(transform->rotationAngle);
-    float rotX = in.position.x * c - in.position.y * s;
-    float rotY = in.position.x * s + in.position.y * c;
+    float rotX = worldRelative.x * c - worldRelative.y * s;
+    float rotY = worldRelative.x * s + worldRelative.y * c;
 
-    // Step B: Zoom - Scale by zoom factor
+    // Step 3: Zoom - Scale by zoom factor
     float2 zoomed = float2(rotX, rotY) * transform->zoomScale;
 
-    // Step C: Projection - Convert to NDC [-1, 1]
+    // Step 4: Projection - Convert to NDC [-1, 1]
     float ndcX = (zoomed.x / transform->screenWidth) * 2.0;
     float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
 
