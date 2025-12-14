@@ -13,6 +13,10 @@ struct StrokeVertex {
     var color: SIMD4<Float>      // Vertex color (baked for batching)
 }
 
+struct QuadVertex {
+    var corner: SIMD2<Float>
+}
+
 // MARK: - Transform Structures
 
 /// Transform for ICB stroke rendering (position offset calculated on GPU)
@@ -23,6 +27,7 @@ struct StrokeTransform {
     var screenHeight: Float
     var rotationAngle: Float
     var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
+    var featherPx: Float                // Feather radius in screen pixels for SDF falloff
 }
 
 /// Transform for card rendering (not batched, includes offset)

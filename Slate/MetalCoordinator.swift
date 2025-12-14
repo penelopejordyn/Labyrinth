@@ -10,13 +10,14 @@ import simd
 class Coordinator: NSObject, MTKViewDelegate {
     var device: MTLDevice!
     var commandQueue: MTLCommandQueue!
-    var pipelineState: MTLRenderPipelineState!
+    var strokePipelineState: MTLRenderPipelineState!
+    var handlePipelineState: MTLRenderPipelineState!
     var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
     var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
     var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
     var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
     var samplerState: MTLSamplerState!                  // Sampler for card textures
-    var vertexBuffer: MTLBuffer!
+    var quadVertexBuffer: MTLBuffer!
 
     // Note: ICB removed - using simple GPU-offset approach instead
 
@@ -159,10 +160,10 @@ class Coordinator: NSObject, MTKViewDelegate {
         var culledStrokes = 0
 
         // GPU-Offset Rendering: Direct draw with GPU applying offset
-        encoder.setRenderPipelineState(pipelineState)
+        encoder.setRenderPipelineState(strokePipelineState)
 
         for stroke in frame.strokes {
-            guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
+            guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
             totalStrokes += 1
 
             let relativeOffsetDouble = stroke.origin - cameraCenterInThisFrame
@@ -197,15 +198,16 @@ class Coordinator: NSObject, MTKViewDelegate {
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
                 rotationAngle: currentRotation,
-                halfPixelWidth: halfPixelWidth
+                halfPixelWidth: halfPixelWidth,
+                featherPx: 1.0
             )
 
-            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+            encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
 
-            // Track debug metrics
-            debugDrawnVerticesThisFrame += stroke.localVertices.count
+            debugDrawnVerticesThisFrame += stroke.segments.count * 4
             debugDrawnNodesThisFrame += 1
         }
 
@@ -324,46 +326,48 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             //  STEP 2: DRAW CARD STROKES (CLIPPED TO CARD)
             // Only draw where stencil == 1
-            if !card.strokes.isEmpty {
-                encoder.setRenderPipelineState(pipelineState)
-                encoder.setDepthStencilState(stencilStateRead) // <--- READ MODE
-                encoder.setStencilReferenceValue(1)
+                if !card.strokes.isEmpty {
+                    encoder.setRenderPipelineState(strokePipelineState)
+                    encoder.setDepthStencilState(stencilStateRead) // <--- READ MODE
+                    encoder.setStencilReferenceValue(1)
 
-                // Calculate "magic offset" for card-local coordinates
-                let totalRotation = currentRotation + card.rotation
-                let distX = card.origin.x - cameraCenterInThisFrame.x
-                let distY = card.origin.y - cameraCenterInThisFrame.y
-                let c = cos(Double(-card.rotation))
-                let s = sin(Double(-card.rotation))
-                let magicOffsetX = distX * c - distY * s
-                let magicOffsetY = distX * s + distY * c
-                let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
+                    // Calculate "magic offset" for card-local coordinates
+                    let totalRotation = currentRotation + card.rotation
+                    let distX = card.origin.x - cameraCenterInThisFrame.x
+                    let distY = card.origin.y - cameraCenterInThisFrame.y
+                    let c = cos(Double(-card.rotation))
+                    let s = sin(Double(-card.rotation))
+                    let magicOffsetX = distX * c - distY * s
+                    let magicOffsetY = distX * s + distY * c
+                    let offset = SIMD2<Float>(Float(magicOffsetX), Float(magicOffsetY))
 
-                // Draw card strokes directly (GPU applies offset)
-                for stroke in card.strokes {
-                    guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
-                    let strokeOffset = stroke.origin
-                    let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
+                    // Draw card strokes directly (GPU applies offset)
+                    for stroke in card.strokes {
+                        guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
+                        let strokeOffset = stroke.origin
+                        let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
 
-                    // Calculate screen-space thickness for card strokes
-                    let basePixelWidth = Float(stroke.worldWidth * currentZoom)
-                    let clampedPixelWidth = min(basePixelWidth, 1000.0)
-                    let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
+                        // Calculate screen-space thickness for card strokes
+                        let basePixelWidth = Float(stroke.worldWidth * currentZoom)
+                        let clampedPixelWidth = min(basePixelWidth, 1000.0)
+                        let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
 
-                    var strokeTransform = StrokeTransform(
-                        relativeOffset: strokeRelativeOffset,
-                        zoomScale: Float(currentZoom),
-                        screenWidth: Float(viewSize.width),
-                        screenHeight: Float(viewSize.height),
-                        rotationAngle: totalRotation,
-                        halfPixelWidth: halfPixelWidth
-                    )
+                        var strokeTransform = StrokeTransform(
+                            relativeOffset: strokeRelativeOffset,
+                            zoomScale: Float(currentZoom),
+                            screenWidth: Float(viewSize.width),
+                            screenHeight: Float(viewSize.height),
+                            rotationAngle: totalRotation,
+                            halfPixelWidth: halfPixelWidth,
+                            featherPx: 1.0
+                        )
 
-                    encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-                    encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                    encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+                        encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+                        encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
+                    }
                 }
-            }
 
             //  STEP 3: CLEANUP STENCIL (Reset to 0 for next card)
             // Draw the card quad again with stencil clear mode
@@ -390,7 +394,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         // Reset pipeline and stencil state for subsequent rendering (live stroke, child frames, etc.)
-        encoder.setRenderPipelineState(pipelineState)
+        encoder.setRenderPipelineState(strokePipelineState)
         encoder.setDepthStencilState(stencilStateDefault)
 
         // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
@@ -420,12 +424,10 @@ class Coordinator: NSObject, MTKViewDelegate {
 
             // 4. Render child strokes directly (GPU applies offset)
             for stroke in child.strokes {
-                guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
+                guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
 
-                //  FIX: Add the Stroke's own origin to the Frame's offset
                 let totalRelativeOffset = stroke.origin + frameOffsetInChildUnits
 
-                // SCREEN SPACE CULLING for child strokes
                 let boundsCenter = SIMD2<Double>(stroke.localBounds.midX, stroke.localBounds.midY)
                 let worldCenter = totalRelativeOffset + boundsCenter
                 let distWorld = sqrt(worldCenter.x * worldCenter.x + worldCenter.y * worldCenter.y)
@@ -438,7 +440,6 @@ class Coordinator: NSObject, MTKViewDelegate {
                     continue // Cull!
                 }
 
-                // Calculate screen-space thickness for child strokes
                 let basePixelWidth = Float(stroke.worldWidth * childZoom)
                 let clampedPixelWidth = min(basePixelWidth, 1000.0)
                 let halfPixelWidth = max(clampedPixelWidth * 0.5, 0.5)
@@ -450,15 +451,16 @@ class Coordinator: NSObject, MTKViewDelegate {
                     screenWidth: Float(viewSize.width),
                     screenHeight: Float(viewSize.height),
                     rotationAngle: currentRotation,
-                    halfPixelWidth: halfPixelWidth
+                    halfPixelWidth: halfPixelWidth,
+                    featherPx: 1.0
                 )
 
-                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&childTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+                encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
 
-                // Track debug metrics
-                debugDrawnVerticesThisFrame += stroke.localVertices.count
+                debugDrawnVerticesThisFrame += stroke.segments.count * 4
                 debugDrawnNodesThisFrame += 1
             }
 
@@ -558,7 +560,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // 4. Render Card Strokes (Clipped) - Batched
                 // FIX: Proper transform for child card strokes
                 if !card.strokes.isEmpty {
-                    encoder.setRenderPipelineState(pipelineState)
+                    encoder.setRenderPipelineState(strokePipelineState)
                     encoder.setDepthStencilState(stencilStateRead)
                     encoder.setStencilReferenceValue(1)
 
@@ -571,7 +573,7 @@ class Coordinator: NSObject, MTKViewDelegate {
 
                     // Draw child card strokes directly (GPU applies offset)
                     for stroke in card.strokes {
-                        guard !stroke.localVertices.isEmpty, let vertexBuffer = stroke.vertexBuffer else { continue }
+                        guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
 
                         // Transform Stroke Origin: Card Local -> Frame Local -> Camera Relative
                         let sx = stroke.origin.x
@@ -594,12 +596,14 @@ class Coordinator: NSObject, MTKViewDelegate {
                             screenWidth: Float(viewSize.width),
                             screenHeight: Float(viewSize.height),
                             rotationAngle: totalRot,
-                            halfPixelWidth: halfPixelWidth
+                            halfPixelWidth: halfPixelWidth,
+                            featherPx: 1.0
                         )
 
-                        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
                         encoder.setVertexBytes(&strokeTrans, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: stroke.localVertices.count)
+                        encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+                        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
                     }
                 }
 
@@ -662,6 +666,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         // NOTE: Base transform not needed - each handle gets its own transform with relativeOffset
 
         // 5. Draw Loop - One handle at each corner
+        encoder.setRenderPipelineState(handlePipelineState)
+
         for cornerLocal in corners {
             // Calculate the Handle's World Origin on CPU
             let cardRot = card.rotation
@@ -691,7 +697,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                 screenWidth: Float(viewSize.width),
                 screenHeight: Float(viewSize.height),
                 rotationAngle: rotation,
-                halfPixelWidth: 1.0  // Handles don't use thickness, but field is required
+                halfPixelWidth: 1.0,  // Handles don't use thickness, but field is required
+                featherPx: 1.0
             )
 
             // Create buffer and draw
@@ -713,7 +720,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         let commandBuffer = commandQueue.makeCommandBuffer()!
         guard let rpd = view.currentRenderPassDescriptor else { return }
         let enc = commandBuffer.makeRenderCommandEncoder(descriptor: rpd)!
-        enc.setRenderPipelineState(pipelineState)
+        enc.setRenderPipelineState(strokePipelineState)
         enc.setCullMode(.none)
 
         // Recursive Rendering
@@ -903,7 +910,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
                     rotationAngle: rotationAngle + card.rotation,
-                    halfPixelWidth: liveHalfPixelWidth
+                    halfPixelWidth: liveHalfPixelWidth,
+                    featherPx: 1.0
                 )
             } else {
                 // CANVAS DRAWING: Use original approach
@@ -939,18 +947,37 @@ class Coordinator: NSObject, MTKViewDelegate {
                     screenWidth: Float(view.bounds.width),
                     screenHeight: Float(view.bounds.height),
                     rotationAngle: rotationAngle,
-                    halfPixelWidth: liveHalfPixelWidth
+                    halfPixelWidth: liveHalfPixelWidth,
+                    featherPx: 1.0
                 )
             }
 
-            // Tessellate in LOCAL space using CENTERLINE approach
-            // This matches committed strokes for consistent rendering
-            let liveVertices = tessellateCenterlineVertices(
-                points: localPoints,
-                color: brushSettings.color
-            )
+            // Build SDF segments for live stroke
+            var liveSegments: [StrokeSegmentInstance] = []
+            if localPoints.count >= 2 {
+                liveSegments.reserveCapacity(localPoints.count - 1)
+                for i in 0..<(localPoints.count - 1) {
+                    let p0 = localPoints[i]
+                    let p1 = localPoints[i + 1]
+                    liveSegments.append(StrokeSegmentInstance(p0: p0, p1: p1, color: brushSettings.color))
+                }
+            } else if localPoints.count == 1 {
+                let p = localPoints[0]
+                liveSegments = [StrokeSegmentInstance(p0: p, p1: p, color: brushSettings.color)]
+            }
 
-            guard !liveVertices.isEmpty else {
+            guard !liveSegments.isEmpty else {
+                enc.endEncoding()
+                commandBuffer.present(view.currentDrawable!)
+                commandBuffer.commit()
+                return
+            }
+
+            guard let liveSegmentBuffer = device.makeBuffer(
+                bytes: liveSegments,
+                length: liveSegments.count * MemoryLayout<StrokeSegmentInstance>.stride,
+                options: .storageModeShared
+            ) else {
                 enc.endEncoding()
                 commandBuffer.present(view.currentDrawable!)
                 commandBuffer.commit()
@@ -1034,27 +1061,20 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // STEP 2: Set stencil read mode for live stroke (clip to card)
                 enc.setDepthStencilState(stencilStateRead)
                 enc.setStencilReferenceValue(1)
-                enc.setRenderPipelineState(pipelineState)
+                enc.setRenderPipelineState(strokePipelineState)
             } else {
                 // Drawing on canvas - reset to stroke pipeline
                 // FIX: The recursive renderer may have left cardSolidPipelineState active
                 // after rendering child frame cards. We must explicitly reset to pipelineState.
-                enc.setRenderPipelineState(pipelineState)
+                enc.setRenderPipelineState(strokePipelineState)
                 enc.setDepthStencilState(stencilStateDefault)
             }
 
-            // Create buffers and render live stroke (GPU applies offset)
-            // liveVertices already contains StrokeVertex with centerline positions and side flags
-            let vertexBuffer = device.makeBuffer(
-                bytes: liveVertices,
-                length: liveVertices.count * MemoryLayout<StrokeVertex>.stride,
-                options: .storageModeShared
-            )
-
-            enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            enc.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&liveTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            enc.setVertexBuffer(liveSegmentBuffer, offset: 0, index: 2)
 
-            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: liveVertices.count)
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: liveSegments.count)
 
             // STEP 3: Clean up stencil if we used it
             if case .card(let card, let frame) = currentDrawingTarget {
@@ -1198,42 +1218,63 @@ class Coordinator: NSObject, MTKViewDelegate {
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
 
-        // Stroke Pipeline (Batched Rendering with Color per Vertex)
+        // Handle/legacy stroke pipeline (StrokeVertex layout)
         let strokeVertexDesc = MTLVertexDescriptor()
-        // Position attribute (attribute 0)
         strokeVertexDesc.attributes[0].format = .float2
         strokeVertexDesc.attributes[0].offset = 0
         strokeVertexDesc.attributes[0].bufferIndex = 0
-        // UV attribute (attribute 1)
         strokeVertexDesc.attributes[1].format = .float2
         strokeVertexDesc.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride
         strokeVertexDesc.attributes[1].bufferIndex = 0
-        // Color attribute (attribute 2) - NEW for batching
         strokeVertexDesc.attributes[2].format = .float4
         strokeVertexDesc.attributes[2].offset = MemoryLayout<SIMD2<Float>>.stride * 2
         strokeVertexDesc.attributes[2].bufferIndex = 0
-        // Layout
         strokeVertexDesc.layouts[0].stride = MemoryLayout<StrokeVertex>.stride
         strokeVertexDesc.layouts[0].stepFunction = .perVertex
 
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction   = library.makeFunction(name: "vertex_main")
-        desc.fragmentFunction = library.makeFunction(name: "fragment_main")
-        desc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        let handleDesc = MTLRenderPipelineDescriptor()
+        handleDesc.vertexFunction   = library.makeFunction(name: "vertex_main")
+        handleDesc.fragmentFunction = library.makeFunction(name: "fragment_main")
+        handleDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
 
-        // Enable blending for round caps (alpha masking in fragment shader)
-        let attachment = desc.colorAttachments[0]!
-        attachment.isBlendingEnabled = true
-        attachment.rgbBlendOperation = .add
-        attachment.alphaBlendOperation = .add
-        attachment.sourceRGBBlendFactor = .sourceAlpha
-        attachment.sourceAlphaBlendFactor = .sourceAlpha
-        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        let handleAttachment = handleDesc.colorAttachments[0]!
+        handleAttachment.isBlendingEnabled = true
+        handleAttachment.rgbBlendOperation = .add
+        handleAttachment.alphaBlendOperation = .add
+        handleAttachment.sourceRGBBlendFactor = .sourceAlpha
+        handleAttachment.sourceAlphaBlendFactor = .sourceAlpha
+        handleAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        handleAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
-        desc.vertexDescriptor = strokeVertexDesc
-        desc.stencilAttachmentPixelFormat = .stencil8 //  Required for stencil buffer
-        pipelineState = try? device.makeRenderPipelineState(descriptor: desc)
+        handleDesc.vertexDescriptor = strokeVertexDesc
+        handleDesc.stencilAttachmentPixelFormat = .stencil8
+        handlePipelineState = try? device.makeRenderPipelineState(descriptor: handleDesc)
+
+        // Stroke SDF pipeline (QuadVertex layout + instancing)
+        let quadVertexDesc = MTLVertexDescriptor()
+        quadVertexDesc.attributes[0].format = .float2
+        quadVertexDesc.attributes[0].offset = 0
+        quadVertexDesc.attributes[0].bufferIndex = 0
+        quadVertexDesc.layouts[0].stride = MemoryLayout<QuadVertex>.stride
+        quadVertexDesc.layouts[0].stepFunction = .perVertex
+
+        let sdfDesc = MTLRenderPipelineDescriptor()
+        sdfDesc.vertexFunction   = library.makeFunction(name: "vertex_segment_sdf")
+        sdfDesc.fragmentFunction = library.makeFunction(name: "fragment_segment_sdf")
+        sdfDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+
+        let sdfAttachment = sdfDesc.colorAttachments[0]!
+        sdfAttachment.isBlendingEnabled = true
+        sdfAttachment.rgbBlendOperation = .add
+        sdfAttachment.alphaBlendOperation = .add
+        sdfAttachment.sourceRGBBlendFactor = .sourceAlpha
+        sdfAttachment.sourceAlphaBlendFactor = .sourceAlpha
+        sdfAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        sdfAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+        sdfDesc.vertexDescriptor = quadVertexDesc
+        sdfDesc.stencilAttachmentPixelFormat = .stencil8
+        strokePipelineState = try? device.makeRenderPipelineState(descriptor: sdfDesc)
 
         // Setup vertex descriptor for StrokeVertex structure (shared by both card pipelines)
         let vertexDesc = MTLVertexDescriptor()
@@ -1390,23 +1431,16 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func makeVertexBuffer() {
-        var positions: [SIMD2<Float>] = [
-            SIMD2<Float>(-0.8,  0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.8, -0.5),
-            SIMD2<Float>(-0.3, -0.5),
-            SIMD2<Float>(-0.3,  0.5),
-            SIMD2<Float>(-0.8,  0.5),
+        let quadVertices: [QuadVertex] = [
+            QuadVertex(corner: SIMD2<Float>(0, 0)),
+            QuadVertex(corner: SIMD2<Float>(1, 0)),
+            QuadVertex(corner: SIMD2<Float>(0, 1)),
+            QuadVertex(corner: SIMD2<Float>(1, 1)),
         ]
-        vertexBuffer = device.makeBuffer(bytes: &positions,
-                                         length: positions.count * MemoryLayout<SIMD2<Float>>.stride,
-                                         options: [])
-    }
 
-    func updateVertexBuffer(with vertices: [SIMD2<Float>]) {
-        guard !vertices.isEmpty else { return }
-        let bufferSize = vertices.count * MemoryLayout<SIMD2<Float>>.stride
-        vertexBuffer = device.makeBuffer(bytes: vertices, length: bufferSize, options: .storageModeShared)
+        quadVertexBuffer = device.makeBuffer(bytes: quadVertices,
+                                             length: quadVertices.count * MemoryLayout<QuadVertex>.stride,
+                                             options: .storageModeShared)
     }
 
     // MARK: - Camera Center Calculation
