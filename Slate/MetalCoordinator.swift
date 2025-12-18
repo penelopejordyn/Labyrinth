@@ -5,47 +5,21 @@ import Metal
 import MetalKit
 import simd
 
-private let DISAPPEAR_DELTA: Float = Float.greatestFiniteMagnitude
-private let TILE_SIZE_PX: Int = 1024
-private let TILE_PAD_PX: Int = 64
-private let BASE_WORLD_UNITS_PER_PIXEL: Float = 1.0
-private let MAX_TILE_CACHE = 300
-private let MAX_VISIBLE_TILES = 900
-private let MAX_BAKES_PER_FRAME = 5
-
 // MARK: - Coordinator
 
-fileprivate struct TileKey: Hashable {
-    let frameID: UUID
-    let level: Int
-    let x: Int
-    let y: Int
-}
-
-fileprivate struct TileEntry {
-    var texture: MTLTexture
-    var isDirty: Bool
-    var hasContent: Bool
-    var lastUsedFrame: Int
-}
-
-class Coordinator: NSObject, MTKViewDelegate {
-    var device: MTLDevice!
-    var commandQueue: MTLCommandQueue!
-    var pipelineState: MTLRenderPipelineState!
-    var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
-    var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
-    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
-    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
-    var tilePipelineState: MTLRenderPipelineState!      // Pipeline for baked tiles
-    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
-    var samplerState: MTLSamplerState!                  // Sampler for card textures
-    var vertexBuffer: MTLBuffer!
-    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
-    fileprivate var tileCache: [TileKey: TileEntry] = [:]
-    fileprivate var tileLRU: [TileKey] = []
-    var frameCounter: Int = 0
-    var tilesBakedThisFrame: Int = 0
+	class Coordinator: NSObject, MTKViewDelegate {
+	    var device: MTLDevice!
+	    var commandQueue: MTLCommandQueue!
+	    var pipelineState: MTLRenderPipelineState!
+	    var cardPipelineState: MTLRenderPipelineState!      // Pipeline for textured cards
+	    var cardSolidPipelineState: MTLRenderPipelineState! // Pipeline for solid color cards
+	    var cardLinedPipelineState: MTLRenderPipelineState! // Pipeline for lined paper cards
+	    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
+	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
+	    var postProcessPipelineState: MTLRenderPipelineState!   // FXAA fullscreen pass
+	    var samplerState: MTLSamplerState!                  // Sampler for card textures
+	    var vertexBuffer: MTLBuffer!
+	    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
 
     // Note: ICB removed - using simple GPU-offset approach instead
 
@@ -54,6 +28,16 @@ class Coordinator: NSObject, MTKViewDelegate {
     var stencilStateWrite: MTLDepthStencilState!   // Writes 1s to stencil (card background)
     var stencilStateRead: MTLDepthStencilState!    // Only draws where stencil == 1 (card strokes)
     var stencilStateClear: MTLDepthStencilState!   // Writes 0s to stencil (cleanup)
+
+    // Depth States for Stroke Rendering
+    var strokeDepthStateWrite: MTLDepthStencilState!   // Depth test + write enabled
+    var strokeDepthStateNoWrite: MTLDepthStencilState! // Depth test enabled, depth write disabled
+
+    // Offscreen render targets (scene -> texture, then FXAA -> drawable)
+    private var offscreenColorTexture: MTLTexture?
+    private var offscreenDepthStencilTexture: MTLTexture?
+    private var offscreenTextureWidth: Int = 0
+    private var offscreenTextureHeight: Int = 0
 
     // MARK: - Modal Input: Pencil vs. Finger
 
@@ -91,13 +75,32 @@ class Coordinator: NSObject, MTKViewDelegate {
     // MARK: - Brush Settings
     let brushSettings = BrushSettings()
 
-    // MARK: - Debug Metrics
-    var debugDrawnVerticesThisFrame: Int = 0
-    var debugDrawnNodesThisFrame: Int = 0
+	    // MARK: - Debug Metrics
+	    var debugDrawnVerticesThisFrame: Int = 0
+	    var debugDrawnNodesThisFrame: Int = 0
 
-    override init() {
-        super.init()
-        device = MTLCreateSystemDefaultDevice()!
+	    // MARK: - Global Stroke Depth Ordering
+	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
+	    // Larger depthID = newer stroke; we map this into Metal NDC depth (smaller = closer).
+	    private static let strokeDepthSlotCount: UInt32 = 1 << 24
+	    private static let strokeDepthDenominator: Float = Float(strokeDepthSlotCount) + 1.0
+	    private var nextStrokeDepthID: UInt32 = 0
+
+	    private func allocateStrokeDepthID() -> UInt32 {
+	        let id = nextStrokeDepthID
+	        if nextStrokeDepthID < Self.strokeDepthSlotCount - 1 {
+	            nextStrokeDepthID += 1
+	        }
+	        return id
+	    }
+
+	    private func peekStrokeDepthID() -> UInt32 {
+	        nextStrokeDepthID
+	    }
+
+	    override init() {
+	        super.init()
+	        device = MTLCreateSystemDefaultDevice()!
         commandQueue = device.makeCommandQueue()!
 
         makePipeLine()
@@ -105,216 +108,38 @@ class Coordinator: NSObject, MTKViewDelegate {
         makeQuadVertexBuffer()
     }
 
-    // MARK: - Tile Helpers
-
-    private func worldUnitsPerPixel(for level: Int) -> Double {
-        return Double(BASE_WORLD_UNITS_PER_PIXEL) / pow(2.0, Double(level))
-    }
-
-    private func tileWorldSize(for level: Int) -> Double {
-        return Double(TILE_SIZE_PX) * worldUnitsPerPixel(for: level)
-    }
-
-    private func tileLevel(for zoom: Double) -> Int {
-        // Target world units per pixel ~ 1/zoom
-        let target = 1.0 / max(zoom, 1e-12)
-        let raw = log2(Double(BASE_WORLD_UNITS_PER_PIXEL) / target)
-        let level = Int(round(raw))
-        return max(-24, min(level, 12)) // allow larger tiles when zoomed out
-    }
-
-    private func tileKey(for frameID: UUID, level: Int, x: Int, y: Int) -> TileKey {
-        TileKey(frameID: frameID, level: level, x: x, y: y)
-    }
-
-    private func touchTileLRU(_ key: TileKey) {
-        if let idx = tileLRU.firstIndex(of: key) {
-            tileLRU.remove(at: idx)
-        }
-        tileLRU.append(key)
-        evictTilesIfNeeded()
-    }
-
-    private func evictTilesIfNeeded() {
-        while tileCache.count > MAX_TILE_CACHE, let key = tileLRU.first {
-            tileCache.removeValue(forKey: key)
-            tileLRU.removeFirst()
-        }
-    }
-
-    private func strokeWorldBounds(_ stroke: Stroke) -> CGRect {
-        var rect = stroke.localBounds
-        rect.origin.x += stroke.origin.x
-        rect.origin.y += stroke.origin.y
-        return rect
-    }
-
-    // Mark any cached tile that intersects this stroke as dirty, across all levels.
-    private func markTilesDirty(for stroke: Stroke, in frame: Frame) {
-        let strokeBounds = strokeWorldBounds(stroke)
-
-        for (key, entry) in tileCache where key.frameID == frame.id {
-            let tileRect = self.tileRect(for: key)
-            if tileRect.intersects(strokeBounds) {
-                var updated = entry
-                updated.isDirty = true
-                tileCache[key] = updated
-            }
-        }
-    }
-
-    private func visibleTiles(for frameID: UUID,
-                              level: Int,
-                              cameraCenter: SIMD2<Double>,
-                              viewSize: CGSize,
-                              zoom: Double) -> ([TileKey], Int) {
-        let worldUnitsPerPixel = worldUnitsPerPixel(for: level)
-        let halfWidth = Double(viewSize.width) * 0.5 / zoom
-        let halfHeight = Double(viewSize.height) * 0.5 / zoom
-        let padWorld = Double(TILE_PAD_PX) * worldUnitsPerPixel * 2.0
-        // Pad for rotation and safety
-        let pad = (halfWidth + halfHeight) * 0.5 + padWorld
-        let minX = cameraCenter.x - halfWidth - pad
-        let maxX = cameraCenter.x + halfWidth + pad
-        let minY = cameraCenter.y - halfHeight - pad
-        let maxY = cameraCenter.y + halfHeight + pad
-
-        let tileSizeW = tileWorldSize(for: level)
-        let tileMinX = Int(floor(minX / tileSizeW))
-        let tileMaxX = Int(floor(maxX / tileSizeW))
-        let tileMinY = Int(floor(minY / tileSizeW))
-        let tileMaxY = Int(floor(maxY / tileSizeW))
-
-        var keys: [TileKey] = []
-        keys.reserveCapacity((tileMaxX - tileMinX + 1) * (tileMaxY - tileMinY + 1))
-        for tx in tileMinX...tileMaxX {
-            for ty in tileMinY...tileMaxY {
-                keys.append(tileKey(for: frameID, level: level, x: tx, y: ty))
-            }
-        }
-
-        // If too many tiles, pick a coarser level until under the cap
-        if keys.count > MAX_VISIBLE_TILES {
-            let newLevel = level - 1
-            return visibleTiles(for: frameID, level: newLevel, cameraCenter: cameraCenter, viewSize: viewSize, zoom: zoom)
-        }
-
-        return (keys, level)
-    }
-
-    private func tileRect(for key: TileKey) -> CGRect {
-        let size = tileWorldSize(for: key.level)
-        let originX = Double(key.x) * size
-        let originY = Double(key.y) * size
-        return CGRect(x: originX, y: originY, width: size, height: size)
-    }
-
-    private func ensureTileTexture(for key: TileKey) -> MTLTexture? {
-        if let existing = tileCache[key]?.texture {
-            return existing
-        }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                            width: TILE_SIZE_PX + TILE_PAD_PX * 2,
-                                                            height: TILE_SIZE_PX + TILE_PAD_PX * 2,
-                                                            mipmapped: false)
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
-        guard let tex = device.makeTexture(descriptor: desc) else { return nil }
-        let entry = TileEntry(texture: tex, isDirty: true, hasContent: false, lastUsedFrame: frameCounter)
-        tileCache[key] = entry
-        touchTileLRU(key)
-        return tex
-    }
-
-    private func bakeTileIfNeeded(key: TileKey, frame: Frame, level: Int, strokes: [Stroke], bakeCommandBuffer: MTLCommandBuffer) -> Bool {
-        if tilesBakedThisFrame >= MAX_BAKES_PER_FRAME { return false }
-        guard let texture = ensureTileTexture(for: key) else { return false }
-        var entry = tileCache[key]!
-        if !entry.isDirty { return false }
-        tilesBakedThisFrame += 1
-
-        let tileWorldRect = tileRect(for: key)
-        let invWorldUnitsPerPixel = Float(1.0 / worldUnitsPerPixel(for: level))
-        let currentZoomEffective = Float(invWorldUnitsPerPixel)
-        let padWorld = Double(TILE_PAD_PX) * worldUnitsPerPixel(for: level)
-        let expandedRect = tileWorldRect.insetBy(dx: -padWorld, dy: -padWorld)
-
-        let rpd = MTLRenderPassDescriptor()
-        rpd.colorAttachments[0].texture = texture
-        rpd.colorAttachments[0].loadAction = .clear
-        rpd.colorAttachments[0].storeAction = .store
-        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
-        // Provide a stencil attachment because the stroke pipeline expects one
-        let stencilDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .stencil8,
-                                                                   width: TILE_SIZE_PX + TILE_PAD_PX * 2,
-                                                                   height: TILE_SIZE_PX + TILE_PAD_PX * 2,
-                                                                   mipmapped: false)
-        stencilDesc.usage = .renderTarget
-        stencilDesc.storageMode = .private
-        if let stencilTex = device.makeTexture(descriptor: stencilDesc) {
-            rpd.stencilAttachment.texture = stencilTex
-            rpd.stencilAttachment.loadAction = .clear
-            rpd.stencilAttachment.storeAction = .dontCare
-        }
-
-        guard let encoder = bakeCommandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { return false }
-
-        encoder.setRenderPipelineState(strokeSegmentPipelineState)
-        encoder.setCullMode(.none)
-        encoder.setDepthStencilState(stencilStateDefault)
-        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
-
-        for stroke in strokes {
-            guard let segmentBuffer = stroke.segmentBuffer, !stroke.segments.isEmpty else { continue }
-            let delta = currentZoomEffective - stroke.zoomEffectiveAtCreation
-            if delta >= DISAPPEAR_DELTA { continue }
-
-            let strokeBounds = strokeWorldBounds(stroke)
-            if !strokeBounds.intersects(expandedRect) { continue }
-
-            let halfPixelWidth = max(Float(stroke.worldWidth) * currentZoomEffective * 0.5, 0.5)
-
-            // Position stroke relative to tile center using high precision, then scale to tile pixels
-            let tileCenterX = tileWorldRect.midX
-            let tileCenterY = tileWorldRect.midY
-            let dx = stroke.origin.x - tileCenterX
-            let dy = stroke.origin.y - tileCenterY
-            let angle: Double = 0 // baking in tile space, no rotation
-            let c = cos(angle)
-            let s = sin(angle)
-            let rdx = dx * c - dy * s
-            let rdy = dx * s + dy * c
-            let rotatedOffsetScreen = SIMD2<Float>(Float(rdx * Double(invWorldUnitsPerPixel)),
-                                                   Float(rdy * Double(invWorldUnitsPerPixel)))
-
-            var transform = StrokeTransform(
-                relativeOffset: .zero,
-                rotatedOffsetScreen: rotatedOffsetScreen,
-                zoomScale: invWorldUnitsPerPixel,
-                screenWidth: Float(TILE_SIZE_PX + TILE_PAD_PX * 2),
-                screenHeight: Float(TILE_SIZE_PX + TILE_PAD_PX * 2),
-                rotationAngle: 0,
-                halfPixelWidth: halfPixelWidth,
-                featherPx: 1.0
-            )
-
-            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
-            encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
-            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
-        }
-
-        encoder.endEncoding()
-
-        entry.isDirty = false
-        entry.hasContent = true
-        entry.lastUsedFrame = frameCounter
-        tileCache[key] = entry
-        touchTileLRU(key)
-        return true
-    }
-
-    // MARK: - Commit 2: Recursive Renderer
+	    // MARK: - Recursive Renderer
+	    /// Calculate Metal depth value for a stroke based on creation order
+	    ///
+	    /// **DEPTH TESTING BY STROKE ORDER:**
+	    /// Newer strokes (higher depthID) are always rendered on top of older strokes,
+	    /// regardless of which telescope depth they were created at.
+	    ///
+	    /// Example:
+	    /// - Draw stroke A at depth -9 (depthID = 100)
+	    /// - Draw stroke B at depth 0  (depthID = 200)
+	    /// - Draw stroke C at depth -9 (depthID = 300)
+	    ///
+	    /// Result: C is on top of B, which is on top of A
+	    ///
+	    /// This uses the global monotonic depthID counter, so stroke ordering is consistent
+	    /// across all telescope depths from -∞ to +∞.
+	    ///
+	    /// **OVERDRAW PREVENTION:**
+	    /// All segments within a stroke share the same depth value. The depth buffer prevents
+	    /// pixel-level overdraw when drawing complex shapes. Front-to-back rendering of
+	    /// depth-write-enabled strokes provides early-Z rejection for maximum performance.
+	    ///
+	    /// - Parameters:
+	    ///   - depthID: The stroke's depth ID (monotonic counter for creation order)
+	    /// - Returns: Metal NDC depth value [0, 1] where 0 is closest
+	    private func strokeDepth(for depthID: UInt32) -> Float {
+	        // Map depthID directly to depth buffer
+	        // Higher depthID (newer stroke) → lower depth value (closer to camera)
+	        let clamped = min(depthID, Self.strokeDepthSlotCount - 1)
+	        let numerator = Float(Self.strokeDepthSlotCount - clamped)
+	        return numerator / Self.strokeDepthDenominator
+	    }
 
     /// Recursively render a frame and adjacent depth levels (depth ±1).
     ///
@@ -339,8 +164,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                      currentZoom: Double,
                      currentRotation: Float,
                      encoder: MTLRenderCommandEncoder,
-                     bakeCommandBuffer: MTLCommandBuffer,
-                     excludedChild: Frame? = nil) { //  NEW: Prevent double-rendering
+                     excludedChild: Frame? = nil,
+                     depthFromActive: Int = 0) { //  NEW: Prevent double-rendering
 
         // Reset debug metrics at the start of each frame (only for root call)
         if frame === activeFrame && excludedChild == nil {
@@ -374,8 +199,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                            currentZoom: parentZoom,
                            currentRotation: currentRotation,
                            encoder: encoder,
-                           bakeCommandBuffer: bakeCommandBuffer,
-                           excludedChild: frame) //  TELL PARENT TO SKIP US
+                           excludedChild: frame,
+                           depthFromActive: depthFromActive - 1) //  TELL PARENT TO SKIP US
             }
             }
         }
@@ -397,110 +222,90 @@ class Coordinator: NSObject, MTKViewDelegate {
         // Apply Culling Multiplier for testing
         let cullRadius = screenRadius * brushSettings.cullingMultiplier
 
-        // Convert cullRadius from screen pixels to world units for inverse culling
+        // Render canvas strokes using depth testing (early-Z).
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setCullMode(.none)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
 
-        let targetLevelRequested = tileLevel(for: currentZoom)
-        let (targetKeys, targetLevelUsed) = visibleTiles(for: frame.id,
-                                                         level: targetLevelRequested,
-                                                         cameraCenter: cameraCenterInThisFrame,
-                                                         viewSize: viewSize,
-                                                         zoom: currentZoom)
+        let zoom = max(currentZoom, 1e-6)
+        let angle = Double(currentRotation)
+        let c = cos(angle)
+        let s = sin(angle)
 
-        // Dual-layer rendering: draw a coarser parent level first as fallback, then draw the target level on top.
-        // This prevents holes/flicker while higher-res tiles are being baked/throttled.
-        let fallbackLevelRequested = targetLevelUsed - 1
-        let (fallbackKeys, fallbackLevelUsed) = visibleTiles(for: frame.id,
-                                                             level: fallbackLevelRequested,
-                                                             cameraCenter: cameraCenterInThisFrame,
-                                                             viewSize: viewSize,
-                                                             zoom: currentZoom)
+	        let strokeCount = frame.strokes.count
+	        func depthForStroke(_ stroke: Stroke) -> Float {
+	            strokeDepth(for: stroke.depthID)
+	        }
 
-        func drawTileSet(keys: [TileKey], levelUsed: Int, allowBake: Bool) {
-            guard !keys.isEmpty else { return }
+        func drawStroke(_ stroke: Stroke, depth: Float) {
+            guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { return }
 
-            encoder.setRenderPipelineState(tilePipelineState)
-            encoder.setDepthStencilState(stencilStateDefault)
-            encoder.setFragmentSamplerState(samplerState, index: 0)
-
-            let tileWorldSide = tileWorldSize(for: levelUsed)
-            let tileHalfSide = tileWorldSide * 0.5
-
-            // All tiles for a given level share the same world size and texture padding.
-            let halfW = Float(tileHalfSide)
-            let halfH = Float(tileHalfSide)
-            let tileTexSide = Float(TILE_SIZE_PX + TILE_PAD_PX * 2)
-            let padU = Float(TILE_PAD_PX) / tileTexSide
-            let padV = Float(TILE_PAD_PX) / tileTexSide
-
-            // NOTE: Tile textures are render targets; their sampling orientation differs from image cards.
-            // Use v=0 at top (like the original tile path) to avoid vertical flipping.
-            let tileVertices: [CardQuadVertex] = [
-                CardQuadVertex(position: SIMD2<Float>(-halfW, -halfH), uv: SIMD2<Float>(padU, padV)),             // Top-Left
-                CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
-                CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV)),         // Top-Right
-                CardQuadVertex(position: SIMD2<Float>(-halfW,  halfH), uv: SIMD2<Float>(padU, 1 - padV)),         // Bottom-Left
-                CardQuadVertex(position: SIMD2<Float>( halfW,  halfH), uv: SIMD2<Float>(1 - padU, 1 - padV)),     // Bottom-Right
-                CardQuadVertex(position: SIMD2<Float>( halfW, -halfH), uv: SIMD2<Float>(1 - padU, padV))          // Top-Right
-            ]
-            guard let tileVertexBuffer = device.makeBuffer(bytes: tileVertices,
-                                                           length: tileVertices.count * MemoryLayout<CardQuadVertex>.stride,
-                                                           options: .storageModeShared) else { return }
-            encoder.setVertexBuffer(tileVertexBuffer, offset: 0, index: 0)
-
-            let orderedKeys: [TileKey]
-            if allowBake {
-                // Prioritize tiles closest to the camera so throttling doesn't leave holes on-screen.
-                orderedKeys = keys.sorted { a, b in
-                    let ax = (Double(a.x) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.x
-                    let ay = (Double(a.y) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.y
-                    let bx = (Double(b.x) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.x
-                    let by = (Double(b.y) * tileWorldSide + tileHalfSide) - cameraCenterInThisFrame.y
-                    return (ax * ax + ay * ay) < (bx * bx + by * by)
-                }
-            } else {
-                orderedKeys = keys
+            // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
+            // If current zoom is more than 100,000x higher than when the stroke was created,
+            // the stroke would be invisible (sub-pixel), so skip all math and rendering
+            let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
+            if zoom > strokeZoom * 100_000.0 {
+                return
             }
 
-            for key in orderedKeys {
-                if allowBake {
-                    _ = bakeTileIfNeeded(key: key,
-                                         frame: frame,
-                                         level: levelUsed,
-                                         strokes: frame.strokes,
-                                         bakeCommandBuffer: bakeCommandBuffer)
-                }
+            let dx = stroke.origin.x - cameraCenterInThisFrame.x
+            let dy = stroke.origin.y - cameraCenterInThisFrame.y
 
-                guard var entry = tileCache[key] else { continue }
-                // Never draw unbaked textures (they may contain undefined memory); rely on fallback instead.
-                guard entry.hasContent else { continue }
+            // Screen-space culling (stable at extreme zoom levels).
+            let distWorld = sqrt(dx * dx + dy * dy)
+            let distScreen = distWorld * zoom
 
-                entry.lastUsedFrame = frameCounter
-                tileCache[key] = entry
-                touchTileLRU(key)
+            let bounds = stroke.localBounds
+            let farX = max(abs(Double(bounds.minX)), abs(Double(bounds.maxX)))
+            let farY = max(abs(Double(bounds.minY)), abs(Double(bounds.maxY)))
+            let radiusWorld = sqrt(farX * farX + farY * farY)
+            let radiusScreen = radiusWorld * zoom
 
-                let centerX = Double(key.x) * tileWorldSide + tileHalfSide
-                let centerY = Double(key.y) * tileWorldSide + tileHalfSide
-                let relativeOffset = SIMD2<Float>(Float(centerX - cameraCenterInThisFrame.x),
-                                                  Float(centerY - cameraCenterInThisFrame.y))
+            if (distScreen - radiusScreen) > cullRadius { return }
 
-                var transform = CardTransform(
-                    relativeOffset: relativeOffset,
-                    zoomScale: Float(currentZoom),
-                    screenWidth: Float(viewSize.width),
-                    screenHeight: Float(viewSize.height),
-                    rotationAngle: currentRotation
-                )
+            let rotatedOffsetScreen = SIMD2<Float>(
+                Float((dx * c - dy * s) * zoom),
+                Float((dx * s + dy * c) * zoom)
+            )
 
-                encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                encoder.setFragmentTexture(entry.texture, index: 0)
-                encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-            }
+            let basePixelWidth = Float(stroke.worldWidth * zoom)
+            let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
+
+            var transform = StrokeTransform(
+                relativeOffset: .zero,
+                rotatedOffsetScreen: rotatedOffsetScreen,
+                zoomScale: Float(zoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: currentRotation,
+                halfPixelWidth: halfPixelWidth,
+                featherPx: 1.0,
+                depth: depth
+            )
+
+            encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+            encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
         }
 
-        // Fallback layer (low-res) first.
-        drawTileSet(keys: fallbackKeys, levelUsed: fallbackLevelUsed, allowBake: false)
-        // Target layer (high-res) on top.
-        drawTileSet(keys: targetKeys, levelUsed: targetLevelUsed, allowBake: true)
+	        // Depth-write strokes: newest -> oldest (front-to-back).
+	        encoder.setDepthStencilState(strokeDepthStateWrite)
+	        if strokeCount > 0 {
+	            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+	                let stroke = frame.strokes[i]
+	                guard stroke.depthWriteEnabled else { continue }
+	                drawStroke(stroke, depth: depthForStroke(stroke))
+	            }
+	        }
+
+        // No-depth-write strokes: oldest -> newest (painter's algorithm), but depth-tested.
+	        encoder.setDepthStencilState(strokeDepthStateNoWrite)
+	        for i in 0..<strokeCount {
+	            let stroke = frame.strokes[i]
+	            guard !stroke.depthWriteEnabled else { continue }
+	            drawStroke(stroke, depth: depthForStroke(stroke))
+	        }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         for card in frame.cards {
@@ -636,12 +441,22 @@ class Coordinator: NSObject, MTKViewDelegate {
                 // Draw card strokes directly (GPU applies offset)
                 for stroke in card.strokes {
                     guard !stroke.segments.isEmpty, let segmentBuffer = stroke.segmentBuffer else { continue }
+
+                    // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
+                    let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
+                    if currentZoom > strokeZoom * 100_000.0 {
+                        continue
+                    }
+
                     let strokeOffset = stroke.origin
                     let strokeRelativeOffset = offset + SIMD2<Float>(Float(strokeOffset.x), Float(strokeOffset.y))
 
                     // Calculate screen-space thickness for card strokes
                     let basePixelWidth = Float(stroke.worldWidth * currentZoom)
                     let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
+
+                    // Calculate depth based on stroke's depthID (creation order)
+                    let cardStrokeDepth = strokeDepth(for: stroke.depthID)
 
                     var strokeTransform = StrokeTransform(
                         relativeOffset: strokeRelativeOffset,
@@ -652,7 +467,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                         screenHeight: Float(viewSize.height),
                         rotationAngle: totalRotation,
                         halfPixelWidth: halfPixelWidth,
-                        featherPx: 1.0
+                        featherPx: 1.0,
+                        depth: cardStrokeDepth
                     )
 
                     encoder.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -705,8 +521,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                         currentZoom: childZoom,
                         currentRotation: currentRotation,
                         encoder: encoder,
-                        bakeCommandBuffer: bakeCommandBuffer,
-                        excludedChild: frame)
+                        excludedChild: frame,
+                        depthFromActive: depthFromActive + 1)
         }
     }
 
@@ -774,6 +590,10 @@ class Coordinator: NSObject, MTKViewDelegate {
             )
 
             let halfPixelWidth = max(Float(brushSettings.size) * 0.5, 0.5)
+
+            // Canvas live stroke depth: use peek for current drawing stroke
+            let canvasLiveStrokeDepth = strokeDepth(for: peekStrokeDepthID())
+
             var transform = StrokeTransform(
                 relativeOffset: .zero,
                 rotatedOffsetScreen: rotatedOffsetScreen,
@@ -782,11 +602,12 @@ class Coordinator: NSObject, MTKViewDelegate {
                 screenHeight: Float(view.bounds.size.height),
                 rotationAngle: rotationAngle,
                 halfPixelWidth: halfPixelWidth,
-                featherPx: 1.0
+                featherPx: 1.0,
+                depth: canvasLiveStrokeDepth
             )
 
             enc.setRenderPipelineState(strokeSegmentPipelineState)
-            enc.setDepthStencilState(stencilStateDefault)
+            enc.setDepthStencilState(strokeDepthStateNoWrite)
             enc.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
             enc.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
             enc.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -805,10 +626,11 @@ class Coordinator: NSObject, MTKViewDelegate {
                 zoomInTarget = zoomScale / child.scaleRelativeToParent
             }
 
-            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
-                                                 card: card,
-                                                 frame: frame,
-                                                 viewSize: view.bounds.size)
+	            let liveStroke = createStrokeForCard(screenPoints: screenPoints,
+	                                                 card: card,
+	                                                 frame: frame,
+	                                                 viewSize: view.bounds.size,
+	                                                 depthID: peekStrokeDepthID())
             guard !liveStroke.segments.isEmpty, let segmentBuffer = liveStroke.segmentBuffer else { return }
 
             // 1) Write stencil for the card region without affecting color output.
@@ -858,6 +680,9 @@ class Coordinator: NSObject, MTKViewDelegate {
             let basePixelWidth = Float(liveStroke.worldWidth * zoomInTarget)
             let halfPixelWidth = max(basePixelWidth * 0.5, 0.5)
 
+            // Live stroke depth: use peekStrokeDepthID (creation order)
+            let liveStrokeDepth = strokeDepth(for: peekStrokeDepthID())
+
             var strokeTransform = StrokeTransform(
                 relativeOffset: strokeRelativeOffset,
                 rotatedOffsetScreen: SIMD2<Float>(
@@ -869,7 +694,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                 screenHeight: Float(view.bounds.size.height),
                 rotationAngle: totalRotation,
                 halfPixelWidth: halfPixelWidth,
-                featherPx: 1.0
+                featherPx: 1.0,
+                depth: liveStrokeDepth
             )
 
             enc.setVertexBytes(&strokeTransform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
@@ -955,6 +781,7 @@ class Coordinator: NSObject, MTKViewDelegate {
                 StrokeVertex(position: pos, uv: .zero, color: handleColor)
             }
 
+            // Selection handles are UI elements - always render in front (depth 0.0)
             var handleTransform = StrokeTransform(
                 relativeOffset: relativeOffset,
                 rotatedOffsetScreen: SIMD2<Float>(Float((Double(relativeOffset.x) * cos(Double(rotation)) - Double(relativeOffset.y) * sin(Double(rotation))) * zoom),
@@ -964,7 +791,8 @@ class Coordinator: NSObject, MTKViewDelegate {
                 screenHeight: Float(viewSize.height),
                 rotationAngle: rotation,
                 halfPixelWidth: 1.0,  // Handles don't use thickness, but field is required
-                featherPx: 1.0
+                featherPx: 1.0,
+                depth: 0.0  // UI elements always in front
             )
 
             // Create buffer and draw
@@ -978,40 +806,68 @@ class Coordinator: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        frameCounter += 1
-        tilesBakedThisFrame = 0
-
-        guard let bakeCommandBuffer = commandQueue.makeCommandBuffer() else { return }
-        bakeCommandBuffer.label = "Tile Bake"
+        resizeOffscreenTexturesIfNeeded(drawableSize: view.drawableSize)
+        guard let offscreenColor = offscreenColorTexture,
+              let offscreenDepthStencil = offscreenDepthStencilTexture else { return }
 
         guard let mainCommandBuffer = commandQueue.makeCommandBuffer(),
-              let rpd = view.currentRenderPassDescriptor,
-              let enc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: rpd) else { return }
+              let drawable = view.currentDrawable,
+              let drawableRPD = view.currentRenderPassDescriptor else { return }
+
+        // PASS 1: Render the full scene into an offscreen texture (no MSAA, hard stroke coverage).
+        let sceneRPD = MTLRenderPassDescriptor()
+        sceneRPD.colorAttachments[0].texture = offscreenColor
+        sceneRPD.colorAttachments[0].loadAction = .clear
+        sceneRPD.colorAttachments[0].storeAction = .store
+        sceneRPD.colorAttachments[0].clearColor = view.clearColor
+
+        sceneRPD.depthAttachment.texture = offscreenDepthStencil
+        sceneRPD.depthAttachment.loadAction = .clear
+        sceneRPD.depthAttachment.storeAction = .dontCare
+        sceneRPD.depthAttachment.clearDepth = view.clearDepth
+
+        sceneRPD.stencilAttachment.texture = offscreenDepthStencil
+        sceneRPD.stencilAttachment.loadAction = .clear
+        sceneRPD.stencilAttachment.storeAction = .dontCare
+        sceneRPD.stencilAttachment.clearStencil = view.clearStencil
+
+        guard let sceneEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: sceneRPD) else { return }
 
         let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
 
-        enc.setRenderPipelineState(strokeSegmentPipelineState)
-        enc.setCullMode(.none)
+        sceneEnc.setRenderPipelineState(strokeSegmentPipelineState)
+        sceneEnc.setCullMode(.none)
 
         renderFrame(activeFrame,
                     cameraCenterInThisFrame: cameraCenterWorld,
                     viewSize: view.bounds.size,
                     currentZoom: zoomScale,
                     currentRotation: rotationAngle,
-                    encoder: enc,
-                    bakeCommandBuffer: bakeCommandBuffer,
+                    encoder: sceneEnc,
                     excludedChild: nil)
 
-        // Live stroke rendering (unchanged logic), reuse main encoder
+        // Live stroke rendering (same logic), reusing the scene encoder.
         if (currentTouchPoints.count + predictedTouchPoints.count) >= 2, let tempOrigin = liveStrokeOrigin {
-            renderLiveStroke(view: view, encoder: enc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
+            renderLiveStroke(view: view, encoder: sceneEnc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
         }
 
-        enc.endEncoding()
-        bakeCommandBuffer.commit()
-        if let drawable = view.currentDrawable {
-            mainCommandBuffer.present(drawable)
-        }
+        sceneEnc.endEncoding()
+
+        // PASS 2: FXAA fullscreen pass into the drawable.
+        guard let postEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: drawableRPD) else { return }
+        postEnc.setRenderPipelineState(postProcessPipelineState)
+        postEnc.setDepthStencilState(stencilStateDefault)
+        postEnc.setCullMode(.none)
+
+        postEnc.setFragmentTexture(offscreenColor, index: 0)
+        postEnc.setFragmentSamplerState(samplerState, index: 0)
+        var invResolution = SIMD2<Float>(1.0 / Float(offscreenTextureWidth),
+                                         1.0 / Float(offscreenTextureHeight))
+        postEnc.setFragmentBytes(&invResolution, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+        postEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        postEnc.endEncoding()
+
+        mainCommandBuffer.present(drawable)
         mainCommandBuffer.commit()
 
         updateDebugHUD(view: view)
@@ -1023,13 +879,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         // Find the debug label subview
         guard let debugLabel = mtkView.subviews.compactMap({ $0 as? UILabel }).first else { return }
 
-        // Calculate frame depth
-        var depth = 0
-        var current: Frame? = activeFrame
-        while current?.parent != nil {
-            depth += 1
-            current = current?.parent
-        }
+        // Get stored depth from the frame
+        let depth = activeFrame.depthFromRoot
 
         // Format zoom scale nicely
         let zoomText: String
@@ -1042,6 +893,7 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         // Calculate effective zoom (depth multiplier)
+        // pow(1000, -1) = 0.001, so negative depths work correctly
         let effectiveZoom = pow(1000.0, Double(depth)) * zoomScale
         let effectiveText: String
         if effectiveZoom >= 1e12 {
@@ -1053,8 +905,13 @@ class Coordinator: NSObject, MTKViewDelegate {
             effectiveText = String(format: "%.1fM×", effectiveZoom / 1e6)
         } else if effectiveZoom >= 1e3 {
             effectiveText = String(format: "%.1fk×", effectiveZoom / 1e3)
-        } else {
+        } else if effectiveZoom >= 1.0 {
             effectiveText = String(format: "%.1f×", effectiveZoom)
+        } else if effectiveZoom >= 0.001 {
+            effectiveText = String(format: "%.3f×", effectiveZoom)
+        } else {
+            let exponent = Int(log10(effectiveZoom))
+            effectiveText = String(format: "10^%d", exponent)
         }
 
         // Calculate camera position in current frame
@@ -1073,7 +930,43 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
     }
 
-    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
+        resizeOffscreenTexturesIfNeeded(drawableSize: size)
+    }
+
+    private func resizeOffscreenTexturesIfNeeded(drawableSize: CGSize) {
+        let width = max(Int(drawableSize.width.rounded(.down)), 1)
+        let height = max(Int(drawableSize.height.rounded(.down)), 1)
+        guard width != offscreenTextureWidth ||
+              height != offscreenTextureHeight ||
+              offscreenColorTexture == nil ||
+              offscreenDepthStencilTexture == nil else { return }
+
+        offscreenTextureWidth = width
+        offscreenTextureHeight = height
+
+        let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        colorDesc.usage = [.renderTarget, .shaderRead]
+        colorDesc.storageMode = .private
+        colorDesc.sampleCount = 1
+        offscreenColorTexture = device.makeTexture(descriptor: colorDesc)
+
+        let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float_stencil8,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        depthDesc.usage = [.renderTarget]
+        depthDesc.storageMode = .private
+        depthDesc.sampleCount = 1
+        offscreenDepthStencilTexture = device.makeTexture(descriptor: depthDesc)
+    }
 
     private func makeQuadVertexDescriptor() -> MTLVertexDescriptor {
         let vd = MTLVertexDescriptor()
@@ -1087,7 +980,10 @@ class Coordinator: NSObject, MTKViewDelegate {
 
     func makePipeLine() {
         let library = device.makeDefaultLibrary()!
-        let viewSampleCount = metalView?.sampleCount ?? 1
+        // Single-sample render target (FXAA handles anti-aliasing as a post-process).
+        // Must match `MTKView.sampleCount`.
+        let viewSampleCount = 1
+        let depthStencilFormat: MTLPixelFormat = .depth32Float_stencil8
 
         let quadVertexDesc = makeQuadVertexDescriptor()
 
@@ -1108,7 +1004,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         segAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
         segDesc.vertexDescriptor = quadVertexDesc
-        segDesc.stencilAttachmentPixelFormat = .stencil8
+        segDesc.depthAttachmentPixelFormat = depthStencilFormat
+        segDesc.stencilAttachmentPixelFormat = depthStencilFormat
         do {
             strokeSegmentPipelineState = try device.makeRenderPipelineState(descriptor: segDesc)
         } catch {
@@ -1140,42 +1037,12 @@ class Coordinator: NSObject, MTKViewDelegate {
         cardDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         cardDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         cardDesc.vertexDescriptor = vertexDesc
-        cardDesc.stencilAttachmentPixelFormat = .stencil8 //  Required for stencil buffer
+        cardDesc.depthAttachmentPixelFormat = depthStencilFormat
+        cardDesc.stencilAttachmentPixelFormat = depthStencilFormat // Required for stencil buffer
         do {
             cardPipelineState = try device.makeRenderPipelineState(descriptor: cardDesc)
         } catch {
             fatalError("Failed to create cardPipelineState: \(error)")
-        }
-
-        // Tile Pipeline (dedicated vertex layout for tiles)
-        let tileVertexDesc = MTLVertexDescriptor()
-        tileVertexDesc.attributes[0].format = .float2
-        tileVertexDesc.attributes[0].offset = 0
-        tileVertexDesc.attributes[0].bufferIndex = 0
-        tileVertexDesc.attributes[1].format = .float2
-        tileVertexDesc.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride
-        tileVertexDesc.attributes[1].bufferIndex = 0
-        tileVertexDesc.layouts[0].stride = MemoryLayout<CardQuadVertex>.stride
-        tileVertexDesc.layouts[0].stepFunction = .perVertex
-
-        let tileDesc = MTLRenderPipelineDescriptor()
-        tileDesc.vertexFunction   = library.makeFunction(name: "vertex_card")
-        tileDesc.fragmentFunction = library.makeFunction(name: "fragment_card_texture")
-        tileDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        tileDesc.sampleCount = viewSampleCount
-        tileDesc.colorAttachments[0].isBlendingEnabled = true
-        tileDesc.colorAttachments[0].rgbBlendOperation = .add
-        tileDesc.colorAttachments[0].alphaBlendOperation = .add
-        tileDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        tileDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-        tileDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        tileDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        tileDesc.vertexDescriptor = tileVertexDesc
-        tileDesc.stencilAttachmentPixelFormat = .stencil8 // match main pass
-        do {
-            tilePipelineState = try device.makeRenderPipelineState(descriptor: tileDesc)
-        } catch {
-            fatalError("Failed to create tilePipelineState: \(error)")
         }
 
         // Solid Color Card Pipeline (for placeholders, backgrounds)
@@ -1192,7 +1059,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         cardSolidDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         cardSolidDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         cardSolidDesc.vertexDescriptor = vertexDesc
-        cardSolidDesc.stencilAttachmentPixelFormat = .stencil8 //  Required for stencil buffer
+        cardSolidDesc.depthAttachmentPixelFormat = depthStencilFormat
+        cardSolidDesc.stencilAttachmentPixelFormat = depthStencilFormat // Required for stencil buffer
 
         do {
             cardSolidPipelineState = try device.makeRenderPipelineState(descriptor: cardSolidDesc)
@@ -1214,7 +1082,8 @@ class Coordinator: NSObject, MTKViewDelegate {
         linedDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         linedDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         linedDesc.vertexDescriptor = vertexDesc
-        linedDesc.stencilAttachmentPixelFormat = .stencil8
+        linedDesc.depthAttachmentPixelFormat = depthStencilFormat
+        linedDesc.stencilAttachmentPixelFormat = depthStencilFormat
 
         do {
             cardLinedPipelineState = try device.makeRenderPipelineState(descriptor: linedDesc)
@@ -1236,12 +1105,28 @@ class Coordinator: NSObject, MTKViewDelegate {
         gridDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         gridDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         gridDesc.vertexDescriptor = vertexDesc
-        gridDesc.stencilAttachmentPixelFormat = .stencil8
+        gridDesc.depthAttachmentPixelFormat = depthStencilFormat
+        gridDesc.stencilAttachmentPixelFormat = depthStencilFormat
 
         do {
             cardGridPipelineState = try device.makeRenderPipelineState(descriptor: gridDesc)
         } catch {
             fatalError("Failed to create grid card pipeline: \(error)")
+        }
+
+        // Post-process Pipeline (FXAA fullscreen pass)
+        let fxaaDesc = MTLRenderPipelineDescriptor()
+        fxaaDesc.vertexFunction = library.makeFunction(name: "vertex_fullscreen_triangle")
+        fxaaDesc.fragmentFunction = library.makeFunction(name: "fragment_fxaa")
+        fxaaDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        fxaaDesc.sampleCount = viewSampleCount
+        fxaaDesc.depthAttachmentPixelFormat = depthStencilFormat
+        fxaaDesc.stencilAttachmentPixelFormat = depthStencilFormat
+
+        do {
+            postProcessPipelineState = try device.makeRenderPipelineState(descriptor: fxaaDesc)
+        } catch {
+            fatalError("Failed to create postProcessPipelineState: \(error)")
         }
 
         // Create Sampler for card textures
@@ -1303,7 +1188,18 @@ class Coordinator: NSObject, MTKViewDelegate {
         desc.frontFaceStencil = stencilClear
         desc.backFaceStencil = stencilClear
         stencilStateClear = device.makeDepthStencilState(descriptor: desc)
-    }
+
+        // Depth-only states for strokes (no stencil).
+        let strokeWriteDesc = MTLDepthStencilDescriptor()
+        strokeWriteDesc.depthCompareFunction = .less
+        strokeWriteDesc.isDepthWriteEnabled = true
+        strokeDepthStateWrite = device.makeDepthStencilState(descriptor: strokeWriteDesc)
+
+	        let strokeNoWriteDesc = MTLDepthStencilDescriptor()
+	        strokeNoWriteDesc.depthCompareFunction = .less
+	        strokeNoWriteDesc.isDepthWriteEnabled = false
+	        strokeDepthStateNoWrite = device.makeDepthStencilState(descriptor: strokeNoWriteDesc)
+	    }
 
     func makeVertexBuffer() {
         var positions: [SIMD2<Float>] = [
@@ -1578,28 +1474,30 @@ class Coordinator: NSObject, MTKViewDelegate {
         switch target {
         case .canvas(let frame):
             // DRAW ON CANVAS (existing logic)
-            let stroke = Stroke(screenPoints: smoothScreenPoints,
-                                zoomAtCreation: zoomScale,
-                                panAtCreation: panOffset,
-                                viewSize: view.bounds.size,
-                                rotationAngle: rotationAngle,
-                                color: brushSettings.color,
-                                baseWidth: brushSettings.size,
-                                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
-                                device: device)
-            frame.strokes.append(stroke)
-            markTilesDirty(for: stroke, in: frame)
+	            let stroke = Stroke(screenPoints: smoothScreenPoints,
+	                                zoomAtCreation: zoomScale,
+	                                panAtCreation: panOffset,
+	                                viewSize: view.bounds.size,
+	                                rotationAngle: rotationAngle,
+	                                color: brushSettings.color,
+	                                baseWidth: brushSettings.size,
+	                                zoomEffectiveAtCreation: Float(max(zoomScale, 1e-6)),
+	                                device: device,
+	                                depthID: allocateStrokeDepthID(),
+	                                depthWriteEnabled: brushSettings.depthWriteEnabled)
+	            frame.strokes.append(stroke)
 
         case .card(let card, let frame):
             // DRAW ON CARD (Cross-Depth Compatible)
             // Transform points into card-local space accounting for which frame the card is in
-            let cardStroke = createStrokeForCard(
-                screenPoints: smoothScreenPoints,
-                card: card,
-                frame: frame,
-                viewSize: view.bounds.size
-            )
-            card.strokes.append(cardStroke)
+	            let cardStroke = createStrokeForCard(
+	                screenPoints: smoothScreenPoints,
+	                card: card,
+	                frame: frame,
+	                viewSize: view.bounds.size,
+	                depthID: allocateStrokeDepthID()
+	            )
+	            card.strokes.append(cardStroke)
         }
 
         currentTouchPoints = []
@@ -1741,7 +1639,7 @@ class Coordinator: NSObject, MTKViewDelegate {
     ///   - frame: The frame the card belongs to (may be parent, active, or child)
     ///   - viewSize: Screen dimensions
     /// - Returns: A stroke with points relative to card center
-    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize) -> Stroke {
+	    func createStrokeForCard(screenPoints: [CGPoint], card: Card, frame: Frame, viewSize: CGSize, depthID: UInt32) -> Stroke {
         // 1. Get the Card's World Position & Rotation (in its Frame)
         let cardOrigin = card.origin
         let cardRot = Double(card.rotation)
@@ -1821,18 +1719,20 @@ class Coordinator: NSObject, MTKViewDelegate {
         }
 
         // 5. Create the Stroke with Effective Zoom
-        return Stroke(
-            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
-            zoomAtCreation: max(effectiveZoom, 1e-6),   // Use effective zoom for the card's frame!
-            panAtCreation: .zero,            // We handled position manually
-            viewSize: .zero,                 // We handled centering manually
-            rotationAngle: 0,                // We handled rotation manually
-            color: brushSettings.color,      // Use brush settings color
-            baseWidth: brushSettings.size,   // Use brush settings size
-            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
-            device: device                   // Pass device for buffer caching
-        )
-    }
+	        return Stroke(
+	            screenPoints: cardLocalPoints,   // Virtual screen space (world units * effectiveZoom)
+	            zoomAtCreation: max(effectiveZoom, 1e-6),   // Use effective zoom for the card's frame!
+	            panAtCreation: .zero,            // We handled position manually
+	            viewSize: .zero,                 // We handled centering manually
+	            rotationAngle: 0,                // We handled rotation manually
+	            color: brushSettings.color,      // Use brush settings color
+	            baseWidth: brushSettings.size,   // Use brush settings size
+	            zoomEffectiveAtCreation: Float(max(effectiveZoom, 1e-6)),
+	            device: device,                  // Pass device for buffer caching
+	            depthID: depthID,
+	            depthWriteEnabled: brushSettings.depthWriteEnabled
+	        )
+	    }
 
 }
 

@@ -18,6 +18,8 @@ class Stroke: Identifiable {
     let worldWidth: Double              // Width in world units
     let color: SIMD4<Float>
     let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
+    let depthID: UInt32                // Global draw order for depth testing (larger = newer)
+    var depthWriteEnabled: Bool         // Allows disabling depth writes for specific strokes (e.g. translucent markers)
 
     /// GPU segment instances for SDF rendering
     let segments: [StrokeSegmentInstance]
@@ -53,11 +55,15 @@ class Stroke: Identifiable {
          color: SIMD4<Float>,
          baseWidth: Double = 10.0,
          zoomEffectiveAtCreation: Float,
-         device: MTLDevice?) {
+         device: MTLDevice?,
+         depthID: UInt32,
+         depthWriteEnabled: Bool = true) {
         self.id = UUID()
         self.color = color
+        self.depthID = depthID
         let safeZoom = max(zoomAtCreation, 1e-6)
         self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
+        self.depthWriteEnabled = depthWriteEnabled
 
         guard let firstScreenPt = screenPoints.first else {
             self.origin = .zero
