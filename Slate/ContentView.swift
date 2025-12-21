@@ -20,20 +20,39 @@ struct ContentView: View {
             }
 
             VStack(spacing: 16) {
-                // Add Card Button
-                Button(action: {
-                    metalViewCoordinator?.addCard()
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "plus.rectangle.fill")
-                        Text("Add Card")
+                HStack(spacing: 12) {
+                    // Add Card Button
+                    Button(action: {
+                        metalViewCoordinator?.addCard()
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus.rectangle.fill")
+                            Text("Add Card")
+                        }
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(20)
                     }
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(.ultraThinMaterial)
-                    .cornerRadius(20)
+
+                    if let coordinator = metalViewCoordinator {
+                        Button(action: {
+                            coordinator.brushSettings.isEraser.toggle()
+                        }) {
+                            VStack(spacing: 2) {
+                                Image(systemName: coordinator.brushSettings.isEraser ? "eraser.fill" : "eraser")
+                                    .font(.system(size: 20))
+                                Text("Erase")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(coordinator.brushSettings.isEraser ? .pink : .white)
+                            .padding(8)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(12)
+                        }
+                    }
                 }
 
                 // Stroke Size Slider

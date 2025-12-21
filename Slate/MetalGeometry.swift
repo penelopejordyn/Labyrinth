@@ -47,6 +47,7 @@ struct CardTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+    var depth: Float
 }
 
 // MARK: - Geometry / Tessellation

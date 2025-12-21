@@ -349,6 +349,7 @@ struct CardTransform {
     float screenWidth;
     float screenHeight;
     float rotationAngle;
+    float depth;
 };
 
 /// Vertex input structure for cards - matches Swift's StrokeVertex
@@ -383,7 +384,7 @@ vertex CardVertexOut vertex_card(CardVertexIn in [[stage_in]],
     float ndcY = -(zoomed.y / transform->screenHeight) * 2.0;
 
     CardVertexOut out;
-    out.position = float4(ndcX, ndcY, 0.0, 1.0);
+    out.position = float4(ndcX, ndcY, transform->depth, 1.0);
     out.uv = in.uv;
 
     return out;
