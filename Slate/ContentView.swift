@@ -193,7 +193,11 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettingsSheet) {
             if let card = editingCard {
-                CardSettingsView(card: card)
+                CardSettingsView(card: card, onDelete: {
+                    metalViewCoordinator?.deleteCard(card)
+                    editingCard = nil
+                    showSettingsSheet = false
+                })
                     .presentationDetents([.medium])
             }
         }
@@ -307,6 +311,21 @@ struct StrokeSizeSlider: View {
                 )
                 .tint(.white)
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+
+            // Constant Screen Size Toggle
+            Toggle(isOn: $brushSettings.constantScreenSize) {
+                HStack(spacing: 8) {
+                    Image(systemName: brushSettings.constantScreenSize ? "pencil.tip" : "pencil.tip.crop.circle")
+                        .font(.system(size: 14))
+                        .foregroundColor(.white)
+                    Text(brushSettings.constantScreenSize ? "Fixed Screen Size" : "Scales with Zoom")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white)
+                }
+            }
+            .toggleStyle(SwitchToggleStyle(tint: .blue))
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
         }
