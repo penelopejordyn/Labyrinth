@@ -87,6 +87,11 @@ class TouchableMTKView: MTKView {
     // var lassoMoveStartSnapshot: Coordinator.LassoMoveSnapshot?
     // var lassoTransformStartSnapshot: Coordinator.LassoTransformSnapshot?
 
+    // Pan momentum/inertia
+    var panVelocity: SIMD2<Double> = .zero
+    var lastPanTime: CFTimeInterval = 0
+    var momentumDisplayLink: CADisplayLink?
+
 
 
 
@@ -561,6 +566,9 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             lassoDragActive = false
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoDragActive = true
@@ -584,6 +592,10 @@ class TouchableMTKView: MTKView {
                 }
             }
             dragContext = nil // Pan Canvas
+
+            // Initialize velocity tracking
+            lastPanTime = CACurrentMediaTime()
+            panVelocity = .zero
 
 	        case .changed:
             let translation = gesture.translation(in: self)
@@ -676,6 +688,18 @@ class TouchableMTKView: MTKView {
 
                 coord.panOffset.x += dx * c + dy * s
                 coord.panOffset.y += -dx * s + dy * c
+
+                // Track velocity for momentum
+                // Since we reset translation each frame, translation IS the delta
+                let currentTime = CACurrentMediaTime()
+                let dt = currentTime - lastPanTime
+                if dt > 0 {
+                    // Calculate velocity in screen space (before rotation)
+                    panVelocity.x = Double(translation.x) / dt
+                    panVelocity.y = Double(translation.y) / dt
+                }
+                lastPanTime = currentTime
+
                 gesture.setTranslation(.zero, in: self)
             }
 
@@ -701,6 +725,15 @@ class TouchableMTKView: MTKView {
                     }
                 }
             }
+
+            // Start momentum if panning canvas and velocity is significant
+            if dragContext == nil && !lassoDragActive {
+                let speed = sqrt(panVelocity.x * panVelocity.x + panVelocity.y * panVelocity.y)
+                if speed > 50.0 { // Minimum velocity threshold (points per second)
+                    startMomentum()
+                }
+            }
+
             lassoDragActive = false
             dragContext = nil
 
@@ -716,6 +749,9 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoPinchActive = true
                 coord.beginLassoTransformIfNeeded()
@@ -837,6 +873,9 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoRotationActive = true
                 coord.beginLassoTransformIfNeeded()
@@ -929,6 +968,53 @@ class TouchableMTKView: MTKView {
             let location = gesture.location(in: self)
             coord.handleLongPress(at: location)
         }
+    }
+
+    // MARK: - Pan Momentum
+
+    func startMomentum() {
+        // Stop any existing display link without resetting velocity
+        momentumDisplayLink?.invalidate()
+        momentumDisplayLink = CADisplayLink(target: self, selector: #selector(updateMomentum))
+        momentumDisplayLink?.add(to: .main, forMode: .common)
+    }
+
+    func stopMomentum() {
+        momentumDisplayLink?.invalidate()
+        momentumDisplayLink = nil
+        panVelocity = .zero
+    }
+
+    @objc func updateMomentum() {
+        guard let coord = coordinator else {
+            stopMomentum()
+            return
+        }
+
+        // Get frame duration (typically 1/60 for 60fps)
+        let dt = momentumDisplayLink?.duration ?? (1.0 / 60.0)
+
+        // Apply friction to decelerate (higher = slides more)
+        let friction = 0.96
+        panVelocity.x *= friction
+        panVelocity.y *= friction
+
+        // Check if velocity is below threshold and stop
+        let speed = sqrt(panVelocity.x * panVelocity.x + panVelocity.y * panVelocity.y)
+        if speed < 0.5 {
+            stopMomentum()
+            return
+        }
+
+        // Apply velocity to pan offset
+        let dx = panVelocity.x * dt
+        let dy = panVelocity.y * dt
+
+        let ang = Double(coord.rotationAngle)
+        let c = cos(ang), s = sin(ang)
+
+        coord.panOffset.x += dx * c + dy * s
+        coord.panOffset.y += -dx * s + dy * c
     }
 
 
