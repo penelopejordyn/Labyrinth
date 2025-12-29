@@ -169,10 +169,81 @@ import simd
     var rootFrame = Frame()           // The "Base Reality" - top level that cannot be zoomed out of
     lazy var activeFrame: Frame = rootFrame  // The current "Local Universe" we are viewing/editing
 
-    weak var metalView: MTKView?
+    // 5x5 fractal grid configuration (set once from the view size).
+    // Frame coordinates are treated as bounded within ±extent/2, and panning swaps tiles when exiting.
+    var fractalFrameExtent: SIMD2<Double> = .zero
 
-    // MARK: - Card Interaction Callbacks
-    var onEditCard: ((Card) -> Void)?
+    // MARK: - Fractal Root Management
+
+    private func topmostFrame(from frame: Frame) -> Frame {
+        var top = frame
+        while let parent = top.parent {
+            top = parent
+        }
+        return top
+    }
+
+    /// Ensure a stable topmost root is retained (required because `Frame.parent` is `weak`).
+    @discardableResult
+    func ensureSuperRootRetained(for frame: Frame) -> Frame {
+        let candidate = frame.ensureSuperRoot()
+        let top = topmostFrame(from: candidate)
+        rootFrame = top
+        return top
+    }
+
+    /// Resolve a same-depth neighbor using the "Up, Over, Down" algorithm and retain any new super-root.
+    func neighborFrame(from frame: Frame, direction: GridDirection) -> Frame {
+        frame.neighbor(direction) { newRoot in
+            self.rootFrame = newRoot
+        }
+    }
+
+    /// Resolve a same-depth neighbor without instantiating missing frames.
+    /// Returns nil when the neighbor/cousin chain hasn't been created yet.
+    private func neighborFrameIfExists(from frame: Frame, direction: GridDirection) -> Frame? {
+        frame.neighborIfExists(direction)
+    }
+
+    /// Returns the frame at an (dx,dy) offset from `activeFrame` without creating missing frames.
+    /// Tries both axis orders so diagonals can be found even if one intermediate neighbor is missing.
+    private func frameAtOffsetFromActiveIfExists(dx: Int, dy: Int) -> Frame? {
+        if dx == 0, dy == 0 { return activeFrame }
+
+        func walk(dxFirst: Bool) -> Frame? {
+            var f: Frame? = activeFrame
+
+            func step(_ direction: GridDirection, count: Int) {
+                guard count > 0 else { return }
+                for _ in 0..<count {
+                    guard let current = f else { return }
+                    f = neighborFrameIfExists(from: current, direction: direction)
+                }
+            }
+
+            if dxFirst {
+                if dx > 0 { step(.right, count: dx) }
+                if dx < 0 { step(.left, count: -dx) }
+                if dy > 0 { step(.down, count: dy) }
+                if dy < 0 { step(.up, count: -dy) }
+            } else {
+                if dy > 0 { step(.down, count: dy) }
+                if dy < 0 { step(.up, count: -dy) }
+                if dx > 0 { step(.right, count: dx) }
+                if dx < 0 { step(.left, count: -dx) }
+            }
+
+            return f
+        }
+
+        return walk(dxFirst: true) ?? walk(dxFirst: false)
+    }
+
+	    weak var metalView: MTKView?
+
+	    // MARK: - Card Interaction Callbacks
+	    var onEditCard: ((Card) -> Void)?
+	    var onPencilSqueeze: (() -> Void)?
 
     //  UPGRADED: Store camera state as Double for infinite precision
     var panOffset: SIMD2<Double> = .zero
@@ -196,98 +267,227 @@ import simd
 	    var debugDrawnVerticesThisFrame: Int = 0
 	    var debugDrawnNodesThisFrame: Int = 0
 
-	    // MARK: - Debug Tools
-	    func debugPopulateFrames(parentCount: Int = 20,
-	                             childCount: Int = 20,
-	                             strokesPerFrame: Int = 1000,
-	                             maxOffset: Double = 1000.0) {
-	        guard let view = metalView else { return }
+	    // MARK: - Fractal Grid Overlay (Debug)
+	    private var fractalGridOverlayBuffer: MTLBuffer?
+	    private var fractalGridOverlayInstanceCount: Int = 0
+	    private var fractalGridOverlayExtent: SIMD2<Double> = .zero
+	    private let fractalGridOverlayEnabled: Bool = true
 
-	        let cameraCenterActive = calculateCameraCenterWorld(viewSize: view.bounds.size)
+		    // MARK: - Fractal Cross-Depth Rendering
+		    private let fractalStrokeVisibilityDepthRadius: Int = 6
 
-	        // Build parent chain above the current top-most frame (linked-list invariant).
-	        var topFrame = activeFrame
-	        while let parent = topFrame.parent {
-	            topFrame = parent
+		    // MARK: - Cross-Depth Interaction Cache
+		    /// Rebuilt every `draw(in:)` from the exact set of frames that were rendered.
+		    /// Used for cross-depth hit testing (cards, strokes) and lasso operations.
+		    private var visibleFractalFrameTransforms: [ObjectIdentifier: (scale: Double, translation: SIMD2<Double>)] = [:]
+		    private var visibleFractalFramesDrawOrder: [Frame] = []
+
+		    // MARK: - Debug Tools
+		    func debugPopulateFrames(parentCount: Int = 20,
+		                             childCount: Int = 20,
+		                             strokesPerFrame: Int = 1000,
+		                             maxOffset: Double = 1000.0) {
+		        /*
+		        // MARK: - Legacy Telescoping Debug Fill (Reference Only)
+		        // This code populated a parent/child linked list for stress testing.
+		        // It relied on `originInParent`, `scaleRelativeToParent`, and the single-child invariant.
+		        */
+
+		        guard let view = metalView else { return }
+		        ensureFractalExtent(viewSize: view.bounds.size)
+
+		        let cameraCenterActive = calculateCameraCenterWorld(viewSize: view.bounds.size)
+		        let extent = fractalFrameExtent
+
+		        func frameAtOffset(dx: Int, dy: Int) -> Frame {
+		            var f = activeFrame
+		            if dx > 0 { for _ in 0..<dx { f = neighborFrame(from: f, direction: .right) } }
+		            if dx < 0 { for _ in 0..<(-dx) { f = neighborFrame(from: f, direction: .left) } }
+		            if dy > 0 { for _ in 0..<dy { f = neighborFrame(from: f, direction: .down) } }
+		            if dy < 0 { for _ in 0..<(-dy) { f = neighborFrame(from: f, direction: .up) } }
+		            return f
+		        }
+
+		        // Keep the debug workload bounded regardless of the legacy parameter defaults.
+		        let radius = 1
+		        var targets: [(frame: Frame, cameraCenter: SIMD2<Double>)] = []
+		        targets.reserveCapacity((2 * radius + 1) * (2 * radius + 1))
+		        for dy in -radius...radius {
+		            for dx in -radius...radius {
+		                let frame = frameAtOffset(dx: dx, dy: dy)
+		                let offset = SIMD2<Double>(Double(dx) * extent.x, Double(dy) * extent.y)
+		                targets.append((frame: frame, cameraCenter: cameraCenterActive - offset))
+		            }
+		        }
+
+		        for (frame, cameraCenter) in targets {
+		            frame.strokes.reserveCapacity(frame.strokes.count + strokesPerFrame)
+		            let effectiveZoom = max(zoomScale, 1e-6)
+		            for _ in 0..<strokesPerFrame {
+		                let points = randomStrokePoints(center: cameraCenter, maxOffset: maxOffset)
+		                let virtualScreenPoints = points.map { CGPoint(x: $0.x * effectiveZoom, y: $0.y * effectiveZoom) }
+		                let color = SIMD4<Float>(Float.random(in: 0.1...1.0),
+		                                         Float.random(in: 0.1...1.0),
+		                                         Float.random(in: 0.1...1.0),
+		                                         1.0)
+		                let stroke = Stroke(screenPoints: virtualScreenPoints,
+		                                    zoomAtCreation: effectiveZoom,
+		                                    panAtCreation: .zero,
+		                                    viewSize: .zero,
+		                                    rotationAngle: 0,
+		                                    color: color,
+		                                    baseWidth: Double.random(in: 2.0...10.0),
+		                                    zoomEffectiveAtCreation: Float(effectiveZoom),
+		                                    device: device,
+		                                    depthID: allocateStrokeDepthID(),
+		                                    depthWriteEnabled: true)
+		                frame.strokes.append(stroke)
+		            }
+		        }
+		    }
+
+		    func clearAllStrokes() {
+		        var topFrame = activeFrame
+		        while let parent = topFrame.parent {
+		            topFrame = parent
+		        }
+
+		        func clearRecursively(_ frame: Frame) {
+		            frame.strokes.removeAll()
+		            for card in frame.cards {
+		                card.strokes.removeAll()
+		            }
+		            for child in frame.children.values {
+		                clearRecursively(child)
+		            }
+		        }
+
+		        clearRecursively(topFrame)
+		    }
+
+	    private func rebuildFractalGridOverlayIfNeeded(extent: SIMD2<Double>) {
+	        guard extent.x > 0.0, extent.y > 0.0 else { return }
+
+	        let dx = abs(fractalGridOverlayExtent.x - extent.x)
+	        let dy = abs(fractalGridOverlayExtent.y - extent.y)
+	        if fractalGridOverlayBuffer != nil, dx < 0.5, dy < 0.5 {
+	            return
 	        }
 
-	        if parentCount > 0 {
-	            for _ in 0..<parentCount {
-	                let newParent = Frame(depth: topFrame.depthFromRoot - 1)
-	                topFrame.parent = newParent
-	                newParent.children.append(topFrame)
-	                topFrame.originInParent = .zero
-	                topFrame.scaleRelativeToParent = 1000.0
-	                topFrame = newParent
+	        fractalGridOverlayExtent = extent
+
+	        let borderAlpha: Float = 0.16
+	        let childAlpha: Float = 0.09
+	        let grandchildAlpha: Float = 0.05
+
+	        let borderColor = SIMD4<Float>(1, 1, 1, borderAlpha)
+	        let childColor = SIMD4<Float>(1, 1, 1, childAlpha)
+	        let grandchildColor = SIMD4<Float>(1, 1, 1, grandchildAlpha)
+
+	        let half = extent * 0.5
+	        let childStep = FractalGrid.tileExtent(frameExtent: extent) // extent / 5
+	        let grandCount = GridIndex.gridSize * GridIndex.gridSize    // 25
+	        let grandStep = childStep / Double(GridIndex.gridSize)      // extent / 25
+
+	        var segments: [StrokeSegmentInstance] = []
+	        segments.reserveCapacity(25 * 52)
+
+	        func addSegment(_ p0: SIMD2<Double>, _ p1: SIMD2<Double>, color: SIMD4<Float>) {
+	            segments.append(
+	                StrokeSegmentInstance(
+	                    p0: SIMD2<Float>(Float(p0.x), Float(p0.y)),
+	                    p1: SIMD2<Float>(Float(p1.x), Float(p1.y)),
+	                    color: color
+	                )
+	            )
+	        }
+
+	        for tileY in -2...2 {
+	            for tileX in -2...2 {
+	                let center = SIMD2<Double>(Double(tileX) * extent.x, Double(tileY) * extent.y)
+	                let xMin = center.x - half.x
+	                let xMax = center.x + half.x
+	                let yMin = center.y - half.y
+	                let yMax = center.y + half.y
+
+	                // Same-depth tile border (frame boundary).
+	                addSegment(SIMD2<Double>(xMin, yMin), SIMD2<Double>(xMax, yMin), color: borderColor)
+	                addSegment(SIMD2<Double>(xMax, yMin), SIMD2<Double>(xMax, yMax), color: borderColor)
+	                addSegment(SIMD2<Double>(xMax, yMax), SIMD2<Double>(xMin, yMax), color: borderColor)
+	                addSegment(SIMD2<Double>(xMin, yMax), SIMD2<Double>(xMin, yMin), color: borderColor)
+
+	                // Child grid boundaries (5x5 inside this tile).
+	                for i in 1..<GridIndex.gridSize {
+	                    let x = xMin + Double(i) * childStep.x
+	                    addSegment(SIMD2<Double>(x, yMin), SIMD2<Double>(x, yMax), color: childColor)
+	                    let y = yMin + Double(i) * childStep.y
+	                    addSegment(SIMD2<Double>(xMin, y), SIMD2<Double>(xMax, y), color: childColor)
+	                }
+
+	                // Grandchild grid boundaries (25x25 inside this tile), skipping child lines.
+	                for i in 1..<grandCount {
+	                    if i % GridIndex.gridSize == 0 { continue }
+	                    let x = xMin + Double(i) * grandStep.x
+	                    addSegment(SIMD2<Double>(x, yMin), SIMD2<Double>(x, yMax), color: grandchildColor)
+	                    let y = yMin + Double(i) * grandStep.y
+	                    addSegment(SIMD2<Double>(xMin, y), SIMD2<Double>(xMax, y), color: grandchildColor)
+	                }
 	            }
 	        }
 
-	        // Build child chain below the current bottom-most frame (linked-list invariant).
-	        var bottomFrame = activeFrame
-	        while let child = childFrame(of: bottomFrame) {
-	            bottomFrame = child
-	        }
-
-	        if childCount > 0 {
-	            var parentFrame = bottomFrame
-	            for _ in 0..<childCount {
-	                let parentCameraCenter = cameraCenterInFrame(parentFrame, cameraCenterActive: cameraCenterActive)
-	                let newChild = Frame(parent: parentFrame,
-	                                     origin: parentCameraCenter,
-	                                     scale: 1000.0,
-	                                     depth: parentFrame.depthFromRoot + 1)
-	                parentFrame.children.append(newChild)
-	                parentFrame = newChild
-	            }
-	        }
-
-	        // Debug stress fill: keep strokes within +/- maxOffset in each frame's world space.
-	        let transforms = collectFrameTransforms(pointActive: cameraCenterActive)
-	        var frames: [Frame] = transforms.ancestors.map { $0.frame }
-	        frames.append(activeFrame)
-	        frames.append(contentsOf: transforms.descendants.map { $0.frame })
-
-	        for frame in frames {
-	            let (cameraCenterInTarget, effectiveZoom) = cameraCenterAndZoom(in: frame, cameraCenterActive: cameraCenterActive)
-	            frame.strokes.reserveCapacity(frame.strokes.count + strokesPerFrame)
-
-	            for _ in 0..<strokesPerFrame {
-	                let points = randomStrokePoints(center: cameraCenterInTarget, maxOffset: maxOffset)
-	                let virtualScreenPoints = points.map { CGPoint(x: $0.x * effectiveZoom, y: $0.y * effectiveZoom) }
-	                let color = SIMD4<Float>(Float.random(in: 0.1...1.0),
-	                                         Float.random(in: 0.1...1.0),
-	                                         Float.random(in: 0.1...1.0),
-	                                         1.0)
-	                let stroke = Stroke(screenPoints: virtualScreenPoints,
-	                                    zoomAtCreation: effectiveZoom,
-	                                    panAtCreation: .zero,
-	                                    viewSize: .zero,
-	                                    rotationAngle: 0,
-	                                    color: color,
-	                                    baseWidth: Double.random(in: 2.0...10.0),
-	                                    zoomEffectiveAtCreation: Float(effectiveZoom),
-	                                    device: device,
-	                                    depthID: allocateStrokeDepthID(),
-	                                    depthWriteEnabled: true)
-	                frame.strokes.append(stroke)
-	            }
-	        }
+	        fractalGridOverlayInstanceCount = segments.count
+	        fractalGridOverlayBuffer = device.makeBuffer(bytes: segments,
+	                                                     length: segments.count * MemoryLayout<StrokeSegmentInstance>.stride,
+	                                                     options: .storageModeShared)
 	    }
 
-	    func clearAllStrokes() {
-	        var topFrame = activeFrame
-	        while let parent = topFrame.parent {
-	            topFrame = parent
-	        }
+	    private func drawFractalGridOverlay(encoder: MTLRenderCommandEncoder,
+	                                        viewSize: CGSize,
+	                                        cameraCenterWorld: SIMD2<Double>,
+	                                        zoom: Double,
+	                                        rotation: Float) {
+	        guard fractalGridOverlayEnabled else { return }
+	        let extent = fractalFrameExtent
+	        guard extent.x > 0.0, extent.y > 0.0 else { return }
+	        rebuildFractalGridOverlayIfNeeded(extent: extent)
+	        guard let buffer = fractalGridOverlayBuffer, fractalGridOverlayInstanceCount > 0 else { return }
 
-	        var current: Frame? = topFrame
-	        while let frame = current {
-	            frame.strokes.removeAll()
-	            for card in frame.cards {
-	                card.strokes.removeAll()
-	            }
-	            current = childFrame(of: frame)
-	        }
+	        let z = max(zoom, 1e-6)
+	        let angle = Double(rotation)
+	        let c = cos(angle)
+	        let s = sin(angle)
+
+	        // Overlay is authored in active-frame world coords around (0,0).
+	        let dx = -cameraCenterWorld.x
+	        let dy = -cameraCenterWorld.y
+	        let rotatedOffsetScreen = SIMD2<Float>(
+	            Float((dx * c - dy * s) * z),
+	            Float((dx * s + dy * c) * z)
+	        )
+
+	        // 1–2px looks best; keep it constant in screen space.
+	        let halfPixelWidth: Float = 1.0
+
+	        var transform = StrokeTransform(
+	            relativeOffset: .zero,
+	            rotatedOffsetScreen: rotatedOffsetScreen,
+	            zoomScale: Float(z),
+	            screenWidth: Float(viewSize.width),
+	            screenHeight: Float(viewSize.height),
+	            rotationAngle: rotation,
+	            halfPixelWidth: halfPixelWidth,
+	            featherPx: 1.0,
+	            depth: 0.0
+	        )
+
+	        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+	        encoder.setDepthStencilState(stencilStateDefault)
+	        encoder.setCullMode(.none)
+	        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+	        encoder.setVertexBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+	        encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
+	        encoder.setVertexBuffer(buffer, offset: 0, index: 2)
+	        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: fractalGridOverlayInstanceCount)
 	    }
 
 	    // MARK: - Undo/Redo Implementation
@@ -396,10 +596,25 @@ import simd
 	        }
 	    }
 
-	    func replaceCanvas(with newRoot: Frame) {
-	        newRoot.parent = nil
-	        rootFrame = newRoot
-	        activeFrame = findFrame(withDepth: 0, in: newRoot) ?? newRoot
+	    func replaceCanvas(with newRoot: Frame, fractalExtent: SIMD2<Double> = .zero) {
+	        // Reset the canvas to a known root reference (topmost) and deterministic active frame.
+	        let top = topmostFrame(from: newRoot)
+	        top.parent = nil
+	        top.indexInParent = nil
+	        rootFrame = top
+
+	        var initial = top
+	        // Prefer the embedded "original" root at depth 0 by walking down the center chain.
+	        while initial.depthFromRoot < 0, let center = initial.children[GridIndex.center] {
+	            initial = center
+	        }
+	        activeFrame = initial
+
+	        if fractalExtent.x > 0.0, fractalExtent.y > 0.0 {
+	            fractalFrameExtent = fractalExtent
+	        } else {
+	            fractalFrameExtent = .zero
+	        }
 	        panOffset = .zero
 	        zoomScale = 1.0
 	        rotationAngle = 0.0
@@ -411,7 +626,7 @@ import simd
 	        clearLassoSelection()
 	        lassoDrawingPoints = []
 	        lassoPredictedPoints = []
-	        resetStrokeDepthID(using: newRoot)
+	        resetStrokeDepthID(using: top)
 	    }
 
 	    // MARK: - Global Stroke Depth Ordering
@@ -466,26 +681,26 @@ import simd
 	                consider(stroke.depthID)
 	            }
 	        }
-	        for child in frame.children {
-	            if let childMax = maxStrokeDepthID(in: child) {
-	                consider(childMax)
-	            }
-	        }
+		        for child in frame.children.values {
+		            if let childMax = maxStrokeDepthID(in: child) {
+		                consider(childMax)
+		            }
+		        }
 
 	        return maxID
 	    }
 
-	    private func findFrame(withDepth depth: Int, in frame: Frame) -> Frame? {
-	        if frame.depthFromRoot == depth {
-	            return frame
-	        }
-	        for child in frame.children {
-	            if let found = findFrame(withDepth: depth, in: child) {
-	                return found
-	            }
-	        }
-	        return nil
-	    }
+		    private func findFrame(withDepth depth: Int, in frame: Frame) -> Frame? {
+		        if frame.depthFromRoot == depth {
+		            return frame
+		        }
+		        for child in frame.children.values {
+		            if let found = findFrame(withDepth: depth, in: child) {
+		                return found
+		            }
+		        }
+		        return nil
+		    }
 
 	    override init() {
 	        super.init()
@@ -530,6 +745,138 @@ import simd
 	        return numerator / Self.strokeDepthDenominator
 	    }
 
+		    private func renderDepthNeighborhood(baseFrame: Frame,
+		                                         cameraCenterInBaseFrame: SIMD2<Double>,
+		                                         cameraCenterInActiveFrame: SIMD2<Double>,
+		                                         viewSize: CGSize,
+		                                         zoomActive: Double,
+		                                         rotation: Float,
+		                                         encoder: MTLRenderCommandEncoder,
+		                                         visited: inout Set<ObjectIdentifier>) {
+		        ensureFractalExtent(viewSize: viewSize)
+		        let extent = fractalFrameExtent
+		        let scale = FractalGrid.scale
+
+		        func recordRenderedFrame(_ frame: Frame,
+		                                 cameraCenterInFrame: SIMD2<Double>,
+		                                 zoomInFrame: Double) {
+		            let id = ObjectIdentifier(frame)
+		            let safeZoomInFrame = max(zoomInFrame, 1e-12)
+		            let scaleFromActive = zoomActive / safeZoomInFrame
+		            let translation = cameraCenterInFrame - cameraCenterInActiveFrame * scaleFromActive
+		            visibleFractalFrameTransforms[id] = (scale: scaleFromActive, translation: translation)
+		            visibleFractalFramesDrawOrder.append(frame)
+		        }
+
+		        // A) Ancestors (up to N). Render farthest-first as a background layer.
+		        var ancestors: [(frame: Frame, cameraCenter: SIMD2<Double>, zoom: Double)] = []
+		        ancestors.reserveCapacity(fractalStrokeVisibilityDepthRadius)
+
+		        var currentFrame = baseFrame
+		        var cameraCenter = cameraCenterInBaseFrame
+		        var currentZoom = zoomActive
+
+		        for _ in 0..<fractalStrokeVisibilityDepthRadius {
+		            guard let parent = currentFrame.parent,
+		                  let index = currentFrame.indexInParent else {
+		                break
+	            }
+
+	            let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+	            cameraCenter = childCenter + (cameraCenter / scale)
+	            currentZoom *= scale
+	            currentFrame = parent
+	            ancestors.append((frame: currentFrame, cameraCenter: cameraCenter, zoom: currentZoom))
+	        }
+
+		        for entry in ancestors.reversed() {
+		            let id = ObjectIdentifier(entry.frame)
+		            guard visited.insert(id).inserted else { continue }
+		            recordRenderedFrame(entry.frame,
+		                                cameraCenterInFrame: entry.cameraCenter,
+		                                zoomInFrame: entry.zoom)
+		            renderFrame(entry.frame,
+		                        cameraCenterInThisFrame: entry.cameraCenter,
+		                        viewSize: viewSize,
+		                        currentZoom: entry.zoom,
+	                        currentRotation: rotation,
+	                        encoder: encoder,
+	                        excludedChild: nil,
+	                        renderCards: true)
+	        }
+
+		        // B) Base frame.
+		        let baseID = ObjectIdentifier(baseFrame)
+		        if visited.insert(baseID).inserted {
+		            recordRenderedFrame(baseFrame,
+		                                cameraCenterInFrame: cameraCenterInBaseFrame,
+		                                zoomInFrame: zoomActive)
+		            renderFrame(baseFrame,
+		                        cameraCenterInThisFrame: cameraCenterInBaseFrame,
+		                        viewSize: viewSize,
+		                        currentZoom: zoomActive,
+		                        currentRotation: rotation,
+		                        encoder: encoder,
+		                        excludedChild: nil,
+		                        renderCards: true)
+	        }
+
+	        // C) Descendants (down to N).
+	        let screenW = Double(viewSize.width)
+	        let screenH = Double(viewSize.height)
+	        let screenRadius = sqrt(screenW * screenW + screenH * screenH) * 0.5
+	        let tileExtentInParent = FractalGrid.tileExtent(frameExtent: extent)
+	        let tileRadiusInParent = sqrt(tileExtentInParent.x * tileExtentInParent.x +
+	                                      tileExtentInParent.y * tileExtentInParent.y) * 0.5
+
+	        func renderDescendants(of frame: Frame,
+	                               cameraCenterInFrame: SIMD2<Double>,
+	                               zoomInFrame: Double,
+	                               remaining: Int) {
+	            guard remaining > 0 else { return }
+	            guard !frame.children.isEmpty else { return }
+
+	            let parentWorldRadius = screenRadius / max(zoomInFrame, 1e-6)
+	            let childZoom = zoomInFrame / scale
+
+	            for (index, child) in frame.children {
+	                let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+
+	                // Tile-level culling in the parent's coordinate space.
+	                let dx = childCenter.x - cameraCenterInFrame.x
+	                let dy = childCenter.y - cameraCenterInFrame.y
+	                let dist = sqrt(dx * dx + dy * dy)
+	                if (dist - tileRadiusInParent) > parentWorldRadius { continue }
+
+		                let cameraCenterInChild = (cameraCenterInFrame - childCenter) * scale
+		                let id = ObjectIdentifier(child)
+		                if visited.insert(id).inserted {
+		                    recordRenderedFrame(child,
+		                                        cameraCenterInFrame: cameraCenterInChild,
+		                                        zoomInFrame: childZoom)
+		                    renderFrame(child,
+		                                cameraCenterInThisFrame: cameraCenterInChild,
+		                                viewSize: viewSize,
+		                                currentZoom: childZoom,
+	                                currentRotation: rotation,
+	                                encoder: encoder,
+	                                excludedChild: nil,
+	                                renderCards: true)
+	                }
+
+	                renderDescendants(of: child,
+	                                  cameraCenterInFrame: cameraCenterInChild,
+	                                  zoomInFrame: childZoom,
+	                                  remaining: remaining - 1)
+	            }
+	        }
+
+		        renderDescendants(of: baseFrame,
+		                          cameraCenterInFrame: cameraCenterInBaseFrame,
+		                          zoomInFrame: zoomActive,
+		                          remaining: fractalStrokeVisibilityDepthRadius)
+		    }
+
     /// Recursively render a frame and adjacent depth levels (depth ±1).
     ///
     /// ** BIDIRECTIONAL RENDERING:**
@@ -554,7 +901,8 @@ import simd
                      currentRotation: Float,
                      encoder: MTLRenderCommandEncoder,
                      excludedChild: Frame? = nil,
-                     depthFromActive: Int = 0) { //  NEW: Prevent double-rendering
+                     depthFromActive: Int = 0,
+                     renderCards: Bool = true) { //  NEW: Prevent double-rendering
 
         // Reset debug metrics at the start of each frame (only for root call)
         if frame === activeFrame && excludedChild == nil {
@@ -562,37 +910,12 @@ import simd
             debugDrawnNodesThisFrame = 0
         }
 
-        // LAYER 1: RENDER PARENT (Background - Depth -1) -------------------------------
-        if let parent = frame.parent {
-            // Prevent recursion loops / redundant overdraw when traversing from parent -> child.
-            let cameFromParent = excludedChild.map { $0 === parent } ?? false
-            if !cameFromParent {
-            // Convert camera position from child coordinates to parent coordinates
-            // Formula: parent_pos = originInParent + (child_pos / scale)
-            let cameraCenterInParent = SIMD2<Double>(
-                frame.originInParent.x + (cameraCenterInThisFrame.x / frame.scaleRelativeToParent),
-                frame.originInParent.y + (cameraCenterInThisFrame.y / frame.scaleRelativeToParent)
-            )
-
-            // Zoom in parent frame is reduced (parent is "bigger")
-            let parentZoom = currentZoom * frame.scaleRelativeToParent
-
-            //  FIX: Event Horizon Culling - Lowered to 1e9 (1 Billion)
-            // Stop rendering the parent if it's magnified beyond Double precision safe zone.
-            // At 1e9+, precision errors cause jittery/shakey panning across vast distances.
-            // The background becomes mathematically unstable and visually meaningless.
-            if parentZoom > 0.0001 && parentZoom < 1e9 {
-                renderFrame(parent,
-                           cameraCenterInThisFrame: cameraCenterInParent,
-                           viewSize: viewSize,
-                           currentZoom: parentZoom,
-                           currentRotation: currentRotation,
-                           encoder: encoder,
-                           excludedChild: frame,
-                           depthFromActive: depthFromActive - 1) //  TELL PARENT TO SKIP US
-            }
-            }
-        }
+        /*
+        // LAYER 1: LEGACY (Telescoping) PARENT RENDERING -------------------------------
+        // Previously rendered the parent frame (depth -1) as a background layer using
+        // `originInParent` and `scaleRelativeToParent`. This is disabled for the fractal grid
+        // neighborhood renderer (same-depth tiling).
+        */
 
         // LAYER 2: RENDER THIS FRAME (Middle Layer - Depth 0) --------------------------
 
@@ -704,6 +1027,7 @@ import simd
 	        }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
+        if renderCards {
         for card in frame.cards {
             // A. Calculate Position
             // Card lives in the Frame, so it moves with the Frame
@@ -1005,29 +1329,17 @@ import simd
                                 encoder: encoder)
             }
         }
+        }
 
-        // Reset pipeline and stencil state for subsequent rendering (live stroke, child frames, etc.)
+        // Reset pipeline and stencil state for subsequent rendering (live stroke, overlays, etc.)
         encoder.setRenderPipelineState(strokeSegmentPipelineState)
         encoder.setDepthStencilState(stencilStateDefault)
-
-        // LAYER 3: RENDER CHILDREN (Foreground Details - Depth +1) ---------------------
-        for child in frame.children {
-            if let excluded = excludedChild, child === excluded { continue }
-
-            let childZoom = currentZoom / child.scaleRelativeToParent
-            if childZoom < 0.001 { continue }
-
-            let cameraCenterInChild = (cameraCenterInThisFrame - child.originInParent) * child.scaleRelativeToParent
-
-            renderFrame(child,
-                        cameraCenterInThisFrame: cameraCenterInChild,
-                        viewSize: viewSize,
-                        currentZoom: childZoom,
-                        currentRotation: currentRotation,
-                        encoder: encoder,
-                        excludedChild: frame,
-                        depthFromActive: depthFromActive + 1)
-        }
+        /*
+        // LAYER 3: LEGACY (Telescoping) CHILD RENDERING -------------------------------
+        // Previously rendered child frames (depth +1) recursively. In the fractal grid,
+        // we render a same-depth neighborhood (3x3) instead, and depth previews are a
+        // separate follow-up step.
+        */
     }
 
     private func buildLiveScreenPoints() -> [CGPoint]? {
@@ -1722,24 +2034,93 @@ import simd
         sceneRPD.stencilAttachment.storeAction = .dontCare
         sceneRPD.stencilAttachment.clearStencil = view.clearStencil
 
-        guard let sceneEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: sceneRPD) else { return }
+	        guard let sceneEnc = mainCommandBuffer.makeRenderCommandEncoder(descriptor: sceneRPD) else { return }
 
-        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
+		        let viewSize = view.bounds.size
+		        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: viewSize)
+		        let extent = fractalFrameExtent
+		        visibleFractalFrameTransforms.removeAll(keepingCapacity: true)
+		        visibleFractalFramesDrawOrder.removeAll(keepingCapacity: true)
 
-        sceneEnc.setRenderPipelineState(strokeSegmentPipelineState)
-        sceneEnc.setCullMode(.none)
+	        sceneEnc.setRenderPipelineState(strokeSegmentPipelineState)
+	        sceneEnc.setCullMode(.none)
 
-        renderFrame(activeFrame,
-                    cameraCenterInThisFrame: cameraCenterWorld,
-                    viewSize: view.bounds.size,
-                    currentZoom: zoomScale,
-                    currentRotation: rotationAngle,
-                    encoder: sceneEnc,
-                    excludedChild: nil)
+	        // Render only the frames that are potentially visible, and avoid instantiating missing frames.
+	        func visibleTileOffsetRanges() -> (dx: ClosedRange<Int>, dy: ClosedRange<Int>) {
+	            guard extent.x > 0.0, extent.y > 0.0 else { return (dx: 0...0, dy: 0...0) }
+	            let cornersScreen = [
+	                CGPoint(x: 0.0, y: 0.0),
+	                CGPoint(x: viewSize.width, y: 0.0),
+	                CGPoint(x: viewSize.width, y: viewSize.height),
+	                CGPoint(x: 0.0, y: viewSize.height)
+	            ]
+	            let cornersWorld = cornersScreen.map {
+	                screenToWorldPixels_PureDouble(
+	                    $0,
+	                    viewSize: viewSize,
+	                    panOffset: panOffset,
+	                    zoomScale: zoomScale,
+	                    rotationAngle: rotationAngle
+	                )
+	            }
 
-        // Live stroke rendering (same logic), reusing the scene encoder.
-        if !brushSettings.isLasso,
-           (currentTouchPoints.count + predictedTouchPoints.count) >= 2,
+	            guard let minX = cornersWorld.map({ $0.x }).min(),
+	                  let maxX = cornersWorld.map({ $0.x }).max(),
+	                  let minY = cornersWorld.map({ $0.y }).min(),
+	                  let maxY = cornersWorld.map({ $0.y }).max() else {
+	                return (dx: 0...0, dy: 0...0)
+	            }
+
+	            let half = extent * 0.5
+	            let safeExtentX = max(extent.x, 1e-9)
+	            let safeExtentY = max(extent.y, 1e-9)
+
+	            func offsetX(for x: Double) -> Int { Int(floor((x + half.x) / safeExtentX)) }
+	            func offsetY(for y: Double) -> Int { Int(floor((y + half.y) / safeExtentY)) }
+
+	            var minDx = offsetX(for: minX)
+	            var maxDx = offsetX(for: maxX)
+	            var minDy = offsetY(for: minY)
+	            var maxDy = offsetY(for: maxY)
+
+	            // Expand by 1 tile to avoid edge pop-in.
+	            minDx -= 1; maxDx += 1
+	            minDy -= 1; maxDy += 1
+
+	            // Clamp to the debug overlay neighborhood.
+	            minDx = max(minDx, -2); maxDx = min(maxDx, 2)
+	            minDy = max(minDy, -2); maxDy = min(maxDy, 2)
+
+	            return (dx: minDx...maxDx, dy: minDy...maxDy)
+	        }
+
+	        // Draw debug grid first so strokes/cards render above it.
+	        drawFractalGridOverlay(encoder: sceneEnc,
+	                               viewSize: viewSize,
+	                               cameraCenterWorld: cameraCenterWorld,
+	                               zoom: zoomScale,
+	                               rotation: rotationAngle)
+
+	        let visible = visibleTileOffsetRanges()
+	        var renderedFrames = Set<ObjectIdentifier>()
+		        for dy in visible.dy {
+		            for dx in visible.dx {
+		                guard let frame = frameAtOffsetFromActiveIfExists(dx: dx, dy: dy) else { continue }
+		                let offset = SIMD2<Double>(Double(dx) * extent.x, Double(dy) * extent.y)
+		                renderDepthNeighborhood(baseFrame: frame,
+		                                        cameraCenterInBaseFrame: cameraCenterWorld - offset,
+		                                        cameraCenterInActiveFrame: cameraCenterWorld,
+		                                        viewSize: viewSize,
+		                                        zoomActive: zoomScale,
+		                                        rotation: rotationAngle,
+		                                        encoder: sceneEnc,
+		                                        visited: &renderedFrames)
+		            }
+		        }
+
+	        // Live stroke rendering (same logic), reusing the scene encoder.
+	        if !brushSettings.isLasso,
+	           (currentTouchPoints.count + predictedTouchPoints.count) >= 2,
            let tempOrigin = liveStrokeOrigin {
             renderLiveStroke(view: view, encoder: sceneEnc, cameraCenterWorld: cameraCenterWorld, tempOrigin: tempOrigin)
         }
@@ -1777,6 +2158,23 @@ import simd
         // Get stored depth from the frame
         let depth = activeFrame.depthFromRoot
 
+        let tileText: String = {
+            guard let idx = activeFrame.indexInParent else { return "root" }
+            return "(\(idx.col), \(idx.row))"
+        }()
+
+        let pathText: String = {
+            var indices: [GridIndex] = []
+            var current: Frame? = activeFrame
+            while let frame = current, let idx = frame.indexInParent {
+                indices.append(idx)
+                current = frame.parent
+            }
+            indices.reverse()
+            if indices.isEmpty { return "root" }
+            return indices.map { "(\($0.col),\($0.row))" }.joined(separator: " → ")
+        }()
+
         // Format zoom scale nicely
         let zoomText: String
         if zoomScale >= 1000.0 {
@@ -1788,8 +2186,8 @@ import simd
         }
 
         // Calculate effective zoom (depth multiplier)
-        // pow(1000, -1) = 0.001, so negative depths work correctly
-        let effectiveZoom = pow(1000.0, Double(depth)) * zoomScale
+        // pow(scale, -1) shrinks, so negative depths work correctly.
+        let effectiveZoom = pow(FractalGrid.scale, Double(depth)) * zoomScale
         let effectiveText: String
         if effectiveZoom >= 1e12 {
             let exponent = Int(log10(effectiveZoom))
@@ -1816,7 +2214,8 @@ import simd
         // Update label on main thread
         DispatchQueue.main.async {
             debugLabel.text = """
-            Depth: \(depth) | Zoom: \(zoomText)
+            Depth: \(depth) | Tile: \(tileText) | Zoom: \(zoomText)
+            Path: \(pathText)
             Effective: \(effectiveText)
             Strokes: \(self.activeFrame.strokes.count)
             Camera: \(cameraPosText)
@@ -2175,13 +2574,22 @@ import simd
                                              options: .storageModeShared)
     }
 
-    // MARK: - Camera Center Calculation
+	    // MARK: - Camera Center Calculation
 
-    /// Calculate the camera center in world coordinates using Double precision.
-    /// This is the inverse of the pan/zoom/rotate transform applied to strokes.
-    func calculateCameraCenterWorld(viewSize: CGSize) -> SIMD2<Double> {
-        // The center of the screen in screen coordinates
-        let screenCenter = CGPoint(x: viewSize.width / 2.0, y: viewSize.height / 2.0)
+	    /// Initialize fractal frame extent once from the view size.
+	    /// The extent defines the bounded coordinate domain of a single same-depth tile.
+	    func ensureFractalExtent(viewSize: CGSize) {
+	        if fractalFrameExtent.x <= 0.0 || fractalFrameExtent.y <= 0.0 {
+	            fractalFrameExtent = SIMD2<Double>(Double(viewSize.width), Double(viewSize.height))
+	        }
+	    }
+
+	    /// Calculate the camera center in world coordinates using Double precision.
+	    /// This is the inverse of the pan/zoom/rotate transform applied to strokes.
+	    func calculateCameraCenterWorld(viewSize: CGSize) -> SIMD2<Double> {
+	        ensureFractalExtent(viewSize: viewSize)
+	        // The center of the screen in screen coordinates
+	        let screenCenter = CGPoint(x: viewSize.width / 2.0, y: viewSize.height / 2.0)
 
         //  USE PURE DOUBLE HELPER
         // Pass Double panOffset and zoomScale directly without casting to Float
@@ -2538,17 +2946,175 @@ import simd
         applyLassoTransform(state)
     }
 
-    func updateLassoTransformRotation(delta: Double) {
-        guard var state = lassoTransformState else { return }
-        guard delta.isFinite else { return }
-        state.currentRotation += delta
-        lassoTransformState = state
-        applyLassoTransform(state)
-    }
+	    func updateLassoTransformRotation(delta: Double) {
+	        guard var state = lassoTransformState else { return }
+	        guard delta.isFinite else { return }
+	        state.currentRotation += delta
+	        lassoTransformState = state
+	        applyLassoTransform(state)
+	    }
+	
+		    func endLassoTransformIfNeeded() {
+		        lassoTransformState = nil
+		        normalizeLassoSelectedCanvasStrokes()
+		        normalizeLassoSelectedCards()
+		    }
 
-    func endLassoTransformIfNeeded() {
-        lassoTransformState = nil
-    }
+	    /// After a lasso scale/rotate, selected strokes can end up outside the local frame bounds.
+	    /// If we leave them there, navigating (wrapping/drilling) moves into neighbor frames and the
+	    /// strokes appear to "vanish" because they're still stored in the old frame.
+	    ///
+	    /// Fix: re-home each selected stroke into the same-depth neighbor frame that contains its bounds center.
+		    private func normalizeLassoSelectedCanvasStrokes() {
+		        guard var selection = lassoSelection else { return }
+	        guard let view = metalView else { return }
+	        let viewSize = view.bounds.size
+	        guard viewSize.width > 0.0, viewSize.height > 0.0 else { return }
+	
+	        ensureFractalExtent(viewSize: viewSize)
+	        let extent = fractalFrameExtent
+	        guard extent.x > 0.0, extent.y > 0.0 else { return }
+	
+	        var regrouped: [ObjectIdentifier: (frame: Frame, strokeIDs: Set<UUID>)] = [:]
+	
+	        for frameSelection in selection.frames {
+	            let originalFrame = frameSelection.frame
+	            for id in frameSelection.strokeIDs {
+	                guard let strokeIndex = originalFrame.strokes.firstIndex(where: { $0.id == id }) else { continue }
+	                let stroke = originalFrame.strokes[strokeIndex]
+	
+	                let (newFrame, newStroke) = rehomeCanvasStrokeIfNeeded(stroke, from: originalFrame, viewSize: viewSize)
+	                if newFrame !== originalFrame {
+	                    originalFrame.strokes.remove(at: strokeIndex)
+	                    newFrame.strokes.append(newStroke)
+	                } else if newStroke !== stroke {
+	                    originalFrame.strokes[strokeIndex] = newStroke
+	                }
+	
+	                let key = ObjectIdentifier(newFrame)
+	                if var entry = regrouped[key] {
+	                    entry.strokeIDs.insert(id)
+	                    regrouped[key] = entry
+	                } else {
+	                    regrouped[key] = (frame: newFrame, strokeIDs: [id])
+	                }
+	            }
+	        }
+	
+		        selection.frames = regrouped.values.map { LassoFrameSelection(frame: $0.frame, strokeIDs: $0.strokeIDs) }
+		        lassoSelection = selection
+		    }
+
+		    /// Same re-homing logic as canvas strokes, but for whole cards that were lasso-transformed.
+		    /// Cards can be moved outside the local frame bounds by a scale/rotate about a distant center.
+		    /// If we don't re-home them, they'll "disappear" when the user wraps/drills into the neighbor frame.
+		    private func normalizeLassoSelectedCards() {
+		        guard var selection = lassoSelection else { return }
+		        guard !selection.cards.isEmpty else { return }
+		        guard let view = metalView else { return }
+		        let viewSize = view.bounds.size
+		        guard viewSize.width > 0.0, viewSize.height > 0.0 else { return }
+		
+		        ensureFractalExtent(viewSize: viewSize)
+		        let extent = fractalFrameExtent
+		        guard extent.x > 0.0, extent.y > 0.0 else { return }
+		
+		        var updated: [LassoCardSelection] = []
+		        updated.reserveCapacity(selection.cards.count)
+		
+		        for cardSelection in selection.cards {
+		            let card = cardSelection.card
+		            if card.isLocked {
+		                updated.append(cardSelection)
+		                continue
+		            }
+		
+		            let originalFrame = cardSelection.frame
+		            let resolved = resolveSameDepthFrame(start: originalFrame, anchor: card.origin, viewSize: viewSize)
+		            if resolved.frame !== originalFrame {
+		                // Move the card into the destination frame and keep its world position stable.
+		                card.origin = card.origin + resolved.shift
+		
+		                if let index = originalFrame.cards.firstIndex(where: { $0.id == card.id }) {
+		                    originalFrame.cards.remove(at: index)
+		                }
+		                if !resolved.frame.cards.contains(where: { $0.id == card.id }) {
+		                    resolved.frame.cards.append(card)
+		                }
+		
+		                updated.append(LassoCardSelection(card: card, frame: resolved.frame))
+		            } else {
+		                updated.append(cardSelection)
+		            }
+		        }
+		
+		        selection.cards = updated
+		        lassoSelection = selection
+		    }
+
+	    private func rehomeCanvasStrokeIfNeeded(_ stroke: Stroke,
+	                                           from frame: Frame,
+	                                           viewSize: CGSize) -> (frame: Frame, stroke: Stroke) {
+	        ensureFractalExtent(viewSize: viewSize)
+	        let extent = fractalFrameExtent
+	        guard extent.x > 0.0, extent.y > 0.0 else { return (frame: frame, stroke: stroke) }
+	
+	        let bounds = stroke.localBounds
+	        let centerLocal = SIMD2<Double>(Double(bounds.midX), Double(bounds.midY))
+	        let center = stroke.origin + centerLocal
+	
+	        let resolved = resolveSameDepthFrame(start: frame, anchor: center, viewSize: viewSize)
+	        if resolved.frame === frame { return (frame: frame, stroke: stroke) }
+	
+	        let shiftedOrigin = stroke.origin + resolved.shift
+	        let shiftedStroke = Stroke(id: stroke.id,
+	                                   origin: shiftedOrigin,
+	                                   worldWidth: stroke.worldWidth,
+	                                   color: stroke.color,
+	                                   zoomEffectiveAtCreation: stroke.zoomEffectiveAtCreation,
+	                                   segments: stroke.segments,
+	                                   localBounds: stroke.localBounds,
+	                                   segmentBounds: stroke.segmentBounds,
+	                                   device: device,
+	                                   depthID: stroke.depthID,
+	                                   depthWriteEnabled: stroke.depthWriteEnabled)
+	        return (frame: resolved.frame, stroke: shiftedStroke)
+	    }
+
+	    private func resolveSameDepthFrame(start: Frame,
+	                                       anchor: SIMD2<Double>,
+	                                       viewSize: CGSize) -> (frame: Frame, shift: SIMD2<Double>) {
+	        ensureFractalExtent(viewSize: viewSize)
+	        let extent = fractalFrameExtent
+	        let half = extent * 0.5
+	
+	        var frame = start
+	        var point = anchor
+	        var shift = SIMD2<Double>(0, 0)
+	
+	        while point.x > half.x {
+	            frame = neighborFrame(from: frame, direction: .right)
+	            point.x -= extent.x
+	            shift.x -= extent.x
+	        }
+	        while point.x < -half.x {
+	            frame = neighborFrame(from: frame, direction: .left)
+	            point.x += extent.x
+	            shift.x += extent.x
+	        }
+	        while point.y > half.y {
+	            frame = neighborFrame(from: frame, direction: .down)
+	            point.y -= extent.y
+	            shift.y -= extent.y
+	        }
+	        while point.y < -half.y {
+	            frame = neighborFrame(from: frame, direction: .up)
+	            point.y += extent.y
+	            shift.y += extent.y
+	        }
+	
+	        return (frame: frame, shift: shift)
+	    }
 
     private func applyLassoTransform(_ state: LassoTransformState) {
         guard var selection = lassoSelection else { return }
@@ -2852,23 +3418,24 @@ import simd
         return SIMD2<Double>(card.origin.x + rotX, card.origin.y + rotY)
     }
 
-    private func framesInActiveChain() -> [Frame] {
-        var frames: [Frame] = []
+	    private func framesInActiveChain() -> [Frame] {
+	        if !visibleFractalFramesDrawOrder.isEmpty {
+	            return visibleFractalFramesDrawOrder
+	        }
+	        guard let view = metalView else { return [activeFrame] }
+	        ensureFractalExtent(viewSize: view.bounds.size)
 
-        var current: Frame? = activeFrame
-        while let frame = current {
-            frames.append(frame)
-            current = frame.parent
-        }
-
-        current = childFrame(of: activeFrame)
-        while let frame = current {
-            frames.append(frame)
-            current = childFrame(of: frame)
-        }
-
-        return frames
-    }
+	        let radius = 2
+	        var frames: [Frame] = []
+	        frames.reserveCapacity((2 * radius + 1) * (2 * radius + 1))
+	        for dy in -radius...radius {
+	            for dx in -radius...radius {
+	                guard let frame = frameAtOffsetFromActiveIfExists(dx: dx, dy: dy) else { continue }
+	                frames.append(frame)
+	            }
+	        }
+	        return frames
+	    }
 
     private func pointInPolygon(_ point: SIMD2<Double>, polygon: [SIMD2<Double>]) -> Bool {
         guard polygon.count >= 3 else { return false }
@@ -3131,14 +3698,16 @@ import simd
                     )
                 }
             } else {
-                currentDrawingTarget = .canvas(activeFrame)
-                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                let pointActive = screenToWorldPixels_PureDouble(
                     point,
                     viewSize: view.bounds.size,
                     panOffset: panOffset,
                     zoomScale: zoomScale,
                     rotationAngle: rotationAngle
                 )
+                let resolved = resolveFrameForActivePoint(pointActive, viewSize: view.bounds.size)
+                currentDrawingTarget = .canvas(resolved.frame)
+                liveStrokeOrigin = resolved.pointInFrame
             }
         } else {
             // USE HIERARCHICAL CARD HIT TEST
@@ -3157,16 +3726,16 @@ import simd
                 )
 
             } else {
-                // Draw on Canvas (Active Frame)
-                currentDrawingTarget = .canvas(activeFrame)
-
-                liveStrokeOrigin = screenToWorldPixels_PureDouble(
+                let pointActive = screenToWorldPixels_PureDouble(
                     point,
                     viewSize: view.bounds.size,
                     panOffset: panOffset,
                     zoomScale: zoomScale,
                     rotationAngle: rotationAngle
                 )
+                let resolved = resolveFrameForActivePoint(pointActive, viewSize: view.bounds.size)
+                currentDrawingTarget = .canvas(resolved.frame)
+                liveStrokeOrigin = resolved.pointInFrame
             }
         }
 
@@ -3494,13 +4063,7 @@ import simd
         lastSavedPoint = nil  // Clear for next stroke
     }
 
-    // MARK: - Cross-Frame Hit Testing (Linked List Frames)
-
-    private struct FrameTransform {
-        let frame: Frame
-        let point: SIMD2<Double>
-        let scale: Double  // Active -> Frame scale factor
-    }
+    // MARK: - Hit Testing (Fractal Grid MVP)
 
     private struct StrokeHit {
         enum Target {
@@ -3513,89 +4076,77 @@ import simd
         let depthID: UInt32
     }
 
-    private func childFrame(of frame: Frame) -> Frame? {
-        // Frames are a linked list: at most one child.
-        frame.children.first
-    }
+    /*
+    // MARK: - Legacy Telescoping Hit Testing (Reference Only)
+    //
+    // This section relied on linked-list frames (single child), plus:
+    // - `originInParent`
+    // - `scaleRelativeToParent`
+    //
+    // private struct FrameTransform { ... }
+    // private func childFrame(of:) -> Frame?
+    // private func collectFrameTransforms(pointActive:) -> (ancestors, descendants)
+    // private func transformFromActive(to:) -> (scale, translation)?
+    // private func pointInFrame(screenPoint:viewSize:frame:) -> SIMD2<Double>?
+    */
 
-    private func collectFrameTransforms(pointActive: SIMD2<Double>) -> (ancestors: [FrameTransform], descendants: [FrameTransform]) {
-        var ancestors: [FrameTransform] = []
-        var descendants: [FrameTransform] = []
+	    /// Supports same-depth transforms within the visible 5x5 neighborhood around the active frame.
+	    private func transformFromActive(to target: Frame) -> (scale: Double, translation: SIMD2<Double>)? {
+	        if target === activeFrame {
+	            return (scale: 1.0, translation: .zero)
+	        }
 
-        // Walk up to parents.
-        var current: Frame? = activeFrame
-        var point = pointActive
-        var scale = 1.0
-        while let frame = current, let parent = frame.parent {
-            point = frame.originInParent + (point / frame.scaleRelativeToParent)
-            scale /= frame.scaleRelativeToParent
-            ancestors.append(FrameTransform(frame: parent, point: point, scale: scale))
-            current = parent
-        }
+	        let targetID = ObjectIdentifier(target)
+	        if let cached = visibleFractalFrameTransforms[targetID] {
+	            return cached
+	        }
 
-        // Walk down to child chain.
-        current = activeFrame
-        point = pointActive
-        scale = 1.0
-        while let frame = current, let child = childFrame(of: frame) {
-            point = (point - child.originInParent) * child.scaleRelativeToParent
-            scale *= child.scaleRelativeToParent
-            descendants.append(FrameTransform(frame: child, point: point, scale: scale))
-            current = child
-        }
+	        guard let view = metalView else { return nil }
+	        ensureFractalExtent(viewSize: view.bounds.size)
+	        let extent = fractalFrameExtent
+	        guard extent.x > 0.0, extent.y > 0.0 else { return nil }
 
-        return (ancestors, descendants)
-    }
-
-    private func transformFromActive(to target: Frame) -> (scale: Double, translation: SIMD2<Double>)? {
-        if target === activeFrame {
-            return (scale: 1.0, translation: .zero)
-        }
-
-        // Walk up to find ancestor.
-        var scale = 1.0
-        var translation = SIMD2<Double>(repeating: 0.0)
-        var current: Frame? = activeFrame
-        while let frame = current, let parent = frame.parent {
-            scale /= frame.scaleRelativeToParent
-            translation = translation / frame.scaleRelativeToParent + frame.originInParent
-            if parent === target {
-                return (scale, translation)
+        let radius = 2
+        for dy in -radius...radius {
+            for dx in -radius...radius {
+                guard let f = frameAtOffsetFromActiveIfExists(dx: dx, dy: dy) else { continue }
+                if f === target {
+                    return (scale: 1.0,
+                            translation: SIMD2<Double>(-Double(dx) * extent.x, -Double(dy) * extent.y))
+                }
             }
-            current = parent
-        }
-
-        // Walk down to find descendant.
-        scale = 1.0
-        translation = SIMD2<Double>(repeating: 0.0)
-        current = activeFrame
-        while let frame = current, let child = childFrame(of: frame) {
-            scale *= child.scaleRelativeToParent
-            translation = (translation - child.originInParent) * child.scaleRelativeToParent
-            if child === target {
-                return (scale, translation)
-            }
-            current = child
         }
 
         return nil
     }
 
-    private func pointInFrame(screenPoint: CGPoint, viewSize: CGSize, frame: Frame) -> SIMD2<Double>? {
-        let pointActive = screenToWorldPixels_PureDouble(
-            screenPoint,
-            viewSize: viewSize,
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            rotationAngle: rotationAngle
-        )
+    private func resolveFrameForActivePoint(_ pointActive: SIMD2<Double>,
+                                            viewSize: CGSize) -> (frame: Frame, pointInFrame: SIMD2<Double>, conversionScale: Double) {
+        ensureFractalExtent(viewSize: viewSize)
+        let extent = fractalFrameExtent
+        let half = extent * 0.5
 
-        if frame === activeFrame {
-            return pointActive
+        var frame = activeFrame
+        var point = pointActive
+
+        while point.x > half.x {
+            frame = neighborFrame(from: frame, direction: .right)
+            point.x -= extent.x
+        }
+        while point.x < -half.x {
+            frame = neighborFrame(from: frame, direction: .left)
+            point.x += extent.x
+        }
+        while point.y > half.y {
+            frame = neighborFrame(from: frame, direction: .down)
+            point.y -= extent.y
+        }
+        while point.y < -half.y {
+            frame = neighborFrame(from: frame, direction: .up)
+            point.y += extent.y
         }
 
-        guard let transform = transformFromActive(to: frame) else { return nil }
-        return pointActive * transform.scale + transform.translation
+        return (frame: frame, pointInFrame: point, conversionScale: 1.0)
     }
 
     private func eraserRadiusWorld(forScale scale: Double) -> Double {
@@ -3677,19 +4228,18 @@ import simd
         return nil
     }
 
-    private func hitTestStrokeHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> StrokeHit? {
-        let pointActive = screenToWorldPixels_PureDouble(
-            screenPoint,
-            viewSize: viewSize,
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            rotationAngle: rotationAngle
-        )
+		    private func hitTestStrokeHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> StrokeHit? {
+		        let pointActive = screenToWorldPixels_PureDouble(
+		            screenPoint,
+		            viewSize: viewSize,
+		            panOffset: panOffset,
+		            zoomScale: zoomScale,
+		            rotationAngle: rotationAngle
+		        )
 
-        let transforms = collectFrameTransforms(pointActive: pointActive)
-        var bestDepthID: UInt32?
-        var bestTarget: StrokeHit.Target?
-        var bestStroke: Stroke?
+	        var bestDepthID: UInt32?
+	        var bestTarget: StrokeHit.Target?
+	        var bestStroke: Stroke?
 
         func considerCanvasStrokes(in frame: Frame,
                                    pointInFrame: SIMD2<Double>,
@@ -3731,50 +4281,43 @@ import simd
                     break
                 }
             }
-        }
+	        }
 
-        // Active frame first, then ancestors/descendants.
-        let activeEraserRadius = eraserRadiusWorld(forScale: 1.0)
-        considerCanvasStrokes(in: activeFrame,
-                              pointInFrame: pointActive,
-                              eraserRadius: activeEraserRadius)
-        considerCardStrokes(in: activeFrame,
-                            pointInFrame: pointActive,
-                            eraserRadius: activeEraserRadius)
+		        if !visibleFractalFramesDrawOrder.isEmpty {
+		            for frame in visibleFractalFramesDrawOrder {
+		                guard let transform = transformFromActive(to: frame) else { continue }
+		                let pointInFrame = pointActive * transform.scale + transform.translation
+		                let eraserRadius = eraserRadiusWorld(forScale: transform.scale)
+		                considerCanvasStrokes(in: frame,
+		                                      pointInFrame: pointInFrame,
+		                                      eraserRadius: eraserRadius)
+		                considerCardStrokes(in: frame,
+		                                    pointInFrame: pointInFrame,
+		                                    eraserRadius: eraserRadius)
+		            }
+		        } else {
+		            let resolved = resolveFrameForActivePoint(pointActive, viewSize: viewSize)
+		            let eraserRadius = eraserRadiusWorld(forScale: resolved.conversionScale)
+		            considerCanvasStrokes(in: resolved.frame,
+		                                  pointInFrame: resolved.pointInFrame,
+		                                  eraserRadius: eraserRadius)
+		            considerCardStrokes(in: resolved.frame,
+		                                pointInFrame: resolved.pointInFrame,
+		                                eraserRadius: eraserRadius)
+		        }
 
-        for ancestor in transforms.ancestors {
-            let eraserRadius = eraserRadiusWorld(forScale: ancestor.scale)
-            considerCanvasStrokes(in: ancestor.frame,
-                                  pointInFrame: ancestor.point,
-                                  eraserRadius: eraserRadius)
-            considerCardStrokes(in: ancestor.frame,
-                                pointInFrame: ancestor.point,
-                                eraserRadius: eraserRadius)
-        }
-
-        for descendant in transforms.descendants {
-            let eraserRadius = eraserRadiusWorld(forScale: descendant.scale)
-            considerCanvasStrokes(in: descendant.frame,
-                                  pointInFrame: descendant.point,
-                                  eraserRadius: eraserRadius)
-            considerCardStrokes(in: descendant.frame,
-                                pointInFrame: descendant.point,
-                                eraserRadius: eraserRadius)
-        }
-
-        guard let depthID = bestDepthID, let target = bestTarget, let stroke = bestStroke else { return nil }
-        return StrokeHit(target: target, stroke: stroke, depthID: depthID)
-    }
+		        guard let depthID = bestDepthID, let target = bestTarget, let stroke = bestStroke else { return nil }
+		        return StrokeHit(target: target, stroke: stroke, depthID: depthID)
+		    }
 
     private func eraseStrokeAtPoint(screenPoint: CGPoint, viewSize: CGSize) {
         // Cards sit on top of the canvas; when covered, only card strokes are eligible.
-        if let (card, frame, conversionScale, _) = hitTestHierarchy(screenPoint: screenPoint, viewSize: viewSize, ignoringLocked: true) {
-            guard let pointInTargetFrame = pointInFrame(screenPoint: screenPoint,
-                                                        viewSize: viewSize,
-                                                        frame: frame) else { return }
+        if let (card, frame, conversionScale, pointInFrame) = hitTestHierarchy(screenPoint: screenPoint,
+                                                                              viewSize: viewSize,
+                                                                              ignoringLocked: true) {
             let eraserRadius = eraserRadiusWorld(forScale: conversionScale)
             if let stroke = hitTestCardStroke(card: card,
-                                              pointInFrame: pointInTargetFrame,
+                                              pointInFrame: pointInFrame,
                                               eraserRadius: eraserRadius),
                let index = card.strokes.firstIndex(where: { $0 === stroke }) {
                 let strokeCopy = stroke // Keep reference before removing
@@ -3803,57 +4346,56 @@ import simd
 
     // MARK: - Card Management
 
-    /// Hit test across the entire visible chain (Ancestors -> Active -> Descendants)
-    /// Returns: The Card, The Frame it belongs to, and the Coordinate Conversion Scale
-    /// The conversion scale is used to translate movement deltas between coordinate systems:
-    ///   - Parent cards: scale < 1.0 (move slower - parent coords are smaller)
-    ///   - Active cards: scale = 1.0 (normal movement)
-    ///   - Child cards: scale > 1.0 (move faster - child coords are larger)
-    func hitTestHierarchy(screenPoint: CGPoint,
-                          viewSize: CGSize,
-                          ignoringLocked: Bool = false) -> (card: Card, frame: Frame, conversionScale: Double, pointInFrame: SIMD2<Double>)? {
+		    /// Hit test cards in the visible 5x5 neighborhood (same-depth).
+	    /// Returns: The Card, The Frame it belongs to, and the Coordinate Conversion Scale
+	    /// The conversion scale is used to translate movement deltas between coordinate systems:
+	    ///   - Parent cards: scale < 1.0 (move slower - parent coords are smaller)
+	    ///   - Active cards: scale = 1.0 (normal movement)
+	    ///   - Child cards: scale > 1.0 (move faster - child coords are larger)
+		    func hitTestHierarchy(screenPoint: CGPoint,
+		                          viewSize: CGSize,
+		                          ignoringLocked: Bool = false) -> (card: Card, frame: Frame, conversionScale: Double, pointInFrame: SIMD2<Double>)? {
 
-        // 1. Calculate Point in Active Frame (World Space)
-        let pointActive = screenToWorldPixels_PureDouble(
-            screenPoint,
-            viewSize: viewSize,
-            panOffset: panOffset,
-            zoomScale: zoomScale,
-            rotationAngle: rotationAngle
-        )
+	        // 1. Calculate Point in Active Frame (World Space)
+	        let pointActive = screenToWorldPixels_PureDouble(
+	            screenPoint,
+	            viewSize: viewSize,
+	            panOffset: panOffset,
+	            zoomScale: zoomScale,
+	            rotationAngle: rotationAngle
+	        )
 
-        let transforms = collectFrameTransforms(pointActive: pointActive)
+	        // Prefer the render-derived cache so cards can be interacted with across depths.
+	        if !visibleFractalFramesDrawOrder.isEmpty {
+	            for frame in visibleFractalFramesDrawOrder.reversed() {
+	                guard !frame.cards.isEmpty else { continue }
+	                guard let transform = transformFromActive(to: frame) else { continue }
 
-        // --- CHECK 1: DESCENDANTS (Foreground - Top Priority) ---
-        for descendant in transforms.descendants.reversed() {
-            for card in descendant.frame.cards.reversed() {
-                if ignoringLocked, card.isLocked { continue }
-                if card.hitTest(pointInFrame: descendant.point) {
-                    return (card, descendant.frame, descendant.scale, descendant.point)
-                }
-            }
-        }
+	                let pointInFrame = pointActive * transform.scale + transform.translation
+	                for card in frame.cards.reversed() {
+	                    if ignoringLocked, card.isLocked { continue }
+	                    if card.hitTest(pointInFrame: pointInFrame) {
+	                        return (card, frame, transform.scale, pointInFrame)
+	                    }
+	                }
+	            }
+	            return nil
+	        }
 
-        // --- CHECK 2: ACTIVE FRAME (Middle) ---
-        for card in activeFrame.cards.reversed() {
-            if ignoringLocked, card.isLocked { continue }
-            if card.hitTest(pointInFrame: pointActive) {
-                return (card, activeFrame, 1.0, pointActive)
-            }
-        }
+	        // Fallback: same-depth resolution only.
+	        let resolved = resolveFrameForActivePoint(pointActive, viewSize: viewSize)
+	        let frame = resolved.frame
+	        let pointInFrame = resolved.pointInFrame
 
-        // --- CHECK 3: ANCESTORS (Background) ---
-        for ancestor in transforms.ancestors {
-            for card in ancestor.frame.cards.reversed() {
-                if ignoringLocked, card.isLocked { continue }
-                if card.hitTest(pointInFrame: ancestor.point) {
-                    return (card, ancestor.frame, ancestor.scale, ancestor.point)
-                }
-            }
-        }
+	        for card in frame.cards.reversed() {
+	            if ignoringLocked, card.isLocked { continue }
+	            if card.hitTest(pointInFrame: pointInFrame) {
+	                return (card, frame, resolved.conversionScale, pointInFrame)
+	            }
+	        }
 
-        return nil
-    }
+	        return nil
+		    }
 
     /// Handle long press gesture to open card settings
     /// Uses hierarchical hit testing to find cards at any depth level
@@ -3867,30 +4409,34 @@ import simd
         }
     }
 
-    func deleteCard(_ card: Card) {
-        guard let frame = findFrame(containing: card, in: rootFrame),
-              let index = frame.cards.firstIndex(where: { $0 === card }) else { return }
+	    func deleteCard(_ card: Card) {
+	        var topFrame = activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+	        guard let frame = findFrame(containing: card, in: topFrame),
+	              let index = frame.cards.firstIndex(where: { $0 === card }) else { return }
 
-        frame.cards.remove(at: index)
-        card.isEditing = false
-        clearLassoSelection()
+	        frame.cards.remove(at: index)
+	        card.isEditing = false
+	        clearLassoSelection()
 
         if case .card(let targetCard, _) = currentDrawingTarget, targetCard === card {
             currentDrawingTarget = nil
         }
     }
 
-    private func findFrame(containing card: Card, in frame: Frame) -> Frame? {
-        if frame.cards.contains(where: { $0 === card }) {
-            return frame
-        }
-        for child in frame.children {
-            if let found = findFrame(containing: card, in: child) {
-                return found
-            }
-        }
-        return nil
-    }
+	    private func findFrame(containing card: Card, in frame: Frame) -> Frame? {
+	        if frame.cards.contains(where: { $0 === card }) {
+	            return frame
+	        }
+	        for child in frame.children.values {
+	            if let found = findFrame(containing: card, in: child) {
+	                return found
+	            }
+	        }
+	        return nil
+	    }
 
     /// Add a new card to the canvas at the camera center
     /// The card will be a solid color and can be selected/dragged/edited

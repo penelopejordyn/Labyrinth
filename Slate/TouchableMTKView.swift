@@ -18,13 +18,15 @@ private struct AssociatedKeys {
 ///   - Child cards: scale > 1.0 (move faster)
 private class DragContext {
     let card: Card
+    let frame: Frame
     let conversionScale: Double
     let isResizing: Bool // True if dragging the handle (resize), false if dragging card body (move)
     let startOrigin: SIMD2<Double>
     let startSize: SIMD2<Double>
 
-    init(card: Card, conversionScale: Double, isResizing: Bool = false) {
+    init(card: Card, frame: Frame, conversionScale: Double, isResizing: Bool = false) {
         self.card = card
+        self.frame = frame
         self.conversionScale = conversionScale
         self.isResizing = isResizing
         self.startOrigin = card.origin
@@ -52,6 +54,7 @@ class TouchableMTKView: MTKView {
     var rotationGesture: UIRotationGestureRecognizer!
     var longPressGesture: UILongPressGestureRecognizer!
     var cardLongPressGesture: UILongPressGestureRecognizer! // Single-finger long press for card settings
+    private var pencilInteraction: UIPencilInteraction?
 
     // Debug HUD
     var debugLabel: UILabel!
@@ -128,7 +131,8 @@ class TouchableMTKView: MTKView {
 
     func clearAnchorIfUnused() { activeOwner = .none }
 
-    // MARK: - Telescoping Transitions
+    /*
+    // MARK: - Legacy Telescoping Transitions (Reference Only)
 
     /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
     /// Returns TRUE if a transition occurred (caller should return early).
@@ -420,6 +424,157 @@ class TouchableMTKView: MTKView {
 
         return 0  // Shouldn't reach here
     }
+    */
+
+    // MARK: - 5x5 Fractal Grid Transitions
+
+    /// Wrap the active frame so `anchorWorld` stays within the current frame bounds.
+    /// This enables infinite panning without coordinate growth.
+    @discardableResult
+    private func wrapFractalIfNeeded(coord: Coordinator,
+                                     anchorWorld: SIMD2<Double>,
+                                     anchorScreen: CGPoint) -> SIMD2<Double> {
+        coord.ensureFractalExtent(viewSize: bounds.size)
+        let extent = coord.fractalFrameExtent
+        let half = extent * 0.5
+
+        var anchor = anchorWorld
+        var moved = false
+
+        while anchor.x > half.x {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .right)
+            anchor.x -= extent.x
+            moved = true
+        }
+        while anchor.x < -half.x {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .left)
+            anchor.x += extent.x
+            moved = true
+        }
+        while anchor.y > half.y {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .down)
+            anchor.y -= extent.y
+            moved = true
+        }
+        while anchor.y < -half.y {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .up)
+            anchor.y += extent.y
+            moved = true
+        }
+
+        if moved {
+            coord.panOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: anchor,
+                desiredScreen: anchorScreen,
+                viewSize: bounds.size,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+        }
+
+        return anchor
+    }
+
+    /// Check if zoom has exceeded fractal thresholds and transition frames if needed.
+    /// Returns TRUE if a transition occurred (caller should return early).
+    func checkFractalTransitions(coord: Coordinator,
+                                 anchorWorld: SIMD2<Double>,
+                                 anchorScreen: CGPoint) -> Bool {
+        coord.ensureFractalExtent(viewSize: bounds.size)
+
+        let beforeWrapFrame = coord.activeFrame
+        var anchor = wrapFractalIfNeeded(coord: coord, anchorWorld: anchorWorld, anchorScreen: anchorScreen)
+        // Treat same-depth wrapping as a "transition" so the caller doesn't overwrite the solved panOffset.
+        var transitioned = (coord.activeFrame !== beforeWrapFrame)
+
+        // Drill down while zoom is large (normalize zoom back into [1, 5)).
+        while coord.zoomScale >= FractalGrid.scale {
+            anchor = drillDownToChildTile(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+            transitioned = true
+        }
+
+        // Pop up while zoom is too small (normalize zoom back into [1, 5)).
+        while coord.zoomScale < 1.0 {
+            anchor = popUpToParentTile(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+            transitioned = true
+        }
+
+        // Ensure the anchor remains in-bounds after transitions.
+        let beforeFinalWrapFrame = coord.activeFrame
+        anchor = wrapFractalIfNeeded(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+        if coord.activeFrame !== beforeFinalWrapFrame {
+            transitioned = true
+        }
+
+        if transitioned {
+            // Keep the gesture anchor consistent with the new active frame.
+            self.anchorWorld = screenToWorldPixels_PureDouble(
+                anchorScreen,
+                viewSize: bounds.size,
+                panOffset: coord.panOffset,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+            self.anchorScreen = anchorScreen
+        }
+
+        return transitioned
+    }
+
+    /// Drill down into the child tile containing `anchorWorld`.
+    private func drillDownToChildTile(coord: Coordinator,
+                                      anchorWorld: SIMD2<Double>,
+                                      anchorScreen: CGPoint) -> SIMD2<Double> {
+        let extent = coord.fractalFrameExtent
+        let index = FractalGrid.childIndex(frameExtent: extent, pointInParent: anchorWorld)
+
+        let child = coord.activeFrame.child(at: index)
+        let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+        let anchorInChild = (anchorWorld - childCenter) * FractalGrid.scale
+
+        coord.activeFrame = child
+        coord.zoomScale = coord.zoomScale / FractalGrid.scale
+        coord.panOffset = solvePanOffsetForAnchor_Double(
+            anchorWorld: anchorInChild,
+            desiredScreen: anchorScreen,
+            viewSize: bounds.size,
+            zoomScale: coord.zoomScale,
+            rotationAngle: coord.rotationAngle
+        )
+
+        return anchorInChild
+    }
+
+    /// Pop up to the parent frame, creating a super-root if needed.
+    private func popUpToParentTile(coord: Coordinator,
+                                   anchorWorld: SIMD2<Double>,
+                                   anchorScreen: CGPoint) -> SIMD2<Double> {
+        let extent = coord.fractalFrameExtent
+
+        let child = coord.activeFrame
+        if child.parent == nil {
+            _ = coord.ensureSuperRootRetained(for: child)
+        }
+
+        guard let parent = child.parent, let index = child.indexInParent else {
+            return anchorWorld
+        }
+
+        let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+        let anchorInParent = childCenter + (anchorWorld / FractalGrid.scale)
+
+        coord.activeFrame = parent
+        coord.zoomScale = coord.zoomScale * FractalGrid.scale
+        coord.panOffset = solvePanOffsetForAnchor_Double(
+            anchorWorld: anchorInParent,
+            desiredScreen: anchorScreen,
+            viewSize: bounds.size,
+            zoomScale: coord.zoomScale,
+            rotationAngle: coord.rotationAngle
+        )
+
+        return anchorInParent
+    }
 
 
 
@@ -497,6 +652,18 @@ class TouchableMTKView: MTKView {
 
         // Setup Debug HUD
         setupDebugHUD()
+
+        // Apple Pencil Pro squeeze (iOS 17.5+)
+        setupPencilInteractionIfAvailable()
+    }
+
+    private func setupPencilInteractionIfAvailable() {
+        guard !isRunningOnMac else { return }
+        guard #available(iOS 17.5, *) else { return }
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        addInteraction(interaction)
+        pencilInteraction = interaction
     }
 
     func setupDebugHUD() {
@@ -543,13 +710,19 @@ class TouchableMTKView: MTKView {
         }
 
         // If we tapped nothing, deselect all cards (requires recursive clear)
-        clearSelectionRecursive(frame: coord.rootFrame)
+        var topFrame = coord.activeFrame
+        while let parent = topFrame.parent {
+            topFrame = parent
+        }
+        clearSelectionRecursive(frame: topFrame)
     }
 
     /// Helper to clear all card selections recursively across the entire hierarchy
     func clearSelectionRecursive(frame: Frame) {
         frame.cards.forEach { $0.isEditing = false }
-        frame.children.forEach { clearSelectionRecursive(frame: $0) }
+        for child in frame.children.values {
+            clearSelectionRecursive(frame: child)
+        }
     }
 
     ///  MODAL INPUT: PAN (Finger Only - Drag Card or Pan Canvas)
@@ -587,7 +760,7 @@ class TouchableMTKView: MTKView {
                     let isOnHandle = coord.isPointOnCardHandle(result.pointInFrame, card: result.card, zoom: zoomInFrame)
 
                     // Store Card + Scale Factor + Resize Mode
-                    dragContext = DragContext(card: result.card, conversionScale: result.conversionScale, isResizing: isOnHandle)
+                    dragContext = DragContext(card: result.card, frame: result.frame, conversionScale: result.conversionScale, isResizing: isOnHandle)
                     return
                 }
             }
@@ -701,6 +874,13 @@ class TouchableMTKView: MTKView {
                 lastPanTime = currentTime
 
                 gesture.setTranslation(.zero, in: self)
+
+                // Keep coordinates bounded by swapping tiles when the camera center exits the frame.
+                let centerScreen = CGPoint(x: bounds.size.width / 2.0, y: bounds.size.height / 2.0)
+                let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+                _ = wrapFractalIfNeeded(coord: coord,
+                                       anchorWorld: cameraCenterWorld,
+                                       anchorScreen: centerScreen)
             }
 
         case .ended, .cancelled, .failed:
@@ -712,7 +892,7 @@ class TouchableMTKView: MTKView {
                     // Only record if size or origin actually changed
                     if context.card.size != context.startSize || context.card.origin != context.startOrigin {
                         coord.pushUndoResizeCard(card: context.card,
-                                                frame: coord.activeFrame,
+                                                frame: context.frame,
                                                 oldOrigin: context.startOrigin,
                                                 oldSize: context.startSize)
                     }
@@ -720,7 +900,7 @@ class TouchableMTKView: MTKView {
                     // Only record if origin actually changed
                     if context.card.origin != context.startOrigin {
                         coord.pushUndoMoveCard(card: context.card,
-                                              frame: coord.activeFrame,
+                                              frame: context.frame,
                                               oldOrigin: context.startOrigin)
                     }
                 }
@@ -814,9 +994,9 @@ class TouchableMTKView: MTKView {
 
             // 🔑 IMPORTANT: depth switches are driven by the *shared anchor*,
             // not by re-sampling world from the current centroid.
-            if checkTelescopingTransitions(coord: coord,
-                                           anchorWorld: anchorWorld,
-                                           anchorScreen: anchorScreen) {
+            if checkFractalTransitions(coord: coord,
+                                       anchorWorld: anchorWorld,
+                                       anchorScreen: anchorScreen) {
                 // The transition functions already solved a perfect panOffset
                 // to keep the anchor pinned. Do NOT overwrite it this frame.
                 return
@@ -836,6 +1016,11 @@ class TouchableMTKView: MTKView {
             if activeOwner == .pinch {
                 anchorScreen = targetScreen
             }
+
+            // Keep coordinates bounded by swapping tiles when the anchor drifts outside the frame.
+            anchorWorld = wrapFractalIfNeeded(coord: coord,
+                                             anchorWorld: anchorWorld,
+                                             anchorScreen: anchorScreen)
 
         case .ended, .cancelled, .failed:
             if lassoPinchActive {
@@ -927,6 +1112,11 @@ class TouchableMTKView: MTKView {
                                                              rotationAngle: coord.rotationAngle)
             if activeOwner == .rotation { anchorScreen = target }
 
+            // Keep coordinates bounded by swapping tiles when the anchor drifts outside the frame.
+            anchorWorld = wrapFractalIfNeeded(coord: coord,
+                                             anchorWorld: anchorWorld,
+                                             anchorScreen: anchorScreen)
+
         case .ended, .cancelled, .failed:
             if lassoRotationActive {
                 lassoRotationActive = false
@@ -1015,6 +1205,13 @@ class TouchableMTKView: MTKView {
 
         coord.panOffset.x += dx * c + dy * s
         coord.panOffset.y += -dx * s + dy * c
+
+        // Keep coordinates bounded by swapping tiles when the camera center exits the frame.
+        let centerScreen = CGPoint(x: bounds.size.width / 2.0, y: bounds.size.height / 2.0)
+        let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+        _ = wrapFractalIfNeeded(coord: coord,
+                               anchorWorld: cameraCenterWorld,
+                               anchorScreen: centerScreen)
     }
 
 
@@ -1064,5 +1261,15 @@ class TouchableMTKView: MTKView {
             guard event?.allTouches?.count == 1 else { return }
         }
         coordinator?.handleTouchCancelled(touchType: touch.type)
+    }
+}
+
+// MARK: - Apple Pencil Interactions
+
+extension TouchableMTKView: UIPencilInteractionDelegate {
+    @available(iOS 17.5, *)
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        guard squeeze.phase == .ended else { return }
+        coordinator?.onPencilSqueeze?()
     }
 }

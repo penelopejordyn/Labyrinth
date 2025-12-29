@@ -1,10 +1,9 @@
-// Frame.swift defines the Frame data model used for telescoping reference frames
-// that enable hierarchical zooming without precision loss.
-
-//  A "Frame" is a Local Universe - a coordinate system that stays bounded.
-//  By chaining Frames together (parent → child), we achieve infinite zoom
-//  without ever exceeding Double precision limits.
+// Frame.swift defines the Frame data model for the 5x5 fractal grid system.
 //
+// A "Frame" is a bounded local universe. Unlike the previous telescoping
+// linked-list architecture, each Frame now contains a sparse 5x5 grid of
+// children, enabling infinite panning (via cousins/uncles) and stable zooming
+// (via constant scale transitions).
 
 import Foundation
 
@@ -28,20 +27,14 @@ class Frame: Identifiable {
     var cards: [Card] = []
 
     /// The "Universe" containing this frame (nil for root frame)
-    var parent: Frame?
+    weak var parent: Frame?
 
-    /// Where this frame's center lives inside the Parent's coordinate system
-    /// (Used to render this frame when the camera is in the Parent)
-    var originInParent: SIMD2<Double>
+    /// Which 5x5 slot this frame occupies inside its parent (nil for topmost root).
+    var indexInParent: GridIndex?
 
-    /// How much smaller this frame is compared to the Parent
-    /// Example: If we drilled down at 1000× zoom, this would be 1000.0
-    /// This tells us: "1 unit in parent space = 1000 units in this frame"
-    var scaleRelativeToParent: Double
-
-    /// Track the sub-universes created inside this frame
-    /// This allows us to re-enter existing frames instead of creating parallel universes
-    var children: [Frame] = []
+    /// Sparse instantiation: only allocate children that are actually visited.
+    /// Keyed by 5x5 grid index (0...4, 0...4).
+    var children: [GridIndex: Frame] = [:]
 
     /// Cached depth relative to a reference root frame
     /// Positive = child of root (drilled in), Negative = parent of root (telescoped out), 0 = is root
@@ -51,29 +44,131 @@ class Frame: Identifiable {
     /// Initialize a new Frame
     /// - Parameters:
     ///   - parent: The containing universe (nil for root)
-    ///   - origin: Where this frame lives in parent coordinates
-    ///   - scale: The zoom factor when this frame was created
     ///   - depth: The depth relative to root (calculated by caller)
-    init(id: UUID = UUID(), parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0, depth: Int = 0) {
+    init(id: UUID = UUID(), parent: Frame? = nil, indexInParent: GridIndex? = nil, depth: Int = 0) {
         self.id = id
         self.parent = parent
-        self.originInParent = origin
-        self.scaleRelativeToParent = scale
+        self.indexInParent = indexInParent
         self.depthFromRoot = depth
     }
 }
 
-// MARK: - Serialization
+// MARK: - 5x5 Fractal Graph Helpers
 extension Frame {
-    func toDTO() -> FrameDTO {
-        FrameDTO(
+    func child(at index: GridIndex) -> Frame {
+        let key = index.clamped()
+        if let existing = children[key] {
+            return existing
+        }
+
+        let created = Frame(parent: self, indexInParent: key, depth: depthFromRoot + 1)
+        children[key] = created
+        return created
+    }
+
+    func childIfExists(at index: GridIndex) -> Frame? {
+        children[index.clamped()]
+    }
+
+    /// If this frame has no parent, create a new super-root above it and place this frame at (2,2).
+    @discardableResult
+    func ensureSuperRoot() -> Frame {
+        if let parent {
+            return parent
+        }
+
+        let newParent = Frame(depth: depthFromRoot - 1)
+        let center = GridIndex.center
+        self.parent = newParent
+        self.indexInParent = center
+        newParent.children[center] = self
+        return newParent
+    }
+
+    /// Same-depth neighbor resolution using "Up, Over, Down" recursion.
+    ///
+    /// Important: because `parent` is `weak`, callers must retain any newly-created super-root.
+    /// Pass a closure that stores the returned root (e.g. `Coordinator.rootFrame = newRoot`).
+    func neighbor(_ direction: GridDirection, retainNewRoot: (Frame) -> Void) -> Frame {
+        guard let parent, let indexInParent else {
+            let superRoot = ensureSuperRoot()
+            retainNewRoot(superRoot)
+            return neighbor(direction, retainNewRoot: retainNewRoot)
+        }
+
+        let d = direction.delta
+        let next = GridIndex(col: indexInParent.col + d.dx, row: indexInParent.row + d.dy)
+
+        if next.isValid {
+            return parent.child(at: next)
+        }
+
+        let uncle = parent.neighbor(direction, retainNewRoot: retainNewRoot)
+        return uncle.child(at: next.wrapped())
+    }
+
+    /// Non-instantiating same-depth neighbor lookup.
+    /// Returns nil when the neighbor has not been created yet.
+    func neighborIfExists(_ direction: GridDirection) -> Frame? {
+        guard let parent, let indexInParent else {
+            return nil
+        }
+
+        let d = direction.delta
+        let next = GridIndex(col: indexInParent.col + d.dx, row: indexInParent.row + d.dy)
+
+        if next.isValid {
+            return parent.childIfExists(at: next)
+        }
+
+        guard let uncle = parent.neighborIfExists(direction) else { return nil }
+        return uncle.childIfExists(at: next.wrapped())
+    }
+}
+
+// MARK: - Serialization (v2 Fractal)
+extension Frame {
+    func toDTOv2() -> FrameDTOv2 {
+        let sortedKeys = children.keys.sorted { lhs, rhs in
+            if lhs.row != rhs.row { return lhs.row < rhs.row }
+            return lhs.col < rhs.col
+        }
+
+        let childDTOs = sortedKeys.compactMap { index -> ChildFrameDTOv2? in
+            guard let child = children[index] else { return nil }
+            return ChildFrameDTOv2(index: GridIndexDTO(index), frame: child.toDTOv2())
+        }
+
+        return FrameDTOv2(
             id: id,
-            originInParent: [originInParent.x, originInParent.y],
-            scaleRelativeToParent: scaleRelativeToParent,
             depthFromRoot: depthFromRoot,
+            indexInParent: indexInParent.map { GridIndexDTO($0) },
             strokes: strokes.map { $0.toDTO() },
             cards: cards.map { $0.toDTO() },
-            children: children.map { $0.toDTO() }
+            children: childDTOs
         )
     }
 }
+
+/*
+// MARK: - Legacy Telescoping Frame Model (Reference Only)
+//
+// class Frame: Identifiable {
+//     let id: UUID
+//     var strokes: [Stroke] = []
+//     var cards: [Card] = []
+//     var parent: Frame?
+//     var originInParent: SIMD2<Double>
+//     var scaleRelativeToParent: Double
+//     var children: [Frame] = []
+//     var depthFromRoot: Int = 0
+//
+//     init(id: UUID = UUID(), parent: Frame? = nil, origin: SIMD2<Double> = .zero, scale: Double = 1.0, depth: Int = 0) {
+//         self.id = id
+//         self.parent = parent
+//         self.originInParent = origin
+//         self.scaleRelativeToParent = scale
+//         self.depthFromRoot = depth
+//     }
+// }
+*/

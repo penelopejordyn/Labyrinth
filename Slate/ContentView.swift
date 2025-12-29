@@ -11,9 +11,12 @@ struct ContentView: View {
     @State private var showingImportPicker = false
     @State private var isExporting = false
     @State private var exportDocument = CanvasDocument()
+    @State private var isBrushMenuExpanded = false
+    @State private var isMenuExpanded = false
+    @State private var showClearConfirmation = false
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
+        ZStack(alignment: .bottomTrailing) {
             MetalView(coordinator: $metalViewCoordinator)
             .edgesIgnoringSafeArea(.all)
             .onChange(of: metalViewCoordinator) { _, newCoord in
@@ -22,175 +25,237 @@ struct ContentView: View {
                     self.editingCard = card
                     self.showSettingsSheet = true
                 }
-            }
-
-            VStack(spacing: 16) {
-                HStack(spacing: 12) {
-                    // Add Card Button
-                    Button(action: {
-                        metalViewCoordinator?.addCard()
-                    }) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "plus.rectangle.fill")
-                            Text("Add Card")
-                        }
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(20)
-                    }
-
-                    if let coordinator = metalViewCoordinator {
-                        Button(action: {
-                            coordinator.debugPopulateFrames()
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "bolt.fill")
-                                Text("Debug Fill")
+                newCoord?.onPencilSqueeze = {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            if !isMenuExpanded {
+                                isMenuExpanded = true
+                                isBrushMenuExpanded = false
+                            } else if !isBrushMenuExpanded {
+                                isBrushMenuExpanded = true
+                            } else {
+                                isBrushMenuExpanded = false
+                                isMenuExpanded = false
                             }
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.yellow)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(20)
-                        }
-
-                        Button(action: {
-                            coordinator.clearAllStrokes()
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "trash.slash")
-                                Text("Clear Strokes")
-                            }
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.red)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(20)
-                        }
-
-                        Button(action: {
-                            if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame) {
-                                exportDocument = CanvasDocument(data: data)
-                                isExporting = true
-                            }
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "square.and.arrow.up")
-                                Text("Export")
-                            }
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(20)
-                        }
-
-                        Button(action: {
-                            showingImportPicker = true
-                        }) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "square.and.arrow.down")
-                                Text("Import")
-                            }
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(20)
-                        }
-
-                        Button(action: {
-                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
-                        }) {
-                            VStack(spacing: 2) {
-                                Image(systemName: coordinator.brushSettings.isMaskEraser ? "eraser.fill" : "eraser")
-                                    .font(.system(size: 20))
-                                Text("Erase")
-                                    .font(.caption)
-                            }
-                            .foregroundColor(coordinator.brushSettings.isMaskEraser ? .pink : .white)
-                            .padding(8)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(12)
-                        }
-
-                        Button(action: {
-                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isStrokeEraser ? .paint : .strokeEraser
-                        }) {
-                            VStack(spacing: 2) {
-                                Image(systemName: coordinator.brushSettings.isStrokeEraser ? "trash.fill" : "trash")
-                                    .font(.system(size: 20))
-                                Text("Stroke")
-                                    .font(.caption)
-                            }
-                            .foregroundColor(coordinator.brushSettings.isStrokeEraser ? .orange : .white)
-                            .padding(8)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(12)
-                        }
-
-                        Button(action: {
-                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isLasso ? .paint : .lasso
-                        }) {
-                            VStack(spacing: 2) {
-                                Image(systemName: "lasso")
-                                    .font(.system(size: 20))
-                                Text("Lasso")
-                                    .font(.caption)
-                            }
-                            .foregroundColor(coordinator.brushSettings.isLasso ? .cyan : .white)
-                            .padding(8)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(12)
-                        }
-
-                        Button(action: {
-                            coordinator.undo()
-                        }) {
-                            VStack(spacing: 2) {
-                                Image(systemName: "arrow.uturn.backward")
-                                    .font(.system(size: 20))
-                                Text("Undo")
-                                    .font(.caption)
-                            }
-                            .foregroundColor(.white)
-                            .padding(8)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(12)
-                        }
-
-                        Button(action: {
-                            coordinator.redo()
-                        }) {
-                            VStack(spacing: 2) {
-                                Image(systemName: "arrow.uturn.forward")
-                                    .font(.system(size: 20))
-                                Text("Redo")
-                                    .font(.caption)
-                            }
-                            .foregroundColor(.white)
-                            .padding(8)
-                            .background(.ultraThinMaterial)
-                            .cornerRadius(12)
                         }
                     }
                 }
+            }
 
-                // Stroke Size Slider
-                if let coordinator = metalViewCoordinator {
-                    StrokeSizeSlider(brushSettings: coordinator.brushSettings)
-                        .frame(width: 200)
+            VStack(alignment: .trailing, spacing: 12) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isMenuExpanded.toggle()
+                        if !isMenuExpanded {
+                            isBrushMenuExpanded = false
+                        }
+                    }
+                }) {
+                    VStack(spacing: 2) {
+                        Image(systemName: isMenuExpanded ? "xmark" : "line.3.horizontal")
+                            .font(.system(size: 20))
+                        Text("Menu")
+                            .font(.caption)
+                    }
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(12)
+                }
+
+                if isMenuExpanded, let coordinator = metalViewCoordinator {
+                    VStack(alignment: .trailing, spacing: 12) {
+                        HStack(spacing: 12) {
+                            Button(action: { coordinator.addCard() }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "plus.rectangle.fill")
+                                        .font(.system(size: 20))
+                                    Text("Card")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+
+                            Button(action: { coordinator.undo() }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "arrow.uturn.backward")
+                                        .font(.system(size: 20))
+                                    Text("Undo")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+
+                            Button(action: { coordinator.redo() }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "arrow.uturn.forward")
+                                        .font(.system(size: 20))
+                                    Text("Redo")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+                        }
+
+                        HStack(spacing: 12) {
+                            Button(action: {
+                                if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame,
+                                                                                    fractalFrameExtent: coordinator.fractalFrameExtent) {
+                                    exportDocument = CanvasDocument(data: data)
+                                    isExporting = true
+                                }
+                            }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.system(size: 20))
+                                    Text("Export")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+
+                            Button(action: { showingImportPicker = true }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "square.and.arrow.down")
+                                        .font(.system(size: 20))
+                                    Text("Import")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+                        }
+
+                        HStack(spacing: 12) {
+                            Button(action: { coordinator.debugPopulateFrames() }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "bolt.fill")
+                                        .font(.system(size: 20))
+                                    Text("Fill")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.yellow)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+
+                            Button(action: { showClearConfirmation = true }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "trash.slash")
+                                        .font(.system(size: 20))
+                                    Text("Clear")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.red)
+                                .padding(8)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(12)
+                            }
+                            .confirmationDialog("Clear all strokes?",
+                                                isPresented: $showClearConfirmation,
+                                                titleVisibility: .visible) {
+                                Button("Clear", role: .destructive) {
+                                    coordinator.clearAllStrokes()
+                                }
+                                Button("Cancel", role: .cancel) {}
+                            } message: {
+                                Text("Clears canvas strokes and card drawings across all frames. This cannot be undone.")
+                            }
+                        }
+
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isBrushMenuExpanded.toggle()
+                            }
+                        }) {
+                            HStack(spacing: 8) {
+                                Image(systemName: isBrushMenuExpanded ? "paintbrush.fill" : "paintbrush")
+                                    .font(.system(size: 16))
+                                Text("Brush Settings")
+                                    .font(.system(size: 14, weight: .medium))
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(16)
+                        }
+
+                        if isBrushMenuExpanded {
+                            VStack(alignment: .trailing, spacing: 12) {
+                                HStack(spacing: 12) {
+                                    Button(action: {
+                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
+                                    }) {
+                                        VStack(spacing: 2) {
+                                            Image(systemName: coordinator.brushSettings.isMaskEraser ? "eraser.fill" : "eraser")
+                                                .font(.system(size: 20))
+                                            Text("Erase")
+                                                .font(.caption)
+                                        }
+                                        .foregroundColor(coordinator.brushSettings.isMaskEraser ? .pink : .white)
+                                        .padding(8)
+                                        .background(.ultraThinMaterial)
+                                        .cornerRadius(12)
+                                    }
+
+                                    Button(action: {
+                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isStrokeEraser ? .paint : .strokeEraser
+                                    }) {
+                                        VStack(spacing: 2) {
+                                            Image(systemName: coordinator.brushSettings.isStrokeEraser ? "trash.fill" : "trash")
+                                                .font(.system(size: 20))
+                                            Text("Stroke")
+                                                .font(.caption)
+                                        }
+                                        .foregroundColor(coordinator.brushSettings.isStrokeEraser ? .orange : .white)
+                                        .padding(8)
+                                        .background(.ultraThinMaterial)
+                                        .cornerRadius(12)
+                                    }
+
+                                    Button(action: {
+                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isLasso ? .paint : .lasso
+                                    }) {
+                                        VStack(spacing: 2) {
+                                            Image(systemName: "lasso")
+                                                .font(.system(size: 20))
+                                            Text("Lasso")
+                                                .font(.caption)
+                                        }
+                                        .foregroundColor(coordinator.brushSettings.isLasso ? .cyan : .white)
+                                        .padding(8)
+                                        .background(.ultraThinMaterial)
+                                        .cornerRadius(12)
+                                    }
+                                }
+
+                                StrokeSizeSlider(brushSettings: coordinator.brushSettings)
+                                    .frame(width: 240)
+                            }
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        }
+                    }
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .padding(.top, 60)
             .padding(.trailing, 16)
+            .padding(.bottom, 24)
         }
         .sheet(isPresented: $showSettingsSheet) {
             if let card = editingCard {
@@ -211,15 +276,17 @@ struct ContentView: View {
                         url.stopAccessingSecurityScopedResource()
                     }
                 }
-                guard let coordinator = metalViewCoordinator else { return }
-                guard let data = try? Data(contentsOf: url) else { return }
-                if let newRoot = PersistenceManager.shared.importCanvas(data: data, device: coordinator.device) {
-                    coordinator.replaceCanvas(with: newRoot)
-                }
-            case .failure(let error):
-                print("Import error: \(error)")
-            }
-        }
+	                guard let coordinator = metalViewCoordinator else { return }
+	                guard let data = try? Data(contentsOf: url) else { return }
+	                let viewSize = coordinator.metalView?.bounds.size ?? .zero
+	                let extent = SIMD2<Double>(Double(viewSize.width), Double(viewSize.height))
+	                if let imported = PersistenceManager.shared.importCanvas(data: data, device: coordinator.device, fractalFrameExtent: extent) {
+	                    coordinator.replaceCanvas(with: imported.rootFrame, fractalExtent: imported.fractalFrameExtent)
+	                }
+	            case .failure(let error):
+	                print("Import error: \(error)")
+	            }
+	        }
         .fileExporter(isPresented: $isExporting, document: exportDocument, contentType: .json, defaultFilename: "canvas") { result in
             if case .failure(let error) = result {
                 print("Export error: \(error)")
@@ -360,6 +427,8 @@ struct CanvasDocument: FileDocument {
     }
 }
 
+#if !CODEX
 #Preview {
     ContentView()
 }
+#endif

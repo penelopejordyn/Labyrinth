@@ -207,7 +207,16 @@ struct CardSettingsView: View {
             let loader = MTKTextureLoader(device: device)
 
             if let cgImg = img.cgImage,
-               let texture = try? loader.newTexture(cgImage: cgImg, options: [.origin: MTKTextureLoader.Origin.bottomLeft]) {
+               let texture = try? loader.newTexture(
+                cgImage: cgImg,
+                options: [
+                    .origin: MTKTextureLoader.Origin.bottomLeft,
+                    // The renderer targets `.bgra8Unorm` (non-sRGB). If we load card images as sRGB textures,
+                    // Metal will convert them to linear on sample, making them appear too dark when written
+                    // into a non-sRGB render target.
+                    .SRGB: false,
+                ]
+               ) {
 
                 card.type = .image(texture)
 
