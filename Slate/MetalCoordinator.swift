@@ -502,6 +502,9 @@ import simd
 	        encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
 	        encoder.setVertexBuffer(buffer, offset: 0, index: 2)
 	        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: fractalGridOverlayInstanceCount)
+
+	        debugDrawnNodesThisFrame += 1
+	        debugDrawnVerticesThisFrame += 4 * fractalGridOverlayInstanceCount
 	    }
 
 	    // MARK: - Undo/Redo Implementation
@@ -646,13 +649,11 @@ import simd
 	    // MARK: - Global Stroke Depth Ordering
 	    // A monotonic per-stroke counter lets depth testing work across telescoping frames.
 	    // Larger depthID = newer stroke; we map this into Metal NDC depth (smaller = closer).
-	    private static let strokeDepthSlotCount: UInt32 = 1 << 24
-	    private static let strokeDepthDenominator: Float = Float(strokeDepthSlotCount) + 1.0
 	    private var nextStrokeDepthID: UInt32 = 0
 
 	    private func allocateStrokeDepthID() -> UInt32 {
 	        let id = nextStrokeDepthID
-	        if nextStrokeDepthID < Self.strokeDepthSlotCount - 1 {
+	        if nextStrokeDepthID < StrokeDepth.slotCount - 1 {
 	            nextStrokeDepthID += 1
 	        }
 	        return id
@@ -664,10 +665,10 @@ import simd
 
 	    private func resetStrokeDepthID(using frame: Frame) {
 	        if let maxDepth = maxStrokeDepthID(in: frame) {
-	            if maxDepth < Self.strokeDepthSlotCount - 1 {
+	            if maxDepth < StrokeDepth.slotCount - 1 {
 	                nextStrokeDepthID = maxDepth + 1
 	            } else {
-	                nextStrokeDepthID = Self.strokeDepthSlotCount - 1
+	                nextStrokeDepthID = StrokeDepth.slotCount - 1
 	            }
 	        } else {
 	            nextStrokeDepthID = 0
@@ -762,6 +763,28 @@ import simd
         batchedSegmentBufferOffset = 0
     }
 
+    private func allocateBatchedSegmentStorage(byteCount: Int) -> (buffer: MTLBuffer, offset: Int, destination: UnsafeMutableRawPointer)? {
+        guard byteCount > 0 else { return nil }
+
+        ensureBatchedSegmentBuffers(minByteCount: byteCount)
+        var buffer = batchedSegmentBuffers[inFlightFrameIndex]
+
+        var offset = align(batchedSegmentBufferOffset, to: Self.batchedSegmentBufferAlignment)
+
+        if offset + byteCount > buffer.length {
+            // Grow and restart from zero in the new buffer. This intentionally switches buffers
+            // instead of wrapping within the same one (to avoid overwriting earlier uploads).
+            ensureBatchedSegmentBuffers(minByteCount: offset + byteCount)
+            buffer = batchedSegmentBuffers[inFlightFrameIndex]
+            batchedSegmentBufferOffset = 0
+            offset = 0
+        }
+
+        let destination = buffer.contents().advanced(by: offset)
+        batchedSegmentBufferOffset = offset + byteCount
+        return (buffer, offset, destination)
+    }
+
     private func uploadBatchedSegments(_ instances: [BatchedStrokeSegmentInstance]) -> (buffer: MTLBuffer, offset: Int)? {
         guard !instances.isEmpty else { return nil }
 
@@ -814,11 +837,7 @@ import simd
 	    ///   - depthID: The stroke's depth ID (monotonic counter for creation order)
 	    /// - Returns: Metal NDC depth value [0, 1] where 0 is closest
 	    private func strokeDepth(for depthID: UInt32) -> Float {
-	        // Map depthID directly to depth buffer
-	        // Higher depthID (newer stroke) → lower depth value (closer to camera)
-	        let clamped = min(depthID, Self.strokeDepthSlotCount - 1)
-	        let numerator = Float(Self.strokeDepthSlotCount - clamped)
-	        return numerator / Self.strokeDepthDenominator
+	        StrokeDepth.metalDepth(for: depthID)
 	    }
 
 		    private func renderDepthNeighborhood(baseFrame: Frame,
@@ -980,12 +999,6 @@ import simd
                      depthFromActive: Int = 0,
                      renderCards: Bool = true) { //  NEW: Prevent double-rendering
 
-        // Reset debug metrics at the start of each frame (only for root call)
-        if frame === activeFrame && excludedChild == nil {
-            debugDrawnVerticesThisFrame = 0
-            debugDrawnNodesThisFrame = 0
-        }
-
         /*
         // LAYER 1: LEGACY (Telescoping) PARENT RENDERING -------------------------------
         // Previously rendered the parent frame (depth -1) as a background layer using
@@ -1047,16 +1060,10 @@ import simd
             let dy = stroke.origin.y - cameraCenterInThisFrame.y
 
             // Screen-space culling (stable at extreme zoom levels).
-            let distWorld = sqrt(dx * dx + dy * dy)
-            let distScreen = distWorld * zoom
-
-            let bounds = stroke.localBounds
-            let farX = max(abs(Double(bounds.minX)), abs(Double(bounds.maxX)))
-            let farY = max(abs(Double(bounds.minY)), abs(Double(bounds.maxY)))
-            let radiusWorld = sqrt(farX * farX + farY * farY)
-            let radiusScreen = radiusWorld * zoom
-
-            if (distScreen - radiusScreen) > cullRadius { return }
+            // Condition: distWorld > (radiusWorld + cullRadius/zoom)
+            let thresholdWorld = stroke.cullingRadiusWorld + (cullRadius / max(zoom, 1e-9))
+            let dist2 = dx * dx + dy * dy
+            if dist2 > thresholdWorld * thresholdWorld { return }
 
             let rotatedOffsetScreen = SIMD2<Float>(
                 Float((dx * c - dy * s) * zoom),
@@ -1082,19 +1089,21 @@ import simd
             encoder.setFragmentBytes(&transform, length: MemoryLayout<StrokeTransform>.stride, index: 1)
             encoder.setVertexBuffer(segmentBuffer, offset: 0, index: 2)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
+
+            debugDrawnNodesThisFrame += 1
+            debugDrawnVerticesThisFrame += 4 * stroke.segments.count
         }
 
         // Depth-write strokes: batched (one draw call per frame).
-        var batchedWriteInstances: [BatchedStrokeSegmentInstance] = []
-        if strokeCount > 0 {
-            batchedWriteInstances.reserveCapacity(frame.strokes.reduce(into: 0) { partial, stroke in
-                if stroke.depthWriteEnabled { partial += stroke.segments.count }
-            })
+        var writeStrokesToBatch: [Stroke] = []
+        writeStrokesToBatch.reserveCapacity(min(strokeCount, 256))
+        var batchedWriteInstanceCount: Int = 0
 
+        if strokeCount > 0 {
             for i in stride(from: strokeCount - 1, through: 0, by: -1) {
                 let stroke = frame.strokes[i]
                 guard stroke.depthWriteEnabled else { continue }
-                guard !stroke.segments.isEmpty else { continue }
+                guard !stroke.batchedSegments.isEmpty else { continue }
 
                 // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
                 let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
@@ -1104,34 +1113,30 @@ import simd
 
                 let dx = stroke.origin.x - cameraCenterInThisFrame.x
                 let dy = stroke.origin.y - cameraCenterInThisFrame.y
+                let thresholdWorld = stroke.cullingRadiusWorld + (cullRadius / max(zoom, 1e-9))
+                let dist2 = dx * dx + dy * dy
+                if dist2 > thresholdWorld * thresholdWorld { continue }
 
-                // Screen-space culling (stable at extreme zoom levels).
-                let distWorld = sqrt(dx * dx + dy * dy)
-                let distScreen = distWorld * zoom
-
-                let bounds = stroke.localBounds
-                let farX = max(abs(Double(bounds.minX)), abs(Double(bounds.maxX)))
-                let farY = max(abs(Double(bounds.minY)), abs(Double(bounds.maxY)))
-                let radiusWorld = sqrt(farX * farX + farY * farY)
-                let radiusScreen = radiusWorld * zoom
-
-                if (distScreen - radiusScreen) > cullRadius { continue }
-
-                let originF = SIMD2<Float>(Float(stroke.origin.x), Float(stroke.origin.y))
-                let params = SIMD2<Float>(Float(stroke.worldWidth), depthForStroke(stroke))
-
-                for seg in stroke.segments {
-                    batchedWriteInstances.append(BatchedStrokeSegmentInstance(
-                        p0World: originF + seg.p0,
-                        p1World: originF + seg.p1,
-                        color: seg.color,
-                        params: params
-                    ))
-                }
+                writeStrokesToBatch.append(stroke)
+                batchedWriteInstanceCount += stroke.batchedSegments.count
             }
         }
 
-        if let upload = uploadBatchedSegments(batchedWriteInstances) {
+        if batchedWriteInstanceCount > 0,
+           let upload = allocateBatchedSegmentStorage(byteCount: batchedWriteInstanceCount * MemoryLayout<BatchedStrokeSegmentInstance>.stride) {
+            let writePtr = upload.destination
+            var byteOffset = 0
+
+            for stroke in writeStrokesToBatch {
+                let segments = stroke.batchedSegments
+                let bytesToCopy = segments.count * MemoryLayout<BatchedStrokeSegmentInstance>.stride
+                segments.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else { return }
+                    memcpy(writePtr.advanced(by: byteOffset), baseAddress, bytesToCopy)
+                }
+                byteOffset += bytesToCopy
+            }
+
             var batchedTransform = BatchedStrokeTransform(
                 cameraCenterWorld: SIMD2<Float>(Float(cameraCenterInThisFrame.x), Float(cameraCenterInThisFrame.y)),
                 zoomScale: Float(zoom),
@@ -1151,7 +1156,10 @@ import simd
             encoder.drawPrimitives(type: .triangleStrip,
                                    vertexStart: 0,
                                    vertexCount: 4,
-                                   instanceCount: batchedWriteInstances.count)
+                                   instanceCount: batchedWriteInstanceCount)
+
+            debugDrawnNodesThisFrame += 1
+            debugDrawnVerticesThisFrame += 4 * batchedWriteInstanceCount
         }
 
         /*
@@ -2206,6 +2214,8 @@ import simd
 		        let extent = fractalFrameExtent
 		        visibleFractalFrameTransforms.removeAll(keepingCapacity: true)
 		        visibleFractalFramesDrawOrder.removeAll(keepingCapacity: true)
+		        debugDrawnVerticesThisFrame = 0
+		        debugDrawnNodesThisFrame = 0
 
 	        sceneEnc.setRenderPipelineState(strokeSegmentPipelineState)
 	        sceneEnc.setCullMode(.none)
@@ -3529,7 +3539,7 @@ import simd
             localBounds: bounds,
             segmentBounds: bounds,
             device: device,
-            depthID: Self.strokeDepthSlotCount - 1,
+            depthID: StrokeDepth.slotCount - 1,
             depthWriteEnabled: false
         )
     }

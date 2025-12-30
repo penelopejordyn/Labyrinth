@@ -25,10 +25,15 @@ class Stroke: Identifiable {
     let segments: [StrokeSegmentInstance]
     var segmentBuffer: MTLBuffer?
 
+    /// Cached batched segment instances in frame/world coordinates (for single-draw batching).
+    let batchedSegments: [BatchedStrokeSegmentInstance]
+
     /// Bounding box in local space for culling
     var localBounds: CGRect = .zero
     /// Optional duplicate for future BVH/tiling
     var segmentBounds: CGRect = .zero
+    /// Cached radius (world units) from origin to farthest stroke bounds (includes stroke radius).
+    let cullingRadiusWorld: Double
 
     init(id: UUID = UUID(),
          origin: SIMD2<Double>,
@@ -51,6 +56,33 @@ class Stroke: Identifiable {
         self.segments = segments
         self.localBounds = localBounds
         self.segmentBounds = segmentBounds ?? localBounds
+
+        if localBounds == .null {
+            self.cullingRadiusWorld = 0
+        } else {
+            let farX = max(abs(localBounds.minX), abs(localBounds.maxX))
+            let farY = max(abs(localBounds.minY), abs(localBounds.maxY))
+            self.cullingRadiusWorld = hypot(farX, farY)
+        }
+
+        if segments.isEmpty {
+            self.batchedSegments = []
+        } else {
+            let originF = SIMD2<Float>(Float(origin.x), Float(origin.y))
+            let params = SIMD2<Float>(Float(worldWidth), StrokeDepth.metalDepth(for: depthID))
+
+            var batched: [BatchedStrokeSegmentInstance] = []
+            batched.reserveCapacity(segments.count)
+            for seg in segments {
+                batched.append(BatchedStrokeSegmentInstance(
+                    p0World: originF + seg.p0,
+                    p1World: originF + seg.p1,
+                    color: seg.color,
+                    params: params
+                ))
+            }
+            self.batchedSegments = batched
+        }
 
         if let device = device, !segments.isEmpty {
             self.segmentBuffer = device.makeBuffer(
