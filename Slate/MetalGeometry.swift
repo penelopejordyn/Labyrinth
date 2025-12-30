@@ -20,6 +20,17 @@ struct StrokeSegmentInstance {
     var color: SIMD4<Float>   // RGBA
 }
 
+/// Instance data for batched distance-field segments (world-space endpoints).
+///
+/// This enables drawing many strokes in a single instanced draw call without
+/// per-stroke uniforms/state changes.
+struct BatchedStrokeSegmentInstance {
+    var p0World: SIMD2<Float>   // Frame/world-space endpoint 0
+    var p1World: SIMD2<Float>   // Frame/world-space endpoint 1
+    var color: SIMD4<Float>     // RGBA
+    var params: SIMD2<Float>    // (worldWidth, depth)
+}
+
 /// Vertex for the reusable unit quad used by instanced segment rendering
 struct QuadVertex {
     var corner: SIMD2<Float>
@@ -38,6 +49,18 @@ struct StrokeTransform {
     var halfPixelWidth: Float           // Half-width of stroke in screen pixels (for screen-space extrusion)
     var featherPx: Float                // Feather amount in pixels for SDF edge
     var depth: Float                    // Depth in Metal NDC [0, 1] (smaller = closer)
+}
+
+/// Shared camera transform for batched segment rendering.
+///
+/// Per-segment width and depth live in `BatchedStrokeSegmentInstance.params`.
+struct BatchedStrokeTransform {
+    var cameraCenterWorld: SIMD2<Float>  // Camera center in the current frame coordinate system
+    var zoomScale: Float
+    var screenWidth: Float
+    var screenHeight: Float
+    var rotationAngle: Float
+    var featherPx: Float
 }
 
 /// Transform for card rendering (not batched, includes offset)

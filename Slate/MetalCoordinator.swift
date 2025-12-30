@@ -17,12 +17,26 @@ import simd
 	    var cardGridPipelineState: MTLRenderPipelineState!  // Pipeline for grid paper cards
 	    var cardShadowPipelineState: MTLRenderPipelineState! // Pipeline for card shadows
 	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
+	    var strokeSegmentBatchedPipelineState: MTLRenderPipelineState! // Batched SDF segment pipeline
 	    var postProcessPipelineState: MTLRenderPipelineState!   // FXAA fullscreen pass
 	    var samplerState: MTLSamplerState!                  // Sampler for card textures
 	    var vertexBuffer: MTLBuffer!
 	    var quadVertexBuffer: MTLBuffer!                    // Unit quad for instanced segments
 
     // Note: ICB removed - using simple GPU-offset approach instead
+
+    // MARK: - Batched Segment Upload (Ring Buffer)
+
+    private static let maxInFlightFrameCount: Int = 3
+    private static let batchedSegmentBufferInitialByteCount: Int = 8 * 1024 * 1024
+    private static let batchedSegmentBufferAlignment: Int = 16
+
+    private let inFlightSemaphore = DispatchSemaphore(value: Coordinator.maxInFlightFrameCount)
+    private var inFlightFrameIndex: Int = 0
+
+    private var batchedSegmentBuffers: [MTLBuffer] = []
+    private var batchedSegmentBufferLength: Int = 0
+    private var batchedSegmentBufferOffset: Int = 0
 
     //  Stencil States for Card Clipping
     var stencilStateDefault: MTLDepthStencilState! // Default passthrough (no testing)
@@ -710,6 +724,68 @@ import simd
         makePipeLine()
         makeVertexBuffer()
         makeQuadVertexBuffer()
+
+        inFlightFrameIndex = Self.maxInFlightFrameCount - 1
+        ensureBatchedSegmentBuffers(minByteCount: Self.batchedSegmentBufferInitialByteCount)
+    }
+
+    private func align(_ value: Int, to alignment: Int) -> Int {
+        guard alignment > 1 else { return value }
+        let mask = alignment - 1
+        return (value + mask) & ~mask
+    }
+
+    private func ensureBatchedSegmentBuffers(minByteCount: Int) {
+        let minimum = max(minByteCount, Self.batchedSegmentBufferInitialByteCount)
+        if !batchedSegmentBuffers.isEmpty, minimum <= batchedSegmentBufferLength {
+            return
+        }
+
+        let newLength = max(minimum, max(batchedSegmentBufferLength * 2, Self.batchedSegmentBufferInitialByteCount))
+        var newBuffers: [MTLBuffer] = []
+        newBuffers.reserveCapacity(Self.maxInFlightFrameCount)
+
+        for _ in 0..<Self.maxInFlightFrameCount {
+            guard let buffer = device.makeBuffer(length: newLength, options: .storageModeShared) else {
+                fatalError("Failed to allocate batched stroke segment buffer (\(newLength) bytes)")
+            }
+            newBuffers.append(buffer)
+        }
+
+        batchedSegmentBuffers = newBuffers
+        batchedSegmentBufferLength = newLength
+        batchedSegmentBufferOffset = 0
+    }
+
+    private func beginBatchedSegmentUploadsForFrame() {
+        inFlightFrameIndex = (inFlightFrameIndex + 1) % Self.maxInFlightFrameCount
+        batchedSegmentBufferOffset = 0
+    }
+
+    private func uploadBatchedSegments(_ instances: [BatchedStrokeSegmentInstance]) -> (buffer: MTLBuffer, offset: Int)? {
+        guard !instances.isEmpty else { return nil }
+
+        let byteCount = instances.count * MemoryLayout<BatchedStrokeSegmentInstance>.stride
+        ensureBatchedSegmentBuffers(minByteCount: byteCount)
+        var buffer = batchedSegmentBuffers[inFlightFrameIndex]
+
+        var offset = align(batchedSegmentBufferOffset, to: Self.batchedSegmentBufferAlignment)
+
+        if offset + byteCount > buffer.length {
+            // Grow and restart from zero in the new buffer.
+            ensureBatchedSegmentBuffers(minByteCount: offset + byteCount)
+            buffer = batchedSegmentBuffers[inFlightFrameIndex]
+            batchedSegmentBufferOffset = 0
+            offset = 0
+        }
+
+        instances.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return }
+            memcpy(buffer.contents().advanced(by: offset), baseAddress, byteCount)
+        }
+
+        batchedSegmentBufferOffset = offset + byteCount
+        return (buffer, offset)
     }
 
 	    // MARK: - Recursive Renderer
@@ -1008,23 +1084,98 @@ import simd
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: stroke.segments.count)
         }
 
-	        // Depth-write strokes: newest -> oldest (front-to-back).
-	        encoder.setDepthStencilState(strokeDepthStateWrite)
-	        if strokeCount > 0 {
-	            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
-	                let stroke = frame.strokes[i]
-	                guard stroke.depthWriteEnabled else { continue }
-	                drawStroke(stroke, depth: depthForStroke(stroke))
-	            }
-	        }
+        // Depth-write strokes: batched (one draw call per frame).
+        var batchedWriteInstances: [BatchedStrokeSegmentInstance] = []
+        if strokeCount > 0 {
+            batchedWriteInstances.reserveCapacity(frame.strokes.reduce(into: 0) { partial, stroke in
+                if stroke.depthWriteEnabled { partial += stroke.segments.count }
+            })
+
+            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+                let stroke = frame.strokes[i]
+                guard stroke.depthWriteEnabled else { continue }
+                guard !stroke.segments.isEmpty else { continue }
+
+                // ZOOM-BASED CULLING: Skip strokes drawn at extreme zoom when we're zoomed way out
+                let strokeZoom = max(Double(stroke.zoomEffectiveAtCreation), 1.0) // Treat 0 as 1
+                if zoom > strokeZoom * 100_000.0 {
+                    continue
+                }
+
+                let dx = stroke.origin.x - cameraCenterInThisFrame.x
+                let dy = stroke.origin.y - cameraCenterInThisFrame.y
+
+                // Screen-space culling (stable at extreme zoom levels).
+                let distWorld = sqrt(dx * dx + dy * dy)
+                let distScreen = distWorld * zoom
+
+                let bounds = stroke.localBounds
+                let farX = max(abs(Double(bounds.minX)), abs(Double(bounds.maxX)))
+                let farY = max(abs(Double(bounds.minY)), abs(Double(bounds.maxY)))
+                let radiusWorld = sqrt(farX * farX + farY * farY)
+                let radiusScreen = radiusWorld * zoom
+
+                if (distScreen - radiusScreen) > cullRadius { continue }
+
+                let originF = SIMD2<Float>(Float(stroke.origin.x), Float(stroke.origin.y))
+                let params = SIMD2<Float>(Float(stroke.worldWidth), depthForStroke(stroke))
+
+                for seg in stroke.segments {
+                    batchedWriteInstances.append(BatchedStrokeSegmentInstance(
+                        p0World: originF + seg.p0,
+                        p1World: originF + seg.p1,
+                        color: seg.color,
+                        params: params
+                    ))
+                }
+            }
+        }
+
+        if let upload = uploadBatchedSegments(batchedWriteInstances) {
+            var batchedTransform = BatchedStrokeTransform(
+                cameraCenterWorld: SIMD2<Float>(Float(cameraCenterInThisFrame.x), Float(cameraCenterInThisFrame.y)),
+                zoomScale: Float(zoom),
+                screenWidth: Float(viewSize.width),
+                screenHeight: Float(viewSize.height),
+                rotationAngle: currentRotation,
+                featherPx: 1.0
+            )
+
+            encoder.setRenderPipelineState(strokeSegmentBatchedPipelineState)
+            encoder.setDepthStencilState(strokeDepthStateWrite)
+            encoder.setCullMode(.none)
+            encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&batchedTransform, length: MemoryLayout<BatchedStrokeTransform>.stride, index: 1)
+            encoder.setFragmentBytes(&batchedTransform, length: MemoryLayout<BatchedStrokeTransform>.stride, index: 1)
+            encoder.setVertexBuffer(upload.buffer, offset: upload.offset, index: 2)
+            encoder.drawPrimitives(type: .triangleStrip,
+                                   vertexStart: 0,
+                                   vertexCount: 4,
+                                   instanceCount: batchedWriteInstances.count)
+        }
+
+        /*
+        // Depth-write strokes: LEGACY per-stroke path (reference only).
+        encoder.setDepthStencilState(strokeDepthStateWrite)
+        if strokeCount > 0 {
+            for i in stride(from: strokeCount - 1, through: 0, by: -1) {
+                let stroke = frame.strokes[i]
+                guard stroke.depthWriteEnabled else { continue }
+                drawStroke(stroke, depth: depthForStroke(stroke))
+            }
+        }
+        */
 
         // No-depth-write strokes: oldest -> newest (painter's algorithm), but depth-tested.
-	        encoder.setDepthStencilState(strokeDepthStateNoWrite)
-	        for i in 0..<strokeCount {
-	            let stroke = frame.strokes[i]
-	            guard !stroke.depthWriteEnabled else { continue }
-	            drawStroke(stroke, depth: depthForStroke(stroke))
-	        }
+        encoder.setRenderPipelineState(strokeSegmentPipelineState)
+        encoder.setCullMode(.none)
+        encoder.setVertexBuffer(quadVertexBuffer, offset: 0, index: 0)
+        encoder.setDepthStencilState(strokeDepthStateNoWrite)
+        for i in 0..<strokeCount {
+            let stroke = frame.strokes[i]
+            guard !stroke.depthWriteEnabled else { continue }
+            drawStroke(stroke, depth: depthForStroke(stroke))
+        }
 
         // 2.2: RENDER CARDS (Middle layer - on top of canvas strokes)
         if renderCards {
@@ -2013,9 +2164,23 @@ import simd
         guard let offscreenColor = offscreenColorTexture,
               let offscreenDepthStencil = offscreenDepthStencilTexture else { return }
 
+        inFlightSemaphore.wait()
+        var didCommitFrame = false
+        defer {
+            if !didCommitFrame {
+                inFlightSemaphore.signal()
+            }
+        }
+
         guard let mainCommandBuffer = commandQueue.makeCommandBuffer(),
               let drawable = view.currentDrawable,
               let drawableRPD = view.currentRenderPassDescriptor else { return }
+
+        mainCommandBuffer.addCompletedHandler { [weak self] _ in
+            self?.inFlightSemaphore.signal()
+        }
+
+        beginBatchedSegmentUploadsForFrame()
 
         // PASS 1: Render the full scene into an offscreen texture (no MSAA, hard stroke coverage).
         let sceneRPD = MTLRenderPassDescriptor()
@@ -2144,6 +2309,7 @@ import simd
         postEnc.endEncoding()
 
         mainCommandBuffer.present(drawable)
+        didCommitFrame = true
         mainCommandBuffer.commit()
 
         updateDebugHUD(view: view)
@@ -2304,6 +2470,31 @@ import simd
             strokeSegmentPipelineState = try device.makeRenderPipelineState(descriptor: segDesc)
         } catch {
             fatalError("Failed to create strokeSegmentPipelineState: \(error)")
+        }
+
+        // Batched Stroke Pipeline (Instanced SDF segments with per-instance width/depth)
+        let batchedSegDesc = MTLRenderPipelineDescriptor()
+        batchedSegDesc.vertexFunction = library.makeFunction(name: "vertex_segment_sdf_batched")
+        batchedSegDesc.fragmentFunction = library.makeFunction(name: "fragment_segment_sdf_batched")
+        batchedSegDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        batchedSegDesc.sampleCount = viewSampleCount
+
+        let batchedAttachment = batchedSegDesc.colorAttachments[0]!
+        batchedAttachment.isBlendingEnabled = true
+        batchedAttachment.rgbBlendOperation = .add
+        batchedAttachment.alphaBlendOperation = .add
+        batchedAttachment.sourceRGBBlendFactor = .sourceAlpha
+        batchedAttachment.sourceAlphaBlendFactor = .sourceAlpha
+        batchedAttachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        batchedAttachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+        batchedSegDesc.vertexDescriptor = quadVertexDesc
+        batchedSegDesc.depthAttachmentPixelFormat = depthStencilFormat
+        batchedSegDesc.stencilAttachmentPixelFormat = depthStencilFormat
+        do {
+            strokeSegmentBatchedPipelineState = try device.makeRenderPipelineState(descriptor: batchedSegDesc)
+        } catch {
+            fatalError("Failed to create strokeSegmentBatchedPipelineState: \(error)")
         }
 
         // Setup vertex descriptor for StrokeVertex structure (shared by both card pipelines)
