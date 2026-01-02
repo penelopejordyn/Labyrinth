@@ -3909,6 +3909,9 @@ import UIKit
 		    func endLassoDrag() {
 		        normalizeLassoSelectedCanvasStrokes()
 		        normalizeLassoSelectedCards()
+		        if internalLinkTargetsPresent {
+		            rebuildInternalLinkReferenceCache()
+		        }
 		        if let selection = lassoSelection {
 		            updateLassoPreview(for: selection)
 		        }
@@ -6078,6 +6081,12 @@ import UIKit
 		            stroke.linkSectionID = sectionID
 		        }
 		        linkSelection = selection
+		        rebuildInternalLinkReferenceCache()
+		    }
+
+		    /// Refresh cached reference edges + name lookup used by the debug UI (and future graph views).
+		    /// Call this after renaming cards/sections or after section membership changes.
+		    func refreshInternalLinkReferenceCache() {
 		        rebuildInternalLinkReferenceCache()
 		    }
 

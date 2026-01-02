@@ -997,6 +997,7 @@ private class DragContext {
         section.labelWorldSize = .zero
         if let coord = coordinator {
             section.ensureLabelTexture(device: coord.device)
+            coord.refreshInternalLinkReferenceCache()
         }
 
         field.resignFirstResponder()
@@ -1083,6 +1084,7 @@ private class DragContext {
         card.name = trimmed.isEmpty ? "Untitled" : trimmed
         if let coord = coordinator {
             card.ensureLabelTexture(device: coord.device)
+            coord.refreshInternalLinkReferenceCache()
         }
 
         field.resignFirstResponder()
@@ -1399,6 +1401,7 @@ private class DragContext {
             let newName = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             section.name = newName.isEmpty ? "Untitled" : newName
             section.labelTexture = nil // Force label texture regeneration
+            self.coordinator?.refreshInternalLinkReferenceCache()
             self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
         })
 
