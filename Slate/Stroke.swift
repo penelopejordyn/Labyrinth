@@ -20,6 +20,11 @@ class Stroke: Identifiable {
     let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
     let depthID: UInt32                // Global draw order for depth testing (larger = newer)
     var depthWriteEnabled: Bool         // Allows disabling depth writes for specific strokes (e.g. translucent markers)
+    var sectionID: UUID?              // Optional Section membership (nil = belongs to frame)
+    var link: String?                  // Optional URL string attached to this stroke (linking feature)
+    var linkSectionID: UUID?           // Groups multiple strokes into one highlight section (separate boxes even for same URL)
+    var linkTargetSectionID: UUID?     // Optional internal link target (Section)
+    var linkTargetCardID: UUID?        // Optional internal link target (Card)
 
     /// GPU segment instances for SDF rendering
     let segments: [StrokeSegmentInstance]
@@ -45,7 +50,12 @@ class Stroke: Identifiable {
          segmentBounds: CGRect? = nil,
          device: MTLDevice?,
          depthID: UInt32,
-         depthWriteEnabled: Bool = true) {
+         depthWriteEnabled: Bool = true,
+         sectionID: UUID? = nil,
+         link: String? = nil,
+         linkSectionID: UUID? = nil,
+         linkTargetSectionID: UUID? = nil,
+         linkTargetCardID: UUID? = nil) {
         self.id = id
         self.origin = origin
         self.worldWidth = worldWidth
@@ -53,6 +63,11 @@ class Stroke: Identifiable {
         self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
         self.depthID = depthID
         self.depthWriteEnabled = depthWriteEnabled
+        self.sectionID = sectionID
+        self.link = link
+        self.linkSectionID = linkSectionID
+        self.linkTargetSectionID = linkTargetSectionID
+        self.linkTargetCardID = linkTargetCardID
         self.segments = segments
         self.localBounds = localBounds
         self.segmentBounds = segmentBounds ?? localBounds
@@ -310,6 +325,11 @@ extension Stroke {
             zoomCreation: safeFloat(zoomEffectiveAtCreation, fallback: 1),
             depthID: depthID,
             depthWrite: depthWriteEnabled,
+            link: link,
+            linkSectionID: linkSectionID,
+            linkTargetSectionID: linkTargetSectionID,
+            linkTargetCardID: linkTargetCardID,
+            sectionID: sectionID,
             points: rawPts
         )
     }
@@ -345,7 +365,27 @@ extension Stroke {
             segmentBounds: bounds,
             device: device,
             depthID: dto.depthID,
-            depthWriteEnabled: dto.depthWrite
+            depthWriteEnabled: dto.depthWrite,
+            sectionID: dto.sectionID,
+            link: dto.link,
+            linkSectionID: dto.linkSectionID,
+            linkTargetSectionID: dto.linkTargetSectionID,
+            linkTargetCardID: dto.linkTargetCardID
         )
+    }
+}
+
+// MARK: - Linking Helpers
+extension Stroke {
+    var linkURL: URL? {
+        guard let link, !link.isEmpty else { return nil }
+        return URL(string: link)
+    }
+
+    var hasAnyLink: Bool {
+        if let link, !link.isEmpty { return true }
+        if linkTargetSectionID != nil { return true }
+        if linkTargetCardID != nil { return true }
+        return false
     }
 }

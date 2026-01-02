@@ -822,6 +822,33 @@ func screenToWorldPixels_PureDouble(_ p: CGPoint,
     return SIMD2<Double>(worldX, worldY)
 }
 
+/// PURE DOUBLE PRECISION (Pixel Space Rotation)
+/// Forward transform for `screenToWorldPixels_PureDouble`:
+/// Converts Active-Frame World Pixels -> Screen Pixels using the exact same pixel-space rotation math.
+func worldToScreenPixels_PureDouble(_ world: SIMD2<Double>,
+                                    viewSize: CGSize,
+                                    panOffset: SIMD2<Double>,
+                                    zoomScale: Double,
+                                    rotationAngle: Float) -> CGPoint {
+    let center = SIMD2<Double>(Double(viewSize.width) / 2.0, Double(viewSize.height) / 2.0)
+
+    // 1) Zoom
+    let zoomedX = world.x * zoomScale
+    let zoomedY = world.y * zoomScale
+
+    // 2) Rotate using the shader's CW matrix [c, -s; s, c]
+    let angle = Double(rotationAngle)
+    let c = cos(angle)
+    let s = sin(angle)
+    let rotatedX = zoomedX * c - zoomedY * s
+    let rotatedY = zoomedX * s + zoomedY * c
+
+    // 3) Pan + center to screen pixels
+    let screenX = rotatedX + panOffset.x + center.x
+    let screenY = rotatedY + panOffset.y + center.y
+    return CGPoint(x: screenX, y: screenY)
+}
+
 /// Solve the pixel panOffset that keeps `anchorWorld` under `desiredScreen`
 /// for the current zoom/rotation (matches shader math exactly).
 func solvePanOffsetForAnchor(anchorWorld: SIMD2<Float>,
@@ -898,4 +925,94 @@ struct GPUTransform {
     var screenWidth: Float
     var screenHeight: Float
     var rotationAngle: Float
+}
+
+// MARK: - Coordinator Extension for Section Hit Testing
+
+extension Coordinator {
+    /// Hit test section labels across the hierarchy.
+    /// Returns the section whose label contains the screen point, or nil if none.
+    func hitTestSectionLabel(screenPoint: CGPoint, viewSize: CGSize) -> Section? {
+        let pointInActive = screenToWorldPixels_PureDouble(
+            screenPoint,
+            viewSize: viewSize,
+            panOffset: panOffset,
+            zoomScale: zoomScale,
+            rotationAngle: rotationAngle
+        )
+
+        // Check active frame's section labels first
+        for section in activeFrame.sections {
+            if section.labelContains(pointInFrame: pointInActive) {
+                return section
+            }
+        }
+
+        // Check parent frame if it exists
+        if let parent = activeFrame.parent {
+            let pointInParent: SIMD2<Double>
+            if let indexInParent = activeFrame.indexInParent {
+                ensureFractalExtent(viewSize: viewSize)
+                let extent = fractalFrameExtent
+                let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: indexInParent)
+                pointInParent = childCenter + (pointInActive / FractalGrid.scale)
+            } else {
+                pointInParent = pointInActive
+            }
+
+            for section in parent.sections {
+                if section.labelContains(pointInFrame: pointInParent) {
+                    return section
+                }
+            }
+        }
+
+        // Check child frames
+        ensureFractalExtent(viewSize: viewSize)
+        let extent = fractalFrameExtent
+
+        for row in 0..<5 {
+            for col in 0..<5 {
+                let index = GridIndex(col: col, row: row)
+                if let child = activeFrame.childIfExists(at: index) {
+                    let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+                    let pointInChild = (pointInActive - childCenter) * FractalGrid.scale
+
+                    for section in child.sections {
+                        if section.labelContains(pointInFrame: pointInChild) {
+                            return section
+                        }
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// Check if a screen point is on a specific section's label.
+    /// The label is rendered at a fixed screen size, so we need to account for zoom.
+    func hitTestSectionLabelOnly(section: Section, screenPoint: CGPoint, viewSize: CGSize) -> Bool {
+        // Label has a fixed screen size, so we check in screen coordinates
+        let labelCenter = section.origin
+
+        // Convert label center to screen coordinates
+        let labelCenterScreen = worldToScreenPixels_PureDouble(
+            labelCenter,
+            viewSize: viewSize,
+            panOffset: self.panOffset,
+            zoomScale: self.zoomScale,
+            rotationAngle: self.rotationAngle
+        )
+
+        // Label size in screen points (fixed size regardless of zoom)
+        let labelWidth = section.labelWorldSize.x
+        let labelHeight = section.labelWorldSize.y
+
+        // Check if screen point is within label bounds (in screen coordinates)
+        let dx = abs(Double(screenPoint.x) - Double(labelCenterScreen.x))
+        let dy = abs(Double(screenPoint.y) - Double(labelCenterScreen.y))
+
+        return dx <= labelWidth * 0.5 && dy <= labelHeight * 0.5
+    }
 }

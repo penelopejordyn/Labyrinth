@@ -35,12 +35,34 @@ private class DragContext {
 }
 
 // MARK: - TouchableMTKView
-class TouchableMTKView: MTKView {
-    private var isRunningOnMac: Bool {
-        #if targetEnvironment(macCatalyst)
-        return true
-        #else
-        if #available(iOS 14.0, *) {
+    class TouchableMTKView: MTKView {
+        private struct ColorChoice {
+            let color: SIMD4<Float>
+        }
+
+        private static let sectionColorPalette: [ColorChoice] = [
+            ColorChoice(color: SIMD4<Float>(1.0, 0.25, 0.25, 1.0)),
+            ColorChoice(color: SIMD4<Float>(1.0, 0.55, 0.20, 1.0)),
+            ColorChoice(color: SIMD4<Float>(1.0, 0.90, 0.20, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.25, 0.85, 0.35, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.25, 0.60, 1.0, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.70, 0.35, 1.0, 1.0))
+        ]
+
+        private static let cardColorPalette: [ColorChoice] = [
+            ColorChoice(color: SIMD4<Float>(1.0, 1.0, 1.0, 1.0)),      // White
+            ColorChoice(color: SIMD4<Float>(0.95, 0.95, 0.90, 1.0)),   // Cream
+            ColorChoice(color: SIMD4<Float>(1.0, 0.95, 0.85, 1.0)),    // Warm
+            ColorChoice(color: SIMD4<Float>(0.85, 0.95, 1.0, 1.0)),    // Cool
+            ColorChoice(color: SIMD4<Float>(0.9, 0.9, 0.9, 1.0)),      // Light gray
+            ColorChoice(color: SIMD4<Float>(0.2, 0.2, 0.2, 1.0))       // Dark
+        ]
+	
+	    private var isRunningOnMac: Bool {
+	        #if targetEnvironment(macCatalyst)
+	        return true
+	        #else
+	        if #available(iOS 14.0, *) {
             return ProcessInfo.processInfo.isiOSAppOnMac
         }
         return false
@@ -50,6 +72,7 @@ class TouchableMTKView: MTKView {
     weak var coordinator: Coordinator?
 
     var panGesture: UIPanGestureRecognizer!
+    var tapGesture: UITapGestureRecognizer!
     var pinchGesture: UIPinchGestureRecognizer!
     var rotationGesture: UIRotationGestureRecognizer!
     var longPressGesture: UILongPressGestureRecognizer!
@@ -58,6 +81,36 @@ class TouchableMTKView: MTKView {
 
     // Debug HUD
     var debugLabel: UILabel!
+
+    // MARK: - Stroke Linking UI (Selection Handles + Menu)
+    private let linkHandleTouchSize: CGFloat = 44.0
+    // private let linkHandleVisibleSize: CGFloat = 18.0
+    private let linkHandleLineWidth: CGFloat = 3.0
+    private var linkHandleView: UIView?
+    private var linkHandlePan: UIPanGestureRecognizer?
+    private var lastLinkMenuAnchorRect: CGRect = .null
+	    private var ignoreTapsUntilTime: CFTimeInterval = 0
+	    private var isPresentingLinkPrompt: Bool = false
+	    private var isPresentingInternalLinkPicker: Bool = false
+	    private var isShowingRemoveHighlightMenu: Bool = false
+	    private var removeHighlightMenuKey: Coordinator.LinkHighlightKey?
+	    private var linkHandleLineView: UIView?
+	    private var lastLassoMenuAnchorRect: CGRect = .null
+        private var isShowingLassoSectionMenu: Bool = false
+        private var isShowingSectionColorMenu: Bool = false
+        private weak var sectionColorMenuTarget: Section?
+        private weak var cardMenuTarget: Card?
+        private var cardMenuTargetFrame: Frame?
+
+        // MARK: - Inline Section Name Editing
+        private var sectionNameTextField: UITextField?
+        private weak var sectionNameEditingTarget: Section?
+        private weak var sectionNameEditingFrame: Frame?
+
+        // MARK: - Inline Card Name Editing
+        private var cardNameTextField: UITextField?
+        private weak var cardNameEditingTarget: Card?
+        private weak var cardNameEditingFrame: Frame?
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
     var pinchAnchorScreen: CGPoint = .zero
@@ -606,7 +659,8 @@ class TouchableMTKView: MTKView {
         addGestureRecognizer(panGesture)
 
         //  MODAL INPUT: TAP (Finger Only - Select/Edit Cards)
-        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tapGesture.cancelsTouchesInView = false
         if isRunningOnMac {
             var tapTouchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
             if #available(iOS 13.4, macCatalyst 13.4, *) {
@@ -645,6 +699,7 @@ class TouchableMTKView: MTKView {
         addGestureRecognizer(cardLongPressGesture)
 
         panGesture.delegate = self
+        tapGesture.delegate = self
         pinchGesture.delegate = self
         rotationGesture.delegate = self
         longPressGesture.delegate = self
@@ -691,14 +746,884 @@ class TouchableMTKView: MTKView {
         ])
     }
 
+    private func setupLinkSelectionOverlay() {
+        guard linkHandleView == nil else { return }
+
+        func makeHandleView() -> UIView {
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: linkHandleTouchSize))
+            container.backgroundColor = .clear
+            container.isHidden = true
+
+            /*
+            // Legacy handle: circle (reference only)
+            let circleOrigin = (linkHandleTouchSize - linkHandleVisibleSize) * 0.5
+            let circle = UIView(frame: CGRect(x: circleOrigin, y: circleOrigin, width: linkHandleVisibleSize, height: linkHandleVisibleSize))
+            circle.backgroundColor = UIColor.white.withAlphaComponent(0.95)
+            circle.layer.cornerRadius = linkHandleVisibleSize * 0.5
+            circle.layer.borderWidth = 2.0
+            circle.layer.borderColor = UIColor.systemYellow.withAlphaComponent(0.9).cgColor
+            circle.isUserInteractionEnabled = false
+            container.addSubview(circle)
+            */
+
+            let lineX = (linkHandleTouchSize - linkHandleLineWidth) * 0.5
+            let line = UIView(frame: CGRect(x: lineX, y: 0, width: linkHandleLineWidth, height: container.bounds.height))
+            line.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.95)
+            line.layer.cornerRadius = linkHandleLineWidth * 0.5
+            line.layer.borderWidth = 1.0
+            line.layer.borderColor = UIColor.white.withAlphaComponent(0.85).cgColor
+            line.autoresizingMask = [.flexibleHeight, .flexibleLeftMargin, .flexibleRightMargin]
+            line.isUserInteractionEnabled = false
+            container.addSubview(line)
+            linkHandleLineView = line
+
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleLinkHandlePan(_:)))
+            pan.minimumNumberOfTouches = 1
+            pan.maximumNumberOfTouches = 1
+            pan.delegate = self
+            if isRunningOnMac {
+                var touchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+                if #available(iOS 13.4, macCatalyst 13.4, *) {
+                    touchTypes.append(NSNumber(value: UITouch.TouchType.indirectPointer.rawValue))
+                }
+                pan.allowedTouchTypes = touchTypes
+            } else {
+                pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            }
+            container.addGestureRecognizer(pan)
+            linkHandlePan = pan
+
+            return container
+        }
+
+        let handle = makeHandleView()
+        addSubview(handle)
+        linkHandleView = handle
+    }
+
+    func updateLinkSelectionOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateLinkSelectionOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let selection = coord.linkSelection else {
+            hideLinkSelectionOverlay()
+            return
+        }
+
+        setupLinkSelectionOverlay()
+        guard let handleView = linkHandleView else { return }
+
+        let anchorRectActive = coord.linkSelectionBoundsActiveWorld()
+        let anchor: CGRect
+
+        if let rect = anchorRectActive, rect != .null, rect.width.isFinite, rect.height.isFinite {
+            let a0 = SIMD2<Double>(rect.maxX, rect.minY)
+            let a1 = SIMD2<Double>(rect.maxX, rect.maxY)
+
+            let p0 = worldToScreenPixels_PureDouble(a0,
+                                                    viewSize: bounds.size,
+                                                    panOffset: coord.panOffset,
+                                                    zoomScale: coord.zoomScale,
+                                                    rotationAngle: coord.rotationAngle)
+            let p1 = worldToScreenPixels_PureDouble(a1,
+                                                    viewSize: bounds.size,
+                                                    panOffset: coord.panOffset,
+                                                    zoomScale: coord.zoomScale,
+                                                    rotationAngle: coord.rotationAngle)
+
+            let dx = p1.x - p0.x
+            let dy = p1.y - p0.y
+            let length = max(hypot(dx, dy), 1.0)
+            // Our handle "cursor" is authored vertical (along +Y). Rotate so its Y-axis aligns with p0→p1.
+            let angle = atan2(dy, dx) - (.pi / 2.0)
+
+            let mid = CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5)
+            handleView.transform = .identity
+            handleView.bounds = CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: length)
+            handleView.center = mid
+            handleView.transform = CGAffineTransform(rotationAngle: angle)
+            handleView.isHidden = false
+            bringSubviewToFront(handleView)
+
+            anchor = CGRect(x: mid.x - 2, y: mid.y - 2, width: 4, height: 4)
+        } else {
+            let handleScreen = worldToScreenPixels_PureDouble(selection.handleActiveWorld,
+                                                              viewSize: bounds.size,
+                                                              panOffset: coord.panOffset,
+                                                              zoomScale: coord.zoomScale,
+                                                              rotationAngle: coord.rotationAngle)
+            handleView.transform = .identity
+            handleView.bounds = CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: linkHandleTouchSize)
+            handleView.center = handleScreen
+            handleView.isHidden = false
+            bringSubviewToFront(handleView)
+            anchor = CGRect(x: handleScreen.x - 2, y: handleScreen.y - 2, width: 4, height: 4)
+        }
+
+        if coord.isDraggingLinkHandle {
+            hideLinkMenu()
+            lastLinkMenuAnchorRect = .null
+        } else {
+            showLinkMenuIfNeeded(anchorRect: anchor)
+        }
+    }
+
+    func updateSectionNameEditorOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateSectionNameEditorOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let field = sectionNameTextField,
+              let section = sectionNameEditingTarget,
+              let frame = sectionNameEditingFrame else { return }
+
+        guard let rect = coord.sectionLabelScreenRect(section: section,
+                                                      frame: frame,
+                                                      viewSize: bounds.size,
+                                                      ignoreHideRule: true) else { return }
+
+        if field.frame != rect {
+            field.frame = rect
+        }
+        bringSubviewToFront(field)
+    }
+
+    func updateCardNameEditorOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateCardNameEditorOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let field = cardNameTextField,
+              let card = cardNameEditingTarget,
+              let frame = cardNameEditingFrame else { return }
+
+        guard let rect = coord.cardLabelScreenRect(card: card,
+                                                   frame: frame,
+                                                   viewSize: bounds.size,
+                                                   ignoreHideRule: true) else { return }
+
+        if field.frame != rect {
+            field.frame = rect
+        }
+        bringSubviewToFront(field)
+    }
+
+    private func beginEditingSectionName(section: Section, frame: Frame) {
+        guard let coord = coordinator else { return }
+
+        // Ensure only one inline editor is active.
+        if cardNameTextField != nil {
+            commitAndEndCardNameEditing()
+        }
+
+        // Ensure we have an accurate label size for placement + the initial editor frame.
+        section.ensureLabelTexture(device: coord.device)
+
+        let field: UITextField = {
+            if let existing = sectionNameTextField { return existing }
+            let f = UITextField(frame: .zero)
+            f.borderStyle = .none
+            f.textAlignment = .left
+            f.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+            f.textColor = .black
+            f.autocapitalizationType = .sentences
+            f.autocorrectionType = .yes
+            f.spellCheckingType = .yes
+            f.keyboardType = .default
+            f.returnKeyType = .done
+            f.enablesReturnKeyAutomatically = false
+            f.clearButtonMode = .whileEditing
+            f.layer.cornerRadius = 8.0
+            f.layer.masksToBounds = true
+            f.delegate = self
+
+            let padX: CGFloat = 10.0
+            let leftPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            let rightPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            f.leftView = leftPad
+            f.leftViewMode = .always
+            f.rightView = rightPad
+            f.rightViewMode = .always
+
+            addSubview(f)
+            sectionNameTextField = f
+            return f
+        }()
+
+        let bg = UIColor(red: CGFloat(section.color.x),
+                         green: CGFloat(section.color.y),
+                         blue: CGFloat(section.color.z),
+                         alpha: 1.0)
+        field.backgroundColor = bg
+
+        sectionNameEditingTarget = section
+        sectionNameEditingFrame = frame
+        field.text = section.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : section.name
+
+        updateSectionNameEditorOverlay()
+        field.isHidden = false
+        bringSubviewToFront(field)
+        field.becomeFirstResponder()
+    }
+
+    private func commitAndEndSectionNameEditing() {
+        guard let field = sectionNameTextField else { return }
+        guard let section = sectionNameEditingTarget else {
+            field.resignFirstResponder()
+            field.removeFromSuperview()
+            sectionNameTextField = nil
+            sectionNameEditingFrame = nil
+            return
+        }
+
+        let trimmed = field.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        section.name = trimmed.isEmpty ? "Untitled" : trimmed
+
+        // Force a label texture rebuild with the updated name.
+        section.labelTexture = nil
+        section.labelWorldSize = .zero
+        if let coord = coordinator {
+            section.ensureLabelTexture(device: coord.device)
+        }
+
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        sectionNameTextField = nil
+        sectionNameEditingTarget = nil
+        sectionNameEditingFrame = nil
+    }
+
+    private func beginEditingCardName(card: Card, frame: Frame) {
+        guard let coord = coordinator else { return }
+
+        // Ensure only one inline editor is active.
+        if sectionNameTextField != nil {
+            commitAndEndSectionNameEditing()
+        }
+
+        card.ensureLabelTexture(device: coord.device)
+
+        let field: UITextField = {
+            if let existing = cardNameTextField { return existing }
+            let f = UITextField(frame: .zero)
+            f.borderStyle = .none
+            f.textAlignment = .left
+            f.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+            f.autocapitalizationType = .sentences
+            f.autocorrectionType = .yes
+            f.spellCheckingType = .yes
+            f.keyboardType = .default
+            f.returnKeyType = .done
+            f.enablesReturnKeyAutomatically = false
+            f.clearButtonMode = .whileEditing
+            f.layer.cornerRadius = 8.0
+            f.layer.masksToBounds = true
+            f.delegate = self
+
+            let padX: CGFloat = 10.0
+            let leftPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            let rightPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            f.leftView = leftPad
+            f.leftViewMode = .always
+            f.rightView = rightPad
+            f.rightViewMode = .always
+
+            addSubview(f)
+            cardNameTextField = f
+            return f
+        }()
+
+        let bg = UIColor(red: CGFloat(card.backgroundColor.x),
+                         green: CGFloat(card.backgroundColor.y),
+                         blue: CGFloat(card.backgroundColor.z),
+                         alpha: 1.0)
+        field.backgroundColor = bg
+
+        let lum = 0.2126 * Double(card.backgroundColor.x) +
+        0.7152 * Double(card.backgroundColor.y) +
+        0.0722 * Double(card.backgroundColor.z)
+        let textColor: UIColor = lum > 0.6 ? .black : .white
+        field.textColor = textColor
+        field.tintColor = textColor
+
+        cardNameEditingTarget = card
+        cardNameEditingFrame = frame
+        field.text = card.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : card.name
+
+        updateCardNameEditorOverlay()
+        field.isHidden = false
+        bringSubviewToFront(field)
+        field.becomeFirstResponder()
+    }
+
+    private func commitAndEndCardNameEditing() {
+        guard let field = cardNameTextField else { return }
+        guard let card = cardNameEditingTarget else {
+            field.resignFirstResponder()
+            field.removeFromSuperview()
+            cardNameTextField = nil
+            cardNameEditingFrame = nil
+            return
+        }
+
+        let trimmed = field.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        card.name = trimmed.isEmpty ? "Untitled" : trimmed
+        if let coord = coordinator {
+            card.ensureLabelTexture(device: coord.device)
+        }
+
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        cardNameTextField = nil
+        cardNameEditingTarget = nil
+        cardNameEditingFrame = nil
+    }
+
+    private func hideLinkSelectionOverlay() {
+        linkHandleView?.isHidden = true
+        if !isShowingRemoveHighlightMenu && !isShowingLassoSectionMenu {
+            hideLinkMenu()
+            lastLinkMenuAnchorRect = .null
+        }
+    }
+
+	    private func showLinkMenuIfNeeded(anchorRect: CGRect) {
+	        guard let coord = coordinator else { return }
+	        guard coord.linkSelection != nil else { return }
+	        guard !coord.isDraggingLinkHandle else { return }
+	        guard !isPresentingLinkPrompt else { return }
+	        guard !isPresentingInternalLinkPicker else { return }
+	        guard !isShowingLassoSectionMenu else { return }
+	        guard !isShowingSectionColorMenu else { return }
+
+	        let menu = UIMenuController.shared
+	        if isShowingRemoveHighlightMenu, !menu.isMenuVisible {
+	            isShowingRemoveHighlightMenu = false
+	            removeHighlightMenuKey = nil
+	        }
+	        guard !isShowingRemoveHighlightMenu else { return }
+	        if isShowingSectionColorMenu, !menu.isMenuVisible {
+	            isShowingSectionColorMenu = false
+	            sectionColorMenuTarget = nil
+	        }
+	        if !anchorRect.isNull, !anchorRect.isInfinite {
+	            // Avoid re-showing the menu every frame unless the anchor moved meaningfully.
+	            let delta = abs(anchorRect.midX - lastLinkMenuAnchorRect.midX) + abs(anchorRect.midY - lastLinkMenuAnchorRect.midY)
+	            if !lastLinkMenuAnchorRect.isNull, delta < 8.0, menu.isMenuVisible {
+                return
+            }
+        }
+
+        becomeFirstResponder()
+        menu.menuItems = [
+            UIMenuItem(title: "Add Link", action: #selector(addLinkMenuItem(_:))),
+            UIMenuItem(title: "Link", action: #selector(addInternalLinkMenuItem(_:)))
+        ]
+        menu.showMenu(from: self, rect: anchorRect)
+        lastLinkMenuAnchorRect = anchorRect
+    }
+
+    private func hideLinkMenu() {
+        let menu = UIMenuController.shared
+        if menu.isMenuVisible {
+            menu.setMenuVisible(false, animated: true)
+        }
+    }
+
+    // MARK: - Section Creation Menu (Lasso → Create Section)
+
+	    func showLassoSectionMenuIfNeeded(anchorRect: CGRect) {
+	        guard let coord = coordinator else { return }
+	        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
+	        guard !isShowingSectionColorMenu else { return }
+
+	        let menu = UIMenuController.shared
+
+	        if !anchorRect.isNull, !anchorRect.isInfinite {
+            let delta = abs(anchorRect.midX - lastLassoMenuAnchorRect.midX) + abs(anchorRect.midY - lastLassoMenuAnchorRect.midY)
+            if !lastLassoMenuAnchorRect.isNull, delta < 8.0, menu.isMenuVisible {
+                return
+            }
+        }
+
+        // Ensure link menus don't fight this.
+        isShowingRemoveHighlightMenu = false
+        removeHighlightMenuKey = nil
+        lastLinkMenuAnchorRect = .null
+
+	        isShowingLassoSectionMenu = true
+	        becomeFirstResponder()
+	        menu.menuItems = [
+	            UIMenuItem(title: "Create Section", action: #selector(createSectionMenuItem(_:)))
+	        ]
+	        menu.showMenu(from: self, rect: anchorRect)
+	        lastLassoMenuAnchorRect = anchorRect
+	    }
+
+    private func hideLassoSectionMenu() {
+        isShowingLassoSectionMenu = false
+        lastLassoMenuAnchorRect = .null
+        hideLinkMenu()
+    }
+
+    private func showRemoveHighlightMenuIfNeeded(key: Coordinator.LinkHighlightKey, anchorRect: CGRect) {
+        guard !isPresentingLinkPrompt else { return }
+        guard !isPresentingInternalLinkPicker else { return }
+
+        isShowingRemoveHighlightMenu = true
+        removeHighlightMenuKey = key
+
+        // Hide any existing link menu state so it doesn't fight this menu.
+        lastLinkMenuAnchorRect = .null
+
+        becomeFirstResponder()
+        let menu = UIMenuController.shared
+        menu.menuItems = [
+            UIMenuItem(title: "Remove Highlight", action: #selector(removeHighlightMenuItem(_:)))
+        ]
+        menu.showMenu(from: self, rect: anchorRect)
+    }
+
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+
+	    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+	        if action == #selector(addLinkMenuItem(_:)) {
+	            return coordinator?.linkSelection != nil && coordinator?.isDraggingLinkHandle == false
+	        }
+	        if action == #selector(addInternalLinkMenuItem(_:)) {
+            return coordinator?.linkSelection != nil && coordinator?.isDraggingLinkHandle == false
+        }
+        if action == #selector(removeHighlightMenuItem(_:)) {
+            return removeHighlightMenuKey != nil &&
+                isPresentingLinkPrompt == false &&
+                isPresentingInternalLinkPicker == false
+        }
+	        if action == #selector(createSectionMenuItem(_:)) {
+	            guard let selection = coordinator?.lassoSelection else { return false }
+	            return selection.cardStrokes.isEmpty
+	        }
+        if action == #selector(setSectionColor0MenuItem(_:)) ||
+            action == #selector(setSectionColor1MenuItem(_:)) ||
+            action == #selector(setSectionColor2MenuItem(_:)) ||
+            action == #selector(setSectionColor3MenuItem(_:)) ||
+            action == #selector(setSectionColor4MenuItem(_:)) ||
+            action == #selector(setSectionColor5MenuItem(_:)) ||
+            action == #selector(renameSectionMenuItem(_:)) ||
+            action == #selector(deleteSectionMenuItem(_:)) {
+            return isShowingSectionColorMenu && sectionColorMenuTarget != nil
+        }
+        return super.canPerformAction(action, withSender: sender)
+	    }
+
+    @objc private func addLinkMenuItem(_ sender: Any?) {
+        presentAddLinkPrompt()
+    }
+
+    @objc private func addInternalLinkMenuItem(_ sender: Any?) {
+        presentInternalLinkPicker()
+    }
+
+    @objc private func removeHighlightMenuItem(_ sender: Any?) {
+        guard let key = removeHighlightMenuKey else { return }
+        coordinator?.removeHighlightSection(key)
+        removeHighlightMenuKey = nil
+        isShowingRemoveHighlightMenu = false
+        hideLinkMenu()
+    }
+
+	    @objc private func createSectionMenuItem(_ sender: Any?) {
+	        guard let coord = coordinator else { return }
+	        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
+
+	        _ = selection
+	        hideLassoSectionMenu()
+
+	        let defaultName = "Untitled"
+	        let randomColor = Self.sectionColorPalette.randomElement()?.color ?? SIMD4<Float>(1.0, 0.90, 0.20, 1.0)
+	        coord.createSectionFromLasso(name: defaultName, color: randomColor)
+	        ignoreTapsUntilTime = CACurrentMediaTime() + 0.25
+	    }
+
+    private func showSectionColorMenuIfNeeded(section: Section, anchorRect: CGRect) {
+        guard !isPresentingLinkPrompt else { return }
+        guard !isPresentingInternalLinkPicker else { return }
+
+        sectionColorMenuTarget = section
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+
+        let colors = Self.sectionColorPalette.map { choice in
+            FloatingMenuViewController.ColorOption(
+                color: UIColor(
+                    red: CGFloat(choice.color.x),
+                    green: CGFloat(choice.color.y),
+                    blue: CGFloat(choice.color.z),
+                    alpha: 1.0
+                ),
+                simdColor: choice.color
+            )
+        }
+
+        let menuItems = [
+            FloatingMenuViewController.MenuItem(title: "Delete", icon: "trash", isDestructive: true) { [weak self] in
+                guard let self else { return }
+                self.coordinator?.deleteSection(section)
+                self.sectionColorMenuTarget = nil
+            }
+        ]
+
+        let menu = FloatingMenuViewController(
+            colors: colors,
+            menuItems: menuItems,
+            onColorSelected: { [weak self] _, simdColor in
+                section.color = simdColor
+                section.labelTexture = nil
+                self?.ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+            },
+            initialPickerColor: UIColor(
+                red: CGFloat(section.color.x),
+                green: CGFloat(section.color.y),
+                blue: CGFloat(section.color.z),
+                alpha: 1.0
+            ),
+            onDismiss: { [weak self] in
+                self?.hideSectionColorMenu()
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func showCardMenuIfNeeded(card: Card, frame: Frame, anchorRect: CGRect) {
+        cardMenuTarget = card
+        cardMenuTargetFrame = frame
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+        guard let coord = coordinator else { return }
+
+        // Previous card menu (small + sheet-based settings) kept for reference:
+        //
+        // let colors = Self.cardColorPalette.map { choice in ... }
+        // let menuItems = [ Settings (sheet), Lock, Delete ]
+        // let menu = FloatingMenuViewController(...)
+        //
+        // The new card long-press uses a popover-style floating settings menu instead.
+        let menu = CardSettingsFloatingMenu(
+            card: card,
+            shadowsEnabled: coord.cardShadowEnabled,
+            onToggleShadows: { [weak coord] enabled in
+                coord?.cardShadowEnabled = enabled
+            },
+            onDelete: { [weak self] in
+                guard let self else { return }
+                self.coordinator?.deleteCard(card)
+                self.cardMenuTarget = nil
+                self.cardMenuTargetFrame = nil
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func hideSectionColorMenu() {
+	        isShowingSectionColorMenu = false
+	        sectionColorMenuTarget = nil
+	        hideLinkMenu()
+	    }
+	
+	    private func applySectionColor(_ color: SIMD4<Float>) {
+	        guard let section = sectionColorMenuTarget else { return }
+	        section.color = color
+	        section.labelTexture = nil
+	        isShowingSectionColorMenu = false
+	        sectionColorMenuTarget = nil
+	        hideLinkMenu()
+	        ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+	    }
+	
+    @objc private func setSectionColor0MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[0].color) }
+    @objc private func setSectionColor1MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[1].color) }
+    @objc private func setSectionColor2MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[2].color) }
+    @objc private func setSectionColor3MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[3].color) }
+    @objc private func setSectionColor4MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[4].color) }
+    @objc private func setSectionColor5MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[5].color) }
+
+    @objc private func renameSectionMenuItem(_ sender: Any?) {
+        guard let section = sectionColorMenuTarget else { return }
+        hideSectionColorMenu()
+        presentSectionRenamePrompt(section: section)
+    }
+
+    @objc private func deleteSectionMenuItem(_ sender: Any?) {
+        guard let section = sectionColorMenuTarget else { return }
+        coordinator?.deleteSection(section)
+        hideSectionColorMenu()
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+    }
+
+    private func presentSectionRenamePrompt(section: Section) {
+        hideSectionColorMenu()
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+
+        let alert = UIAlertController(title: "Rename Section", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = section.name
+            field.placeholder = "Section name"
+            field.autocapitalizationType = .sentences
+            field.autocorrectionType = .yes
+            field.returnKeyType = .done
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+        alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self] _ in
+            guard let self else { return }
+            let newName = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            section.name = newName.isEmpty ? "Untitled" : newName
+            section.labelTexture = nil // Force label texture regeneration
+            self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+        })
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(alert, animated: true) {
+            alert.textFields?.first?.becomeFirstResponder()
+        }
+    }
+
+    @objc private func handleLinkHandlePan(_ gesture: UIPanGestureRecognizer) {
+        guard let coord = coordinator else { return }
+
+        let loc = gesture.location(in: self)
+
+        switch gesture.state {
+        case .began:
+            stopMomentum()
+            coord.isDraggingLinkHandle = true
+            coord.beginLinkSelectionDrag(at: loc, viewSize: bounds.size)
+            hideLinkMenu()
+            // Prevent canvas pan from also recognizing while dragging a handle.
+            panGesture.isEnabled = false
+            panGesture.isEnabled = true
+
+        case .changed:
+            coord.extendLinkSelection(to: loc, viewSize: bounds.size)
+            updateLinkSelectionOverlay()
+
+        case .ended, .cancelled, .failed:
+            coord.isDraggingLinkHandle = false
+            coord.snapLinkSelectionHandleToBounds()
+            updateLinkSelectionOverlay()
+
+        default:
+            break
+        }
+    }
+
+    private func presentAddLinkPrompt() {
+        guard let coord = coordinator else { return }
+        guard coord.linkSelection != nil else { return }
+
+        isPresentingLinkPrompt = true
+        hideLinkMenu()
+        lastLinkMenuAnchorRect = .null
+
+        let initialText: String? = {
+            if let url = UIPasteboard.general.url?.absoluteString {
+                return url
+            }
+            if let str = UIPasteboard.general.string, !str.isEmpty {
+                return str
+            }
+            return nil
+        }()
+
+        let alert = UIAlertController(title: "Add Link", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.placeholder = "https://example.com"
+            field.text = initialText
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+            field.keyboardType = .URL
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: { [weak self] _ in
+            // Let the dismissal finish before resuming our own menu controller.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self?.isPresentingLinkPrompt = false
+            }
+        }))
+        alert.addAction(UIAlertAction(title: "Add", style: .default, handler: { [weak self] _ in
+            guard let text = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !text.isEmpty else { return }
+
+            let normalized: String = {
+                if text.contains("://") { return text }
+                return "https://\(text)"
+            }()
+
+            coord.addLinkToSelection(normalized)
+            coord.snapLinkSelectionHandleToBounds()
+            // If the alert tap leaks through to the canvas, it can clear the selection immediately.
+            // Ignore taps very briefly so the highlight persists after adding a link.
+            self?.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
+            // Let the dismissal finish before resuming our own menu controller.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self?.isPresentingLinkPrompt = false
+                self?.updateLinkSelectionOverlay()
+            }
+        }))
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(alert, animated: true) {
+            alert.textFields?.first?.becomeFirstResponder()
+        }
+    }
+
+    private func presentInternalLinkPicker() {
+        guard let coord = coordinator else { return }
+        guard coord.linkSelection != nil else { return }
+
+        isPresentingInternalLinkPicker = true
+        hideLinkMenu()
+        lastLinkMenuAnchorRect = .null
+
+        let destinations = coord.linkDestinationsInCanvas()
+        guard !destinations.isEmpty else {
+            let alert = UIAlertController(title: "No Sections or Cards",
+                                          message: "Create a section or card first.",
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default, handler: { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingInternalLinkPicker = false
+                }
+            }))
+            nearestViewController()?.present(alert, animated: true)
+            return
+        }
+
+        let picker = LinkDestinationPickerViewController(
+            destinations: destinations,
+            onSelect: { [weak self] destination in
+                guard let self else { return }
+                guard let coord = self.coordinator else { return }
+                coord.addInternalLinkToSelection(destination)
+                coord.snapLinkSelectionHandleToBounds()
+                self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self.isPresentingInternalLinkPicker = false
+                    self.updateLinkSelectionOverlay()
+                }
+            },
+            onCancel: { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingInternalLinkPicker = false
+                }
+            }
+        )
+
+        let nav = UINavigationController(rootViewController: picker)
+        nav.modalPresentationStyle = .pageSheet
+        nav.presentationController?.delegate = picker
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(nav, animated: true)
+    }
+
+    private func nearestViewController() -> UIViewController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let vc = current as? UIViewController {
+                return vc
+            }
+            responder = current.next
+        }
+        return nil
+    }
+
     // MARK: - Gesture Handlers
 
     ///  MODAL INPUT: TAP (Finger Only - Select/Deselect Cards)
-    @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-        let loc = gesture.location(in: self)
-        guard let coord = coordinator else { return }
+	    @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+	        if CACurrentMediaTime() < ignoreTapsUntilTime {
+	            return
+	        }
+
+	        let loc = gesture.location(in: self)
+	        guard let coord = coordinator else { return }
+
+	        if let field = cardNameTextField {
+	            // Tap-away commits and dismisses the inline editor.
+	            if field.frame.contains(loc) {
+	                return
+	            }
+	            commitAndEndCardNameEditing()
+	            return
+	        }
+
+	        if let field = sectionNameTextField {
+	            // Tap-away commits and dismisses the inline editor.
+	            if field.frame.contains(loc) {
+	                return
+	            }
+	            commitAndEndSectionNameEditing()
+	            return
+	        }
+	
+	        if isShowingSectionColorMenu {
+	            hideSectionColorMenu()
+	            return
+	        }
 
         if coord.handleLassoTap(screenPoint: loc, viewSize: bounds.size) {
+            if coord.lassoSelection == nil {
+                hideLassoSectionMenu()
+            }
+            return
+        }
+
+        if coord.linkSelection != nil {
+            // 1) Tap on a linked selected stroke: open it.
+            if coord.openLinkIfNeeded(at: loc, viewSize: bounds.size, restrictToSelection: true) {
+                return
+            }
+
+            // 2) Tap inside selection: keep selection (no side effects).
+            if coord.linkSelectionContains(screenPoint: loc, viewSize: bounds.size) {
+                return
+            }
+
+            // 3) Tap away: clear link selection + UI.
+            coord.clearLinkSelection()
+            updateLinkSelectionOverlay()
+            return
+        }
+
+        // Tap on any linked stroke (when no selection is active).
+        if coord.openLinkIfNeeded(at: loc, viewSize: bounds.size, restrictToSelection: false) {
+            return
+        }
+
+        // Tap on card name label: inline rename.
+        if let hit = coord.hitTestCardLabelHierarchy(screenPoint: loc, viewSize: bounds.size) {
+            beginEditingCardName(card: hit.card, frame: hit.frame)
             return
         }
 
@@ -706,6 +1631,12 @@ class TouchableMTKView: MTKView {
         if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
             // Toggle Edit on the card (wherever it lives - parent, active, or child)
             result.card.isEditing.toggle()
+            return
+        }
+
+        // Tap on section name label: inline rename.
+        if let hit = coord.hitTestSectionLabelHierarchy(screenPoint: loc, viewSize: bounds.size) {
+            beginEditingSectionName(section: hit.section, frame: hit.frame)
             return
         }
 
@@ -745,6 +1676,7 @@ class TouchableMTKView: MTKView {
             lassoDragActive = false
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoDragActive = true
+                hideLassoSectionMenu()
                 dragContext = nil
                 // TODO: Capture lasso state for undo
                 return
@@ -885,6 +1817,9 @@ class TouchableMTKView: MTKView {
 
         case .ended, .cancelled, .failed:
             // TODO: Record undo action for lasso move
+            if lassoDragActive {
+                coord.endLassoDrag()
+            }
 
             // Record undo action for card move/resize
             if let context = dragContext {
@@ -904,6 +1839,9 @@ class TouchableMTKView: MTKView {
                                               oldOrigin: context.startOrigin)
                     }
                 }
+
+                // Normalize across same-depth frames (and recompute section membership).
+                coord.normalizeCardAcrossFramesIfNeeded(card: context.card, from: context.frame, viewSize: bounds.size)
             }
 
             // Start momentum if panning canvas and velocity is significant
@@ -1156,7 +2094,38 @@ class TouchableMTKView: MTKView {
 
         if gesture.state == .began {
             let location = gesture.location(in: self)
+            if let key = coord.hitTestHighlightSection(at: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showRemoveHighlightMenuIfNeeded(key: key, anchorRect: anchor)
+                return
+            }
+
+            // Stroke long-press takes precedence (link selection).
+            if coord.beginLinkSelection(at: location, viewSize: bounds.size) {
+                updateLinkSelectionOverlay()
+                return
+            }
+
+            // Card long-press shows card menu.
+            if let (card, frame, _, _) = coord.hitTestHierarchy(screenPoint: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showCardMenuIfNeeded(card: card, frame: frame, anchorRect: anchor)
+                return
+            }
+
+            // Section bounds long-press shows color menu.
+            if let section = coord.hitTestSectionHierarchy(screenPoint: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showSectionColorMenuIfNeeded(section: section, anchorRect: anchor)
+                return
+            }
+
+            // Clear any previous remove-highlight menu state if we didn't hit a highlight box.
+            removeHighlightMenuKey = nil
+            isShowingRemoveHighlightMenu = false
+
             coord.handleLongPress(at: location)
+            updateLinkSelectionOverlay()
         }
     }
 
@@ -1271,5 +2240,134 @@ extension TouchableMTKView: UIPencilInteractionDelegate {
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard squeeze.phase == .ended else { return }
         coordinator?.onPencilSqueeze?()
+    }
+}
+
+// MARK: - Gesture Delegate (Ignore Inline Text Editing)
+
+extension TouchableMTKView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        let loc = touch.location(in: self)
+
+        if let field = sectionNameTextField, field.frame.contains(loc) {
+            return false
+        }
+        if let field = cardNameTextField, field.frame.contains(loc) {
+            return false
+        }
+        return true
+    }
+}
+
+// MARK: - UITextField Delegate (Inline Section Rename)
+
+extension TouchableMTKView: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === sectionNameTextField {
+            commitAndEndSectionNameEditing()
+        } else if textField === cardNameTextField {
+            commitAndEndCardNameEditing()
+        }
+        return false
+    }
+}
+
+// MARK: - Section Options Sheet
+
+private class SectionOptionsViewController: UIViewController {
+    private let colors: [UIColor]
+    private let onColorSelected: (Int) -> Void
+    private let onRename: () -> Void
+    private let onDelete: () -> Void
+
+    init(colors: [UIColor], onColorSelected: @escaping (Int) -> Void, onRename: @escaping () -> Void, onDelete: @escaping () -> Void) {
+        self.colors = colors
+        self.onColorSelected = onColorSelected
+        self.onRename = onRename
+        self.onDelete = onDelete
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+
+        // Color buttons row
+        let colorStack = UIStackView()
+        colorStack.axis = .horizontal
+        colorStack.spacing = 16
+        colorStack.alignment = .center
+        colorStack.distribution = .equalSpacing
+
+        for (index, color) in colors.enumerated() {
+            let button = UIButton(type: .system)
+            button.backgroundColor = color
+            button.layer.cornerRadius = 22
+            button.tag = index
+            button.addTarget(self, action: #selector(colorTapped(_:)), for: .touchUpInside)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 44),
+                button.heightAnchor.constraint(equalToConstant: 44)
+            ])
+            colorStack.addArrangedSubview(button)
+        }
+
+        // Action buttons row
+        let renameButton = UIButton(type: .system)
+        renameButton.setTitle("Rename", for: .normal)
+        renameButton.titleLabel?.font = .systemFont(ofSize: 17)
+        renameButton.addTarget(self, action: #selector(renameTapped), for: .touchUpInside)
+
+        let deleteButton = UIButton(type: .system)
+        deleteButton.setTitle("Delete", for: .normal)
+        deleteButton.setTitleColor(.systemRed, for: .normal)
+        deleteButton.titleLabel?.font = .systemFont(ofSize: 17)
+        deleteButton.addTarget(self, action: #selector(deleteTapped), for: .touchUpInside)
+
+        let actionStack = UIStackView(arrangedSubviews: [renameButton, deleteButton])
+        actionStack.axis = .horizontal
+        actionStack.spacing = 40
+        actionStack.alignment = .center
+
+        // Main stack
+        let mainStack = UIStackView(arrangedSubviews: [colorStack, actionStack])
+        mainStack.axis = .vertical
+        mainStack.spacing = 24
+        mainStack.alignment = .center
+        mainStack.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(mainStack)
+        NSLayoutConstraint.activate([
+            mainStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            mainStack.topAnchor.constraint(equalTo: view.topAnchor, constant: 32)
+        ])
+    }
+
+    @objc private func colorTapped(_ sender: UIButton) {
+        dismiss(animated: true) { [weak self] in
+            self?.onColorSelected(sender.tag)
+        }
+    }
+
+    @objc private func renameTapped() {
+        dismiss(animated: true) { [weak self] in
+            self?.onRename()
+        }
+    }
+
+    @objc private func deleteTapped() {
+        dismiss(animated: true) { [weak self] in
+            self?.onDelete()
+        }
     }
 }

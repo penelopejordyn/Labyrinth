@@ -653,3 +653,11 @@ fragment float4 fragment_card_shadow(CardVertexOut in [[stage_in]],
     float alpha = (1.0 - smoothstep(0.0, blurPx, distPx)) * style.shadowOpacity;
     return float4(0.0, 0.0, 0.0, alpha);
 }
+
+// MARK: - Unmasked Solid (for arbitrary triangles, e.g. Sections)
+
+fragment float4 fragment_solid_unmasked(CardVertexOut in [[stage_in]],
+                                        constant float4 &color [[buffer(0)]]) {
+    (void)in;
+    return color;
+}

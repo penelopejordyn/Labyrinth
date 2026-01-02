@@ -10,10 +10,12 @@ class BrushSettings: ObservableObject {
         case maskEraser
         case strokeEraser
         case lasso
+        case boxLasso
     }
 
     @Published var size: Double = 5.0  // Stroke width in world units (1-100)
-    @Published var color: SIMD4<Float> = SIMD4<Float>(1.0, 0.0, 0.0, 1.0)  // Red default
+    // Default stroke color: #FFF2D9
+    @Published var color: SIMD4<Float> = SIMD4<Float>(1.0, 0.94902, 0.85098, 1.0)
     @Published var toolMode: ToolMode = .paint
     @Published var cullingMultiplier: Double = 1.0  // Test multiplier for culling box size (1.0, 0.5, 0.25)
     @Published var depthWriteEnabled: Bool = true  // Set false for strokes that should not write depth (e.g. translucent marker)
@@ -24,5 +26,7 @@ class BrushSettings: ObservableObject {
 
     var isMaskEraser: Bool { toolMode == .maskEraser }
     var isStrokeEraser: Bool { toolMode == .strokeEraser }
-    var isLasso: Bool { toolMode == .lasso }
+    var isFreehandLasso: Bool { toolMode == .lasso }
+    var isBoxLasso: Bool { toolMode == .boxLasso }
+    var isLasso: Bool { isFreehandLasso || isBoxLasso }
 }

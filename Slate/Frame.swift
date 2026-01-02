@@ -6,6 +6,7 @@
 // (via constant scale transitions).
 
 import Foundation
+import simd
 
 /// A Frame represents a bounded coordinate system (a "Local Universe").
 ///
@@ -25,6 +26,11 @@ class Frame: Identifiable {
 
     /// Cards that belong to this Frame (Images, PDFs, Sketches)
     var cards: [Card] = []
+
+    /// Sections (lasso-defined grouping regions) that live in this Frame.
+    /// Sections define grouping regions; strokes/cards remain stored on Frames and reference
+    /// an optional `sectionID` to indicate membership (including across depths).
+    var sections: [Section] = []
 
     /// The "Universe" containing this frame (nil for root frame)
     weak var parent: Frame?
@@ -126,6 +132,28 @@ extension Frame {
     }
 }
 
+// MARK: - Section Helpers
+extension Frame {
+    /// Returns the "deepest" section that contains the given point (smallest area wins).
+    /// Tie-break: newest created wins (later in `sections` array).
+    func sectionContaining(pointInFrame: SIMD2<Double>) -> Section? {
+        guard !sections.isEmpty else { return nil }
+        var best: (section: Section, area: Double, index: Int)?
+        for (index, section) in sections.enumerated() {
+            guard section.contains(pointInFrame: pointInFrame) else { continue }
+            let area = section.absoluteArea
+            if let current = best {
+                if area < current.area - 1e-9 || (abs(area - current.area) <= 1e-9 && index > current.index) {
+                    best = (section: section, area: area, index: index)
+                }
+            } else {
+                best = (section: section, area: area, index: index)
+            }
+        }
+        return best?.section
+    }
+}
+
 // MARK: - Serialization (v2 Fractal)
 extension Frame {
     func toDTOv2() -> FrameDTOv2 {
@@ -145,6 +173,7 @@ extension Frame {
             indexInParent: indexInParent.map { GridIndexDTO($0) },
             strokes: strokes.map { $0.toDTO() },
             cards: cards.map { $0.toDTO() },
+            sections: sections.map { $0.toDTO() },
             children: childDTOs
         )
     }

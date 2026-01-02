@@ -66,48 +66,30 @@ struct FrameDTOv2: Codable {
     let indexInParent: GridIndexDTO?
     let strokes: [StrokeDTO]
     let cards: [CardDTO]
+    let sections: [SectionDTO]?
     let children: [ChildFrameDTOv2]
 }
 
-// MARK: - v1 (Legacy Telescoping)
-
-struct CanvasSaveDataV1: Codable {
-    let version: Int
-    let timestamp: Date
-    let rootFrame: FrameDTOv1
-
-    init(timestamp: Date, rootFrame: FrameDTOv1, version: Int = 1) {
-        self.version = version
-        self.timestamp = timestamp
-        self.rootFrame = rootFrame
-    }
-}
-
-// MARK: - DTOs
-
-struct FrameDTOv1: Codable {
-    let id: UUID
-    let originInParent: [Double]
-    let scaleRelativeToParent: Double
-    let depthFromRoot: Int
-    let strokes: [StrokeDTO]
-    let cards: [CardDTO]
-    let children: [FrameDTOv1]
-}
-
-struct StrokeDTO: Codable {
-    let id: UUID
-    let origin: [Double]
-    let worldWidth: Double
-    let color: [Float]
-    let zoomCreation: Float
-    let depthID: UInt32
-    let depthWrite: Bool
-    let points: [[Float]]
-}
+		struct StrokeDTO: Codable {
+		    let id: UUID
+		    let origin: [Double]
+		    let worldWidth: Double
+	    let color: [Float]
+	    let zoomCreation: Float
+	    let depthID: UInt32
+	    let depthWrite: Bool
+	    let link: String?
+	    let linkSectionID: UUID?
+	    let linkTargetSectionID: UUID?
+	    let linkTargetCardID: UUID?
+	    let sectionID: UUID?
+	    let points: [[Float]]
+	}
 
 struct CardDTO: Codable {
     let id: UUID
+    let name: String?
+    let sectionID: UUID?
     let origin: [Double]
     let size: [Double]
     let rotation: Float
@@ -117,6 +99,16 @@ struct CardDTO: Codable {
     let backgroundColor: [Float]?
     let opacity: Float?
     let isLocked: Bool?
+}
+
+struct SectionDTO: Codable {
+    let id: UUID
+    let name: String
+    let color: [Float]
+    let fillOpacity: Float?
+    let polygon: [[Double]]
+    let strokes: [StrokeDTO]?
+    let cards: [CardDTO]?
 }
 
 enum CardContentDTO: Codable {

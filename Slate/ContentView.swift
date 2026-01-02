@@ -198,50 +198,69 @@ struct ContentView: View {
 
                         if isBrushMenuExpanded {
                             VStack(alignment: .trailing, spacing: 12) {
-                                HStack(spacing: 12) {
-                                    Button(action: {
-                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
-                                    }) {
-                                        VStack(spacing: 2) {
-                                            Image(systemName: coordinator.brushSettings.isMaskEraser ? "eraser.fill" : "eraser")
-                                                .font(.system(size: 20))
-                                            Text("Erase")
-                                                .font(.caption)
+                                VStack(alignment: .trailing, spacing: 12) {
+                                    HStack(spacing: 12) {
+                                        Button(action: {
+                                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isMaskEraser ? .paint : .maskEraser
+                                        }) {
+                                            VStack(spacing: 2) {
+                                                Image(systemName: coordinator.brushSettings.isMaskEraser ? "eraser.fill" : "eraser")
+                                                    .font(.system(size: 20))
+                                                Text("Erase")
+                                                    .font(.caption)
+                                            }
+                                            .foregroundColor(coordinator.brushSettings.isMaskEraser ? .pink : .white)
+                                            .padding(8)
+                                            .background(.ultraThinMaterial)
+                                            .cornerRadius(12)
                                         }
-                                        .foregroundColor(coordinator.brushSettings.isMaskEraser ? .pink : .white)
-                                        .padding(8)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(12)
+
+                                        Button(action: {
+                                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isStrokeEraser ? .paint : .strokeEraser
+                                        }) {
+                                            VStack(spacing: 2) {
+                                                Image(systemName: coordinator.brushSettings.isStrokeEraser ? "trash.fill" : "trash")
+                                                    .font(.system(size: 20))
+                                                Text("Stroke")
+                                                    .font(.caption)
+                                            }
+                                            .foregroundColor(coordinator.brushSettings.isStrokeEraser ? .orange : .white)
+                                            .padding(8)
+                                            .background(.ultraThinMaterial)
+                                            .cornerRadius(12)
+                                        }
                                     }
 
-                                    Button(action: {
-                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isStrokeEraser ? .paint : .strokeEraser
-                                    }) {
-                                        VStack(spacing: 2) {
-                                            Image(systemName: coordinator.brushSettings.isStrokeEraser ? "trash.fill" : "trash")
-                                                .font(.system(size: 20))
-                                            Text("Stroke")
-                                                .font(.caption)
+                                    HStack(spacing: 12) {
+                                        Button(action: {
+                                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isFreehandLasso ? .paint : .lasso
+                                        }) {
+                                            VStack(spacing: 2) {
+                                                Image(systemName: "lasso")
+                                                    .font(.system(size: 20))
+                                                Text("Lasso")
+                                                    .font(.caption)
+                                            }
+                                            .foregroundColor(coordinator.brushSettings.isFreehandLasso ? .cyan : .white)
+                                            .padding(8)
+                                            .background(.ultraThinMaterial)
+                                            .cornerRadius(12)
                                         }
-                                        .foregroundColor(coordinator.brushSettings.isStrokeEraser ? .orange : .white)
-                                        .padding(8)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(12)
-                                    }
 
-                                    Button(action: {
-                                        coordinator.brushSettings.toolMode = coordinator.brushSettings.isLasso ? .paint : .lasso
-                                    }) {
-                                        VStack(spacing: 2) {
-                                            Image(systemName: "lasso")
-                                                .font(.system(size: 20))
-                                            Text("Lasso")
-                                                .font(.caption)
+                                        Button(action: {
+                                            coordinator.brushSettings.toolMode = coordinator.brushSettings.isBoxLasso ? .paint : .boxLasso
+                                        }) {
+                                            VStack(spacing: 2) {
+                                                Image(systemName: "rectangle.dashed")
+                                                    .font(.system(size: 20))
+                                                Text("Box")
+                                                    .font(.caption)
+                                            }
+                                            .foregroundColor(coordinator.brushSettings.isBoxLasso ? .cyan : .white)
+                                            .padding(8)
+                                            .background(.ultraThinMaterial)
+                                            .cornerRadius(12)
                                         }
-                                        .foregroundColor(coordinator.brushSettings.isLasso ? .cyan : .white)
-                                        .padding(8)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(12)
                                     }
                                 }
 
