@@ -1446,6 +1446,9 @@ private class DragContext {
 
         isPresentingLinkPrompt = true
         hideLinkMenu()
+        let anchorRect = (!lastLinkMenuAnchorRect.isNull && !lastLinkMenuAnchorRect.isInfinite)
+            ? lastLinkMenuAnchorRect
+            : CGRect(x: bounds.midX - 2, y: bounds.midY - 2, width: 4, height: 4)
         lastLinkMenuAnchorRect = .null
 
         let initialText: String? = {
@@ -1458,46 +1461,27 @@ private class DragContext {
             return nil
         }()
 
-        let alert = UIAlertController(title: "Add Link", message: nil, preferredStyle: .alert)
-        alert.addTextField { field in
-            field.placeholder = "https://example.com"
-            field.text = initialText
-            field.autocapitalizationType = .none
-            field.autocorrectionType = .no
-            field.keyboardType = .URL
-        }
-
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: { [weak self] _ in
-            // Let the dismissal finish before resuming our own menu controller.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                self?.isPresentingLinkPrompt = false
-            }
-        }))
-        alert.addAction(UIAlertAction(title: "Add", style: .default, handler: { [weak self] _ in
-            guard let text = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty else { return }
-
-            let normalized: String = {
-                if text.contains("://") { return text }
-                return "https://\(text)"
-            }()
-
-            coord.addLinkToSelection(normalized)
-            coord.snapLinkSelectionHandleToBounds()
-            // If the alert tap leaks through to the canvas, it can clear the selection immediately.
-            // Ignore taps very briefly so the highlight persists after adding a link.
-            self?.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
-            // Let the dismissal finish before resuming our own menu controller.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                self?.isPresentingLinkPrompt = false
-                self?.updateLinkSelectionOverlay()
-            }
-        }))
+        let menu = AddLinkFloatingMenuViewController(
+            initialText: initialText,
+            onAdd: { [weak self] normalized in
+                guard let self else { return }
+                guard let coord = self.coordinator else { return }
+                coord.addLinkToSelection(normalized)
+                coord.snapLinkSelectionHandleToBounds()
+                self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
+                self.updateLinkSelectionOverlay()
+            },
+            onDismiss: { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingLinkPrompt = false
+                }
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
 
         guard let vc = nearestViewController() else { return }
-        vc.present(alert, animated: true) {
-            alert.textFields?.first?.becomeFirstResponder()
-        }
+        vc.present(menu, animated: true)
     }
 
     private func presentInternalLinkPicker() {
@@ -1506,6 +1490,9 @@ private class DragContext {
 
         isPresentingInternalLinkPicker = true
         hideLinkMenu()
+        let anchorRect = (!lastLinkMenuAnchorRect.isNull && !lastLinkMenuAnchorRect.isInfinite)
+            ? lastLinkMenuAnchorRect
+            : CGRect(x: bounds.midX - 2, y: bounds.midY - 2, width: 4, height: 4)
         lastLinkMenuAnchorRect = .null
 
         let destinations = coord.linkDestinationsInCanvas()
@@ -1522,7 +1509,7 @@ private class DragContext {
             return
         }
 
-        let picker = LinkDestinationPickerViewController(
+        let menu = InternalLinkPickerFloatingMenuViewController(
             destinations: destinations,
             onSelect: { [weak self] destination in
                 guard let self else { return }
@@ -1530,24 +1517,19 @@ private class DragContext {
                 coord.addInternalLinkToSelection(destination)
                 coord.snapLinkSelectionHandleToBounds()
                 self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    self.isPresentingInternalLinkPicker = false
-                    self.updateLinkSelectionOverlay()
-                }
+                self.updateLinkSelectionOverlay()
             },
-            onCancel: { [weak self] in
+            onDismiss: { [weak self] in
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                     self?.isPresentingInternalLinkPicker = false
                 }
-            }
+            },
+            sourceRect: anchorRect,
+            sourceView: self
         )
 
-        let nav = UINavigationController(rootViewController: picker)
-        nav.modalPresentationStyle = .pageSheet
-        nav.presentationController?.delegate = picker
-
         guard let vc = nearestViewController() else { return }
-        vc.present(nav, animated: true)
+        vc.present(menu, animated: true)
     }
 
     private func nearestViewController() -> UIViewController? {
