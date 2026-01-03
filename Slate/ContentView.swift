@@ -109,7 +109,10 @@ struct ContentView: View {
                         HStack(spacing: 12) {
                             Button(action: {
                                 if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame,
-                                                                                    fractalFrameExtent: coordinator.fractalFrameExtent) {
+                                                                                    fractalFrameExtent: coordinator.fractalFrameExtent,
+                                                                                    layers: coordinator.layers,
+                                                                                    zOrder: coordinator.zOrder,
+                                                                                    selectedLayerID: coordinator.selectedLayerID) {
                                     exportDocument = CanvasDocument(data: data)
                                     isExporting = true
                                 }
@@ -140,21 +143,21 @@ struct ContentView: View {
                             }
                         }
 
-                        HStack(spacing: 12) {
-                            Button(action: { coordinator.debugPopulateFrames() }) {
-                                VStack(spacing: 2) {
-                                    Image(systemName: "bolt.fill")
-                                        .font(.system(size: 20))
-                                    Text("Fill")
-                                        .font(.caption)
-                                }
-                                .foregroundColor(.yellow)
-                                .padding(8)
-                                .background(.ultraThinMaterial)
-                                .cornerRadius(12)
-                            }
+	                        HStack(spacing: 12) {
+	                            Button(action: { coordinator.debugPopulateFrames() }) {
+	                                VStack(spacing: 2) {
+	                                    Image(systemName: "bolt.fill")
+	                                        .font(.system(size: 20))
+	                                    Text("Fill")
+	                                        .font(.caption)
+	                                }
+	                                .foregroundColor(.yellow)
+	                                .padding(8)
+	                                .background(.ultraThinMaterial)
+	                                .cornerRadius(12)
+	                            }
 
-                            Button(action: { showClearConfirmation = true }) {
+	                            Button(action: { showClearConfirmation = true }) {
                                 VStack(spacing: 2) {
                                     Image(systemName: "trash.slash")
                                         .font(.system(size: 20))
@@ -174,14 +177,30 @@ struct ContentView: View {
                                 }
                                 Button("Cancel", role: .cancel) {}
                             } message: {
-                                Text("Clears canvas strokes and card drawings across all frames. This cannot be undone.")
-                            }
-                        }
+	                                Text("Clears canvas strokes and card drawings across all frames. This cannot be undone.")
+	                            }
+	                        }
 
-                        Button(action: {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                isBrushMenuExpanded.toggle()
-                            }
+	                        Button(action: {
+	                            coordinator.presentLayersMenu()
+	                        }) {
+	                            HStack(spacing: 8) {
+	                                Image(systemName: "square.3.layers.3d")
+	                                    .font(.system(size: 16))
+	                                Text("Layers")
+	                                    .font(.system(size: 14, weight: .medium))
+	                            }
+	                            .foregroundColor(.white)
+	                            .padding(.horizontal, 12)
+	                            .padding(.vertical, 10)
+	                            .background(.ultraThinMaterial)
+	                            .cornerRadius(16)
+	                        }
+
+	                        Button(action: {
+	                            withAnimation(.easeInOut(duration: 0.2)) {
+	                                isBrushMenuExpanded.toggle()
+	                            }
                         }) {
                             HStack(spacing: 8) {
                                 Image(systemName: isBrushMenuExpanded ? "paintbrush.fill" : "paintbrush")
@@ -300,7 +319,11 @@ struct ContentView: View {
 	                let viewSize = coordinator.metalView?.bounds.size ?? .zero
 	                let extent = SIMD2<Double>(Double(viewSize.width), Double(viewSize.height))
 	                if let imported = PersistenceManager.shared.importCanvas(data: data, device: coordinator.device, fractalFrameExtent: extent) {
-	                    coordinator.replaceCanvas(with: imported.rootFrame, fractalExtent: imported.fractalFrameExtent)
+	                    coordinator.replaceCanvas(with: imported.rootFrame,
+	                                              fractalExtent: imported.fractalFrameExtent,
+	                                              layers: imported.layers,
+	                                              zOrder: imported.zOrder,
+	                                              selectedLayerID: imported.selectedLayerID)
 	                }
 	            case .failure(let error):
 	                print("Import error: \(error)")

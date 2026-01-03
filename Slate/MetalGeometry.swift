@@ -61,6 +61,9 @@ struct BatchedStrokeTransform {
     var screenHeight: Float
     var rotationAngle: Float
     var featherPx: Float
+    /// Depth band mapping for global z-order: `finalDepth = depthBias + baseDepth * depthScale`.
+    var depthBias: Float = 0.0
+    var depthScale: Float = 1.0
 }
 
 /// Transform for card rendering (not batched, includes offset)

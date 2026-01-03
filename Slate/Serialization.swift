@@ -32,12 +32,24 @@ struct CanvasSaveDataV2: Codable {
     let timestamp: Date
     let fractal: FractalSaveConfigDTO
     let rootFrame: FrameDTOv2
+    let layers: [CanvasLayer]?
+    let zOrder: [CanvasZItem]?
+    let selectedLayerID: UUID?
 
-    init(timestamp: Date, fractal: FractalSaveConfigDTO, rootFrame: FrameDTOv2, version: Int = 2) {
+    init(timestamp: Date,
+         fractal: FractalSaveConfigDTO,
+         rootFrame: FrameDTOv2,
+         version: Int = 2,
+         layers: [CanvasLayer]? = nil,
+         zOrder: [CanvasZItem]? = nil,
+         selectedLayerID: UUID? = nil) {
         self.version = version
         self.timestamp = timestamp
         self.fractal = fractal
         self.rootFrame = rootFrame
+        self.layers = layers
+        self.zOrder = zOrder
+        self.selectedLayerID = selectedLayerID
     }
 }
 
@@ -78,6 +90,8 @@ struct FrameDTOv2: Codable {
 	    let zoomCreation: Float
 	    let depthID: UInt32
 	    let depthWrite: Bool
+	    let maskAppliesToAllLayers: Bool?
+	    let layerID: UUID?
 	    let link: String?
 	    let linkSectionID: UUID?
 	    let linkTargetSectionID: UUID?
@@ -99,6 +113,7 @@ struct CardDTO: Codable {
     let backgroundColor: [Float]?
     let opacity: Float?
     let isLocked: Bool?
+    let isHidden: Bool?
 }
 
 struct SectionDTO: Codable {
@@ -116,4 +131,5 @@ enum CardContentDTO: Codable {
     case image(pngData: Data)
     case lined(spacing: Float, lineWidth: Float, color: [Float])
     case grid(spacing: Float, lineWidth: Float, color: [Float])
+    case youtube(videoID: String, aspectRatio: Double)
 }

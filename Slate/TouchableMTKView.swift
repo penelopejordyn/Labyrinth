@@ -4,6 +4,12 @@ import UIKit
 import MetalKit
 import ObjectiveC.runtime
 import simd
+import Combine
+#if canImport(YouTubePlayerKit)
+import YouTubePlayerKit
+#else
+import WebKit
+#endif
 
 // MARK: - Associated Object Keys for gesture state storage
 private struct AssociatedKeys {
@@ -111,6 +117,24 @@ private class DragContext {
         private var cardNameTextField: UITextField?
         private weak var cardNameEditingTarget: Card?
         private weak var cardNameEditingFrame: Frame?
+
+        // MARK: - YouTube Card Overlay (single active player)
+        #if canImport(YouTubePlayerKit)
+        private var youtubePlayer: YouTubePlayer?
+        private var youtubeHostingView: YouTubePlayerHostingView?
+        private var youtubeStateCancellable: AnyCancellable?
+        private var youtubeEventCancellable: AnyCancellable?
+        private var youtubePendingVideoID: String?
+        #else
+        private var youtubeWebView: WKWebView?
+        #endif
+        private weak var youtubeCardTarget: Card?
+        private weak var youtubeCardFrame: Frame?
+        private var youtubeLoadedVideoID: String?
+        private var youtubeOverlayLastCenter: CGPoint?
+        private var youtubeOverlayLastSize: CGSize?
+        private var youtubeOverlayLastRotation: CGFloat?
+        private var youtubeLastErrorSummary: String?
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
     var pinchAnchorScreen: CGPoint = .zero
@@ -921,6 +945,358 @@ private class DragContext {
         bringSubviewToFront(field)
     }
 
+    func updateYouTubeOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateYouTubeOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        #if canImport(YouTubePlayerKit)
+        guard let hostingView = youtubeHostingView else { return }
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            deactivateYouTubeOverlay()
+            return
+        }
+        #else
+        guard let webView = youtubeWebView else { return }
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            deactivateYouTubeOverlay()
+            return
+        }
+        guard webView.superview != nil else { return }
+        #endif
+
+        guard case .youtube(let videoID, _) = card.type, !videoID.isEmpty else {
+            deactivateYouTubeOverlay()
+            return
+        }
+
+        if youtubeLoadedVideoID != videoID {
+            setYouTubeVideo(videoID: videoID)
+        }
+
+        guard let placement = coord.cardScreenTransform(card: card, frame: frame, viewSize: bounds.size) else {
+            // Keep the player alive; just hide the overlay until the target card is visible again.
+            #if canImport(YouTubePlayerKit)
+            hostingView.isHidden = true
+            #else
+            webView.isHidden = true
+            #endif
+            return
+        }
+
+        let size = placement.size
+        guard size.width.isFinite, size.height.isFinite, size.width > 1, size.height > 1 else {
+            #if canImport(YouTubePlayerKit)
+            hostingView.isHidden = true
+            #else
+            webView.isHidden = true
+            #endif
+            return
+        }
+
+        let desiredCenter = placement.center
+        let desiredSize = size
+        let desiredRotation = placement.rotation
+
+        let shouldUpdateFrame: Bool = {
+            guard let lastCenter = youtubeOverlayLastCenter,
+                  let lastSize = youtubeOverlayLastSize,
+                  let lastRotation = youtubeOverlayLastRotation else {
+                return true
+            }
+            let centerDelta = abs(desiredCenter.x - lastCenter.x) + abs(desiredCenter.y - lastCenter.y)
+            let sizeDelta = abs(desiredSize.width - lastSize.width) + abs(desiredSize.height - lastSize.height)
+            let rotationDelta = abs(desiredRotation - lastRotation)
+            return centerDelta > 0.5 || sizeDelta > 0.5 || rotationDelta > 0.002
+        }()
+
+        #if canImport(YouTubePlayerKit)
+        hostingView.isHidden = false
+        if shouldUpdateFrame {
+            hostingView.transform = .identity
+            hostingView.bounds = CGRect(x: 0, y: 0, width: desiredSize.width, height: desiredSize.height)
+            hostingView.center = desiredCenter
+            hostingView.transform = CGAffineTransform(rotationAngle: desiredRotation)
+            hostingView.layoutIfNeeded()
+            youtubeOverlayLastCenter = desiredCenter
+            youtubeOverlayLastSize = desiredSize
+            youtubeOverlayLastRotation = desiredRotation
+        }
+        bringSubviewToFront(hostingView)
+        #else
+        webView.isHidden = false
+        if shouldUpdateFrame {
+            webView.transform = .identity
+            webView.bounds = CGRect(x: 0, y: 0, width: desiredSize.width, height: desiredSize.height)
+            webView.center = desiredCenter
+            webView.transform = CGAffineTransform(rotationAngle: desiredRotation)
+            youtubeOverlayLastCenter = desiredCenter
+            youtubeOverlayLastSize = desiredSize
+            youtubeOverlayLastRotation = desiredRotation
+        }
+        bringSubviewToFront(webView)
+        #endif
+    }
+
+    func youtubeHUDText() -> String {
+        #if canImport(YouTubePlayerKit)
+        let activeVideoID: String = {
+            guard let card = youtubeCardTarget, case .youtube(let id, _) = card.type else { return "-" }
+            return id
+        }()
+        let state = youtubePlayer.map { String(describing: $0.state) } ?? "nil"
+        let originHost = youtubePlayer?.parameters.originURL?.host ?? "nil"
+        let err = youtubeLastErrorSummary ?? "ok"
+        return "YT: \(activeVideoID) | \(state) | origin: \(originHost) | \(err)"
+        #else
+        let activeVideoID: String = {
+            guard let card = youtubeCardTarget, case .youtube(let id, _) = card.type else { return "-" }
+            return id
+        }()
+        return "YT: \(activeVideoID) | WKWebView"
+        #endif
+    }
+
+    private func toggleYouTubeOverlay(card: Card, frame: Frame) {
+        #if canImport(YouTubePlayerKit)
+        let isActive = (youtubeCardTarget === card && youtubeCardFrame === frame && youtubeHostingView?.isHidden == false)
+        #else
+        let isActive = (youtubeCardTarget === card && youtubeCardFrame === frame && youtubeWebView?.superview != nil)
+        #endif
+
+        // A YouTube overlay should only stop when switching to a different YouTube card.
+        // Tapping the active YouTube card should never stop playback.
+        if !isActive {
+            activateYouTubeOverlay(card: card, frame: frame)
+        }
+    }
+
+    private func activateYouTubeOverlay(card: Card, frame: Frame) {
+        guard case .youtube(let videoID, _) = card.type, !videoID.isEmpty else { return }
+
+        #if canImport(YouTubePlayerKit)
+        let player: YouTubePlayer = youtubePlayer ?? {
+            let origin = preferredYouTubeEmbedOriginURL()
+            let userAgent = preferredYouTubeUserAgentString()
+            let params = YouTubePlayer.Parameters(
+                showControls: true,
+                showFullscreenButton: false,
+                keyboardControlsDisabled: false,
+                originURL: origin,
+                referrerURL: nil
+            )
+
+            let config = YouTubePlayer.Configuration(
+                fullscreenMode: .preferred,
+                allowsInlineMediaPlayback: true,
+                allowsAirPlayForMediaPlayback: true,
+                allowsPictureInPictureMediaPlayback: false,
+                useNonPersistentWebsiteDataStore: false,
+                automaticallyAdjustsContentInsets: true,
+                customUserAgent: userAgent,
+                htmlBuilder: .init(),
+                openURLAction: .default
+            )
+
+            let p = YouTubePlayer(
+                source: .video(id: videoID),
+                parameters: params,
+                configuration: config,
+                isLoggingEnabled: false
+            )
+            #if DEBUG
+            p.isLoggingEnabled = true
+            #endif
+
+            youtubeEventCancellable = p.eventPublisher.sink { [weak self] event in
+                guard let self else { return }
+                switch event.name {
+                case .error:
+                    let payload = event.data?.value ?? "nil"
+                    self.youtubeLastErrorSummary = "YT onError(\(payload))"
+                case .iFrameApiFailedToLoad:
+                    self.youtubeLastErrorSummary = "YT iFrameApiFailedToLoad"
+                default:
+                    break
+                }
+            }
+
+            youtubeStateCancellable = p.statePublisher.sink { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    guard let pending = self.youtubePendingVideoID else { return }
+                    self.youtubePendingVideoID = nil
+                    self.setYouTubeVideo(videoID: pending)
+                case .error(let error):
+                    self.youtubeLastErrorSummary = "YT stateError(\(error))"
+                case .idle:
+                    break
+                }
+            }
+
+            youtubePlayer = p
+            return p
+        }()
+
+        let hostingView: YouTubePlayerHostingView = youtubeHostingView ?? {
+            let view = YouTubePlayerHostingView(player: player)
+            view.backgroundColor = .clear
+            view.isOpaque = false
+            view.layer.cornerRadius = 12.0
+            view.layer.masksToBounds = true
+            view.isHidden = true
+            addSubview(view)
+            youtubeHostingView = view
+            return view
+        }()
+
+        youtubeCardTarget = card
+        youtubeCardFrame = frame
+
+        hostingView.isHidden = false
+
+        youtubeLoadedVideoID = nil
+        youtubeLastErrorSummary = nil
+        setYouTubeVideo(videoID: videoID)
+        updateYouTubeOverlay()
+        #else
+        let webView: WKWebView = youtubeWebView ?? {
+            let configuration = WKWebViewConfiguration()
+            configuration.allowsInlineMediaPlayback = true
+            configuration.allowsPictureInPictureMediaPlayback = false
+            configuration.mediaTypesRequiringUserActionForPlayback = []
+            if #available(iOS 14.0, *) {
+                configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+            } else {
+                configuration.preferences.javaScriptEnabled = true
+            }
+
+            let webView = WKWebView(frame: .zero, configuration: configuration)
+            webView.isOpaque = false
+            webView.backgroundColor = .clear
+            webView.scrollView.isScrollEnabled = false
+            webView.scrollView.bounces = false
+            webView.layer.cornerRadius = 12.0
+            webView.layer.masksToBounds = true
+            return webView
+        }()
+
+        if webView.superview == nil {
+            addSubview(webView)
+        }
+
+        youtubeWebView = webView
+        youtubeCardTarget = card
+        youtubeCardFrame = frame
+
+        youtubeLoadedVideoID = nil
+        setYouTubeVideo(videoID: videoID)
+        updateYouTubeOverlay()
+        #endif
+    }
+
+    #if canImport(YouTubePlayerKit)
+    private func preferredYouTubeEmbedOriginURL() -> URL? {
+        if let bundleID = Bundle.main.bundleIdentifier?.lowercased(), !bundleID.isEmpty {
+            // Use a stable-looking https origin with a real TLD to satisfy embed identity checks.
+            // Bundle IDs aren't valid TLDs; convert to a single DNS label and append `.app`.
+            let label = bundleID
+                .replacingOccurrences(of: ".", with: "-")
+                .replacingOccurrences(of: "_", with: "-")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+
+            if !label.isEmpty {
+                return URL(string: "https://\(label).app")
+            }
+        }
+        return URL(string: "https://example.com")
+    }
+
+    private func preferredYouTubeUserAgentString() -> String? {
+        // YouTube sometimes blocks playback in "webview" user agents. Provide a Safari-like UA.
+        #if targetEnvironment(macCatalyst)
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        #else
+        return "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        #endif
+    }
+    #endif
+
+    private func deactivateYouTubeOverlay() {
+        youtubeCardTarget = nil
+        youtubeCardFrame = nil
+        youtubeLoadedVideoID = nil
+        youtubeOverlayLastCenter = nil
+        youtubeOverlayLastSize = nil
+        youtubeOverlayLastRotation = nil
+        #if canImport(YouTubePlayerKit)
+        youtubePendingVideoID = nil
+        youtubeHostingView?.isHidden = true
+        if let player = youtubePlayer {
+            Task { [weak player] in
+                try? await player?.pause()
+            }
+        }
+        #else
+        youtubeWebView?.stopLoading()
+        youtubeWebView?.removeFromSuperview()
+        #endif
+    }
+
+    private func setYouTubeVideo(videoID: String) {
+        guard !videoID.isEmpty else { return }
+        guard youtubeLoadedVideoID != videoID else { return }
+        youtubeLoadedVideoID = videoID
+
+        #if canImport(YouTubePlayerKit)
+        guard let player = youtubePlayer else { return }
+
+        let currentID = player.source?.videoID
+        if currentID == videoID {
+            return
+        }
+
+        if case .ready = player.state {
+            Task { [weak player] in
+                guard let player else { return }
+                try? await player.load(source: .video(id: videoID))
+            }
+        } else {
+            youtubePendingVideoID = videoID
+        }
+        #else
+        guard let webView = youtubeWebView else { return }
+
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "www.youtube-nocookie.com"
+        components.path = "/embed/\(videoID)"
+        components.queryItems = [
+            URLQueryItem(name: "playsinline", value: "1"),
+            URLQueryItem(name: "controls", value: "1"),
+            URLQueryItem(name: "fs", value: "0"),
+            URLQueryItem(name: "rel", value: "0"),
+            URLQueryItem(name: "modestbranding", value: "1"),
+        ]
+
+        guard let url = components.url else { return }
+        webView.load(URLRequest(url: url))
+        #endif
+    }
+
+    func deactivateYouTubeOverlayIfTarget(card: Card) {
+        if youtubeCardTarget === card {
+            deactivateYouTubeOverlay()
+        }
+    }
+
     private func beginEditingSectionName(section: Section, frame: Frame) {
         guard let coord = coordinator else { return }
 
@@ -1248,18 +1624,17 @@ private class DragContext {
         hideLinkMenu()
     }
 
-	    @objc private func createSectionMenuItem(_ sender: Any?) {
-	        guard let coord = coordinator else { return }
-	        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
+		    @objc private func createSectionMenuItem(_ sender: Any?) {
+		        guard let coord = coordinator else { return }
+		        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
 
-	        _ = selection
-	        hideLassoSectionMenu()
+		        _ = selection
+		        hideLassoSectionMenu()
 
-	        let defaultName = "Untitled"
-	        let randomColor = Self.sectionColorPalette.randomElement()?.color ?? SIMD4<Float>(1.0, 0.90, 0.20, 1.0)
-	        coord.createSectionFromLasso(name: defaultName, color: randomColor)
-	        ignoreTapsUntilTime = CACurrentMediaTime() + 0.25
-	    }
+		        let randomColor = Self.sectionColorPalette.randomElement()?.color ?? SIMD4<Float>(1.0, 0.90, 0.20, 1.0)
+		        coord.createSectionFromLasso(name: "", color: randomColor)
+		        ignoreTapsUntilTime = CACurrentMediaTime() + 0.25
+		    }
 
     private func showSectionColorMenuIfNeeded(section: Section, anchorRect: CGRect) {
         guard !isPresentingLinkPrompt else { return }
@@ -1546,7 +1921,7 @@ private class DragContext {
     // MARK: - Gesture Handlers
 
     ///  MODAL INPUT: TAP (Finger Only - Select/Deselect Cards)
-	    @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+    @objc func handleTap(_ gesture: UITapGestureRecognizer) {
 	        if CACurrentMediaTime() < ignoreTapsUntilTime {
 	            return
 	        }
@@ -1614,8 +1989,16 @@ private class DragContext {
 
         // Use the new hierarchical hit test to find cards at any depth
         if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
-            // Toggle Edit on the card (wherever it lives - parent, active, or child)
-            result.card.isEditing.toggle()
+            if case .youtube = result.card.type {
+                if result.card.isEditing {
+                    toggleYouTubeOverlay(card: result.card, frame: result.frame)
+                } else {
+                    result.card.isEditing = true
+                }
+            } else {
+                // Toggle Edit on the card (wherever it lives - parent, active, or child)
+                result.card.isEditing.toggle()
+            }
             return
         }
 
@@ -1732,9 +2115,31 @@ private class DragContext {
                     let localDx = frameDelta.x * cardC + frameDelta.y * cardS
                     let localDy = -frameDelta.x * cardS + frameDelta.y * cardC
 
+                    let minCardSize: Double = 10.0
+
                     // Size changes by the desired corner movement
-                    let newSizeX = max(context.card.size.x + localDx, 10.0)
-                    let newSizeY = max(context.card.size.y + localDy, 10.0)
+                    var newSizeX = max(context.card.size.x + localDx, minCardSize)
+                    var newSizeY = max(context.card.size.y + localDy, minCardSize)
+
+                    // Lock aspect ratio for YouTube embed cards.
+                    if case .youtube(_, let aspectRatio) = context.card.type,
+                       aspectRatio.isFinite, aspectRatio > 0 {
+                        let proposedWidthFromDx = context.card.size.x + localDx
+                        let proposedWidthFromDy = context.card.size.x + localDy * aspectRatio
+                        let widthCandidate = abs(localDx) >= abs(localDy * aspectRatio)
+                            ? proposedWidthFromDx
+                            : proposedWidthFromDy
+
+                        var lockedWidth = max(widthCandidate, minCardSize)
+                        var lockedHeight = lockedWidth / aspectRatio
+                        if lockedHeight < minCardSize {
+                            lockedHeight = minCardSize
+                            lockedWidth = lockedHeight * aspectRatio
+                        }
+
+                        newSizeX = lockedWidth
+                        newSizeY = lockedHeight
+                    }
 
                     // Calculate actual size change (accounting for minimum size clamping)
                     let deltaX = newSizeX - context.card.size.x
@@ -2245,6 +2650,20 @@ extension TouchableMTKView: UIGestureRecognizerDelegate {
         if let field = cardNameTextField, field.frame.contains(loc) {
             return false
         }
+        #if canImport(YouTubePlayerKit)
+        if let view = youtubeHostingView,
+           !view.isHidden,
+           view.frame.contains(loc) {
+            return false
+        }
+        #else
+        if let webView = youtubeWebView,
+           webView.superview != nil,
+           !webView.isHidden,
+           webView.frame.contains(loc) {
+            return false
+        }
+        #endif
         return true
     }
 }

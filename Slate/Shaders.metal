@@ -31,6 +31,8 @@ struct BatchedStrokeTransform {
     float screenHeight;
     float rotationAngle;
     float featherPx;
+    float depthBias;
+    float depthScale;
 };
 
 /// Per-segment instance data for batched SDF segments.
@@ -197,9 +199,10 @@ vertex BatchedSegmentOut vertex_segment_sdf_batched(
 
     float ndcX = (screenPos.x / t->screenWidth) * 2.0;
     float ndcY = -(screenPos.y / t->screenHeight) * 2.0;
+    float depth = t->depthBias + seg.params.y * t->depthScale;
 
     BatchedSegmentOut out;
-    out.position = float4(ndcX, ndcY, seg.params.y, 1.0);
+    out.position = float4(ndcX, ndcY, depth, 1.0);
     out.fragScreen = screenPos;
     out.p0Screen = p0;
     out.p1Screen = p1;

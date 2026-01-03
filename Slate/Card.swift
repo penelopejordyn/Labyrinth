@@ -16,6 +16,7 @@ enum CardType {
     case image(MTLTexture)        // User photos
     case lined(LinedBackgroundConfig) // Procedural Lines
     case grid(LinedBackgroundConfig)  // Procedural Grid
+    case youtube(videoID: String, aspectRatio: Double) // Embedded YouTube video (rendered via overlay)
     case drawing([Stroke])        // Future: Mini-canvas inside the card
 }
 
@@ -69,12 +70,15 @@ class Card: Identifiable {
     }
 
     private var cachedImageSampleColor: SIMD4<Float>?
+    var youtubeThumbnailTexture: MTLTexture?
+    var youtubeThumbnailVideoID: String?
 
     // MARK: - Interaction State
     // When true, the card is selected and can be dragged with finger
     // When false, finger touches pass through to canvas pan
     var isEditing: Bool = false
     var isLocked: Bool = false
+    var isHidden: Bool = false
 
     // MARK: - Card-Local Strokes
     // Strokes drawn on this card are stored relative to the card's center (0,0)
@@ -101,7 +105,8 @@ class Card: Identifiable {
          type: CardType,
          backgroundColor: SIMD4<Float>? = nil,
          opacity: Float = 1.0,
-         isLocked: Bool = false) {
+         isLocked: Bool = false,
+         isHidden: Bool = false) {
         self.id = id
         self.name = name
         self.sectionID = sectionID
@@ -112,6 +117,7 @@ class Card: Identifiable {
         self.type = type
         self.opacity = opacity
         self.isLocked = isLocked
+        self.isHidden = isHidden
         if let backgroundColor = backgroundColor {
             self.backgroundColor = backgroundColor
         } else if case .solidColor(let color) = type {
@@ -311,6 +317,8 @@ extension Card {
             } else {
                 content = .solid(color: [1, 0, 1, 1])
             }
+        case .youtube(let videoID, let aspectRatio):
+            content = .youtube(videoID: videoID, aspectRatio: aspectRatio)
         case .drawing:
             content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
         }
@@ -327,7 +335,8 @@ extension Card {
             strokes: strokes.map { $0.toDTO() },
             backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w],
             opacity: opacity,
-            isLocked: isLocked
+            isLocked: isLocked,
+            isHidden: isHidden
         )
     }
 

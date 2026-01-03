@@ -16,6 +16,7 @@ struct CardSettingsView: View {
     @State private var isLocked: Bool = false
     @State private var showImagePicker = false
     @State private var uiImage: UIImage?
+    @State private var youtubeURL: String = ""
     @Environment(\.dismiss) var dismiss
 
     init(card: Card, onDelete: (() -> Void)? = nil) {
@@ -53,6 +54,7 @@ struct CardSettingsView: View {
                         Text("Lined").tag(1)
                         Text("Grid").tag(2)
                         Text("Image").tag(3)
+                        Text("YouTube").tag(4)
                     }
                     .pickerStyle(.segmented)
                     .padding()
@@ -180,6 +182,24 @@ struct CardSettingsView: View {
                             }
                         }
                         .padding(.horizontal)
+                    } else if selectedTab == 4 {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("YouTube Link")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+
+                            TextField("Paste a YouTube URL", text: $youtubeURL)
+                                .textFieldStyle(.roundedBorder)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .keyboardType(.URL)
+
+                            Button("Set YouTube Video") {
+                                applyYouTubeLink(youtubeURL)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.horizontal)
                     }
 
                     Spacer(minLength: 20)
@@ -247,6 +267,9 @@ struct CardSettingsView: View {
                 lineColor = colorFromSIMD(config.color)
             case .image:
                 selectedTab = 3
+            case .youtube(let videoID, _):
+                selectedTab = 4
+                youtubeURL = videoID
             case .drawing:
                 selectedTab = 0 // Default to solid for now
             }
@@ -276,6 +299,8 @@ struct CardSettingsView: View {
         case 3: // Image
             // Will be handled in Phase 4
             break
+        case 4: // YouTube
+            card.type = .youtube(videoID: "", aspectRatio: 16.0 / 9.0)
         default:
             break
         }
@@ -307,5 +332,65 @@ struct CardSettingsView: View {
               green: Double(color.y),
               blue: Double(color.z),
               opacity: Double(color.w))
+    }
+
+    private func applyYouTubeLink(_ input: String) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let info = parseYouTubeVideoInfo(from: trimmed) else { return }
+
+        card.type = .youtube(videoID: info.videoID, aspectRatio: info.aspectRatio)
+
+        if info.aspectRatio.isFinite, info.aspectRatio > 0 {
+            let newHeight = card.size.x / info.aspectRatio
+            if newHeight.isFinite, newHeight > 0 {
+                card.size.y = newHeight
+            }
+        }
+        card.rebuildGeometry()
+    }
+
+    private func parseYouTubeVideoInfo(from input: String) -> (videoID: String, aspectRatio: Double)? {
+        guard !input.isEmpty else { return nil }
+
+        if !input.contains("://"),
+           input.range(of: #"^[A-Za-z0-9_-]{6,}$"#, options: .regularExpression) != nil {
+            return (videoID: input, aspectRatio: 16.0 / 9.0)
+        }
+
+        guard let url = URL(string: input),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+
+        let host = (components.host ?? "").lowercased()
+        let path = components.path
+
+        if host.contains("youtube.com") || host.contains("youtube-nocookie.com") {
+            if let v = components.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return (videoID: v, aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if host.contains("youtu.be") {
+            let parts = path.split(separator: "/")
+            if let first = parts.first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if let range = path.range(of: "/embed/") {
+            let rest = path[range.upperBound...]
+            if let first = rest.split(separator: "/").first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if let range = path.range(of: "/shorts/") {
+            let rest = path[range.upperBound...]
+            if let first = rest.split(separator: "/").first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 9.0 / 16.0)
+            }
+        }
+
+        return nil
     }
 }

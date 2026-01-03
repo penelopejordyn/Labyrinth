@@ -20,7 +20,11 @@ class Stroke: Identifiable {
     let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
     let depthID: UInt32                // Global draw order for depth testing (larger = newer)
     var depthWriteEnabled: Bool         // Allows disabling depth writes for specific strokes (e.g. translucent markers)
+    var layerID: UUID?                 // Optional Layer membership (nil = default layer)
     var sectionID: UUID?              // Optional Section membership (nil = belongs to frame)
+    /// When true, this (mask eraser) stroke is rendered in every layer pass (so it can erase across layers)
+    /// without duplicating geometry per layer.
+    var maskAppliesToAllLayers: Bool
     var link: String?                  // Optional URL string attached to this stroke (linking feature)
     var linkSectionID: UUID?           // Groups multiple strokes into one highlight section (separate boxes even for same URL)
     var linkTargetSectionID: UUID?     // Optional internal link target (Section)
@@ -51,7 +55,9 @@ class Stroke: Identifiable {
          device: MTLDevice?,
          depthID: UInt32,
          depthWriteEnabled: Bool = true,
+         layerID: UUID? = nil,
          sectionID: UUID? = nil,
+         maskAppliesToAllLayers: Bool = false,
          link: String? = nil,
          linkSectionID: UUID? = nil,
          linkTargetSectionID: UUID? = nil,
@@ -63,7 +69,9 @@ class Stroke: Identifiable {
         self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
         self.depthID = depthID
         self.depthWriteEnabled = depthWriteEnabled
+        self.layerID = layerID
         self.sectionID = sectionID
+        self.maskAppliesToAllLayers = maskAppliesToAllLayers
         self.link = link
         self.linkSectionID = linkSectionID
         self.linkTargetSectionID = linkTargetSectionID
@@ -325,6 +333,8 @@ extension Stroke {
             zoomCreation: safeFloat(zoomEffectiveAtCreation, fallback: 1),
             depthID: depthID,
             depthWrite: depthWriteEnabled,
+            maskAppliesToAllLayers: maskAppliesToAllLayers,
+            layerID: layerID,
             link: link,
             linkSectionID: linkSectionID,
             linkTargetSectionID: linkTargetSectionID,
@@ -366,7 +376,9 @@ extension Stroke {
             device: device,
             depthID: dto.depthID,
             depthWriteEnabled: dto.depthWrite,
+            layerID: dto.layerID,
             sectionID: dto.sectionID,
+            maskAppliesToAllLayers: dto.maskAppliesToAllLayers ?? false,
             link: dto.link,
             linkSectionID: dto.linkSectionID,
             linkTargetSectionID: dto.linkTargetSectionID,

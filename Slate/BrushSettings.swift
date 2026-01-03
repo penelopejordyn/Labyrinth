@@ -20,6 +20,9 @@ class BrushSettings: ObservableObject {
     @Published var cullingMultiplier: Double = 1.0  // Test multiplier for culling box size (1.0, 0.5, 0.25)
     @Published var depthWriteEnabled: Bool = true  // Set false for strokes that should not write depth (e.g. translucent marker)
     @Published var constantScreenSize: Bool = true  // When true, stroke width is divided by zoom to stay constant on screen; when false, stroke scales with zoom
+    /// When true, selection + eraser tools can hit strokes across all layers (and cards);
+    /// when false, they only operate on the current selected layer.
+    @Published var hitTestAllLayers: Bool = false
 
     static let minSize: Double = 5.0
     static let maxSize: Double = 1000.0

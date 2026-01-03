@@ -10,13 +10,26 @@ final class PersistenceManager {
     struct ImportedCanvas {
         let rootFrame: Frame
         let fractalFrameExtent: SIMD2<Double>
+        let layers: [CanvasLayer]?
+        let zOrder: [CanvasZItem]?
+        let selectedLayerID: UUID?
     }
 
-    func exportCanvas(rootFrame: Frame, fractalFrameExtent: SIMD2<Double>) -> Data? {
+    func exportCanvas(rootFrame: Frame,
+                      fractalFrameExtent: SIMD2<Double>,
+                      layers: [CanvasLayer]? = nil,
+                      zOrder: [CanvasZItem]? = nil,
+                      selectedLayerID: UUID? = nil) -> Data? {
         let topFrame = topmostFrame(from: rootFrame)
         let dto = topFrame.toDTOv2()
         let config = FractalSaveConfigDTO(frameExtent: fractalFrameExtent)
-        let saveData = CanvasSaveDataV2(timestamp: Date(), fractal: config, rootFrame: dto, version: 4)
+        let saveData = CanvasSaveDataV2(timestamp: Date(),
+                                        fractal: config,
+                                        rootFrame: dto,
+                                        version: 5,
+                                        layers: layers,
+                                        zOrder: zOrder,
+                                        selectedLayerID: selectedLayerID)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -41,10 +54,14 @@ final class PersistenceManager {
             let version = header?.version ?? 0
 
             switch version {
-            case 2, 3, 4:
+            case 2, 3, 4, 5:
                 let saveData = try decoder.decode(CanvasSaveDataV2.self, from: data)
                 let root = restoreFrame(from: saveData.rootFrame, parent: nil, indexInParent: nil, device: device)
-                return ImportedCanvas(rootFrame: root, fractalFrameExtent: saveData.fractal.toExtent())
+                return ImportedCanvas(rootFrame: root,
+                                      fractalFrameExtent: saveData.fractal.toExtent(),
+                                      layers: saveData.layers,
+                                      zOrder: saveData.zOrder,
+                                      selectedLayerID: saveData.selectedLayerID)
             default:
                 // Legacy v1 normalization (telescoping → fractal) has been removed.
                 // Only v2+ fractal saves are supported.
@@ -82,7 +99,8 @@ final class PersistenceManager {
                 type: type,
                 backgroundColor: background,
                 opacity: cardDto.opacity ?? 1.0,
-                isLocked: cardDto.isLocked ?? false
+                isLocked: cardDto.isLocked ?? false,
+                isHidden: cardDto.isHidden ?? false
             )
             card.strokes = cardDto.strokes.map { Stroke(dto: $0, device: device) }
             return card
@@ -141,6 +159,8 @@ final class PersistenceManager {
                 return .image(texture)
             }
             return .solidColor(SIMD4<Float>(1, 0, 1, 1))
+        case .youtube(let videoID, let aspectRatio):
+            return .youtube(videoID: videoID, aspectRatio: aspectRatio)
         }
     }
 
