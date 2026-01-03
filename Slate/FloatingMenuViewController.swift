@@ -446,6 +446,10 @@ final class CardSettingsFloatingMenu: UIViewController {
     private var backgroundColorWell: UIColorWell?
     private var lineColorWell: UIColorWell?
     private var imageSettingsStack: UIStackView!
+    private var youtubeSettingsStack: UIStackView!
+    private var youtubeURLField: UITextField!
+    private var youtubeErrorLabel: UILabel!
+    private var youtubeInputText: String = ""
 
     private var lineColor: SIMD4<Float> = SIMD4<Float>(0.7, 0.8, 1.0, 0.5)
 
@@ -522,6 +526,9 @@ final class CardSettingsFloatingMenu: UIViewController {
             lineColor = config.color
         case .image:
             selectedTab = 3
+        case .youtube(let videoID, _):
+            selectedTab = 4
+            youtubeInputText = videoID
         case .drawing:
             selectedTab = 0
         }
@@ -706,8 +713,8 @@ final class CardSettingsFloatingMenu: UIViewController {
         mainStack.addArrangedSubview(colorGrid)
 
         // Type segment
-        typeSegment = UISegmentedControl(items: ["Solid", "Lined", "Grid", "Image"])
-        typeSegment.selectedSegmentIndex = min(selectedTab, 3)
+        typeSegment = UISegmentedControl(items: ["Solid", "Lined", "Grid", "Image", "YouTube"])
+        typeSegment.selectedSegmentIndex = min(selectedTab, 4)
         typeSegment.addTarget(self, action: #selector(typeChanged(_:)), for: .valueChanged)
         mainStack.addArrangedSubview(typeSegment)
 
@@ -715,7 +722,7 @@ final class CardSettingsFloatingMenu: UIViewController {
         lineSettingsStack = UIStackView()
         lineSettingsStack.axis = .vertical
         lineSettingsStack.spacing = 12
-        lineSettingsStack.isHidden = selectedTab == 0 || selectedTab == 3
+        lineSettingsStack.isHidden = !(selectedTab == 1 || selectedTab == 2)
 
         // Spacing
         let spacingStack = UIStackView()
@@ -806,6 +813,75 @@ final class CardSettingsFloatingMenu: UIViewController {
         }
         imageSettingsStack.addArrangedSubview(pickImageButton)
         mainStack.addArrangedSubview(imageSettingsStack)
+
+        // YouTube settings (only shown for YouTube)
+        youtubeSettingsStack = UIStackView()
+        youtubeSettingsStack.axis = .vertical
+        youtubeSettingsStack.spacing = 8
+        youtubeSettingsStack.isHidden = selectedTab != 4
+
+        let youtubeLabel = UILabel()
+        youtubeLabel.text = "YouTube Link"
+        youtubeLabel.font = .systemFont(ofSize: 13)
+        youtubeLabel.textColor = .secondaryLabel
+        youtubeSettingsStack.addArrangedSubview(youtubeLabel)
+
+        youtubeURLField = UITextField()
+        youtubeURLField.placeholder = "Paste a YouTube URL"
+        youtubeURLField.text = youtubeInputText.isEmpty ? nil : youtubeInputText
+        youtubeURLField.font = .systemFont(ofSize: 13)
+        youtubeURLField.textColor = .white
+        youtubeURLField.tintColor = .white
+        youtubeURLField.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        youtubeURLField.layer.cornerRadius = 10
+        youtubeURLField.layer.masksToBounds = true
+        youtubeURLField.layer.borderWidth = 1
+        youtubeURLField.layer.borderColor = UIColor.white.withAlphaComponent(0.14).cgColor
+        youtubeURLField.autocapitalizationType = .none
+        youtubeURLField.autocorrectionType = .no
+        youtubeURLField.keyboardType = .URL
+        youtubeURLField.returnKeyType = .done
+        youtubeURLField.clearButtonMode = .whileEditing
+        youtubeURLField.delegate = self
+
+        let padX: CGFloat = 10.0
+        youtubeURLField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+        youtubeURLField.leftViewMode = .always
+        youtubeURLField.rightView = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+        youtubeURLField.rightViewMode = .always
+
+        youtubeSettingsStack.addArrangedSubview(youtubeURLField)
+
+        let youtubeButtons = UIStackView()
+        youtubeButtons.axis = .horizontal
+        youtubeButtons.spacing = 8
+        youtubeButtons.distribution = .fillEqually
+
+        let pasteButton = makeCompactButton(title: "Paste", systemImage: "doc.on.clipboard") { [weak self] in
+            guard let self else { return }
+            self.youtubeErrorLabel.isHidden = true
+            if let text = UIPasteboard.general.string, !text.isEmpty {
+                self.youtubeURLField.text = text
+            }
+        }
+
+        let setButton = makeCompactButton(title: "Set", systemImage: "checkmark") { [weak self] in
+            self?.applyYouTubeFromField()
+        }
+
+        youtubeButtons.addArrangedSubview(pasteButton)
+        youtubeButtons.addArrangedSubview(setButton)
+        youtubeSettingsStack.addArrangedSubview(youtubeButtons)
+
+        youtubeErrorLabel = UILabel()
+        youtubeErrorLabel.text = "Invalid YouTube link"
+        youtubeErrorLabel.font = .systemFont(ofSize: 12)
+        youtubeErrorLabel.textColor = .systemRed
+        youtubeErrorLabel.numberOfLines = 0
+        youtubeErrorLabel.isHidden = true
+        youtubeSettingsStack.addArrangedSubview(youtubeErrorLabel)
+
+        mainStack.addArrangedSubview(youtubeSettingsStack)
 
         // Opacity
         let opacityStack = UIStackView()
@@ -936,9 +1012,150 @@ final class CardSettingsFloatingMenu: UIViewController {
             card.type = .grid(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: lineColor))
         case 3:
             break
+        case 4:
+            break
         default:
             break
         }
+    }
+
+    private func makeCompactButton(title: String, systemImage: String, action: @escaping () -> Void) -> UIButton {
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.image = UIImage(systemName: systemImage)
+        config.imagePadding = 6
+        config.baseBackgroundColor = UIColor.white.withAlphaComponent(0.12)
+        config.baseForegroundColor = .white
+        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+
+        let button = UIButton(configuration: config)
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        return button
+    }
+
+    private func applyYouTubeFromField() {
+        youtubeURLField.resignFirstResponder()
+        youtubeErrorLabel.isHidden = true
+
+        let text = youtubeURLField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let info = parseYouTubeVideoInfo(from: text) else {
+            youtubeErrorLabel.isHidden = false
+            return
+        }
+
+        let videoID = info.videoID
+        let aspect = info.aspectRatio
+
+        var shouldClearThumbnail = true
+        if case .youtube(let existingID, _) = card.type, existingID == videoID {
+            shouldClearThumbnail = false
+        }
+
+        card.type = .youtube(videoID: videoID, aspectRatio: aspect)
+
+        if shouldClearThumbnail {
+            card.youtubeThumbnailTexture = nil
+            card.youtubeThumbnailVideoID = nil
+        }
+
+        if aspect.isFinite, aspect > 0 {
+            let newHeight = card.size.x / aspect
+            if newHeight.isFinite, newHeight > 0 {
+                card.size.y = newHeight
+            }
+        }
+        card.rebuildGeometry()
+
+        fetchYouTubeThumbnail(videoID: videoID)
+    }
+
+    private func parseYouTubeVideoInfo(from input: String) -> (videoID: String, aspectRatio: Double)? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let raw = trimmed
+
+        // Allow pasting a bare video ID.
+        if !raw.contains("://"),
+           raw.range(of: #"^[A-Za-z0-9_-]{6,}$"#, options: .regularExpression) != nil {
+            return (videoID: raw, aspectRatio: 16.0 / 9.0)
+        }
+
+        guard let url = URL(string: raw) else { return nil }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+
+        let host = (components.host ?? "").lowercased()
+        let path = components.path
+
+        // https://www.youtube.com/watch?v=VIDEOID
+        if host.contains("youtube.com") || host.contains("youtube-nocookie.com") {
+            if let v = components.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return (videoID: v, aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        // https://youtu.be/VIDEOID
+        if host.contains("youtu.be") {
+            let parts = path.split(separator: "/")
+            if let first = parts.first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        // https://www.youtube.com/embed/VIDEOID
+        if let range = path.range(of: "/embed/") {
+            let rest = path[range.upperBound...]
+            let parts = rest.split(separator: "/")
+            if let first = parts.first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        // https://www.youtube.com/shorts/VIDEOID
+        if let range = path.range(of: "/shorts/") {
+            let rest = path[range.upperBound...]
+            let parts = rest.split(separator: "/")
+            if let first = parts.first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 9.0 / 16.0)
+            }
+        }
+
+        return nil
+    }
+
+    private func fetchYouTubeThumbnail(videoID: String) {
+        guard !videoID.isEmpty else { return }
+
+        let urlString = "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg"
+        guard let url = URL(string: urlString) else { return }
+
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self else { return }
+            guard let data, let image = UIImage(data: data), let cgImg = image.cgImage else { return }
+            guard let device = MTLCreateSystemDefaultDevice() else { return }
+            let loader = MTKTextureLoader(device: device)
+
+            let texture: MTLTexture?
+            do {
+                texture = try loader.newTexture(
+                    cgImage: cgImg,
+                    options: [
+                        .origin: MTKTextureLoader.Origin.bottomLeft,
+                        .SRGB: false
+                    ]
+                )
+            } catch {
+                return
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard case .youtube(let currentID, _) = self.card.type, currentID == videoID else { return }
+                self.card.youtubeThumbnailTexture = texture
+                self.card.youtubeThumbnailVideoID = videoID
+            }
+        }.resume()
     }
 
     private func applySelectedImage(_ image: UIImage) {
@@ -1026,8 +1243,15 @@ final class CardSettingsFloatingMenu: UIViewController {
 
     @objc private func typeChanged(_ sender: UISegmentedControl) {
         selectedTab = sender.selectedSegmentIndex
-        lineSettingsStack.isHidden = selectedTab == 0 || selectedTab == 3
+        lineSettingsStack.isHidden = !(selectedTab == 1 || selectedTab == 2)
         imageSettingsStack.isHidden = selectedTab != 3
+        youtubeSettingsStack.isHidden = selectedTab != 4
+        if selectedTab == 4, case .youtube = card.type {
+            // Keep existing YouTube card state.
+        } else if selectedTab == 4 {
+            card.type = .youtube(videoID: "", aspectRatio: 16.0 / 9.0)
+            card.rebuildGeometry()
+        }
         updateCardType()
     }
 
@@ -1063,6 +1287,16 @@ extension CardSettingsFloatingMenu: UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         let location = touch.location(in: containerView)
         return !containerView.bounds.contains(location)
+    }
+}
+
+extension CardSettingsFloatingMenu: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === youtubeURLField {
+            applyYouTubeFromField()
+            return false
+        }
+        return true
     }
 }
 
