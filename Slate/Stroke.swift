@@ -20,15 +20,29 @@ class Stroke: Identifiable {
     let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
     let depthID: UInt32                // Global draw order for depth testing (larger = newer)
     var depthWriteEnabled: Bool         // Allows disabling depth writes for specific strokes (e.g. translucent markers)
+    var layerID: UUID?                 // Optional Layer membership (nil = default layer)
+    var sectionID: UUID?              // Optional Section membership (nil = belongs to frame)
+    /// When true, this (mask eraser) stroke is rendered in every layer pass (so it can erase across layers)
+    /// without duplicating geometry per layer.
+    var maskAppliesToAllLayers: Bool
+    var link: String?                  // Optional URL string attached to this stroke (linking feature)
+    var linkSectionID: UUID?           // Groups multiple strokes into one highlight section (separate boxes even for same URL)
+    var linkTargetSectionID: UUID?     // Optional internal link target (Section)
+    var linkTargetCardID: UUID?        // Optional internal link target (Card)
 
     /// GPU segment instances for SDF rendering
     let segments: [StrokeSegmentInstance]
     var segmentBuffer: MTLBuffer?
 
+    /// Cached batched segment instances in frame/world coordinates (for single-draw batching).
+    let batchedSegments: [BatchedStrokeSegmentInstance]
+
     /// Bounding box in local space for culling
     var localBounds: CGRect = .zero
     /// Optional duplicate for future BVH/tiling
     var segmentBounds: CGRect = .zero
+    /// Cached radius (world units) from origin to farthest stroke bounds (includes stroke radius).
+    let cullingRadiusWorld: Double
 
     init(id: UUID = UUID(),
          origin: SIMD2<Double>,
@@ -40,7 +54,14 @@ class Stroke: Identifiable {
          segmentBounds: CGRect? = nil,
          device: MTLDevice?,
          depthID: UInt32,
-         depthWriteEnabled: Bool = true) {
+         depthWriteEnabled: Bool = true,
+         layerID: UUID? = nil,
+         sectionID: UUID? = nil,
+         maskAppliesToAllLayers: Bool = false,
+         link: String? = nil,
+         linkSectionID: UUID? = nil,
+         linkTargetSectionID: UUID? = nil,
+         linkTargetCardID: UUID? = nil) {
         self.id = id
         self.origin = origin
         self.worldWidth = worldWidth
@@ -48,9 +69,43 @@ class Stroke: Identifiable {
         self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
         self.depthID = depthID
         self.depthWriteEnabled = depthWriteEnabled
+        self.layerID = layerID
+        self.sectionID = sectionID
+        self.maskAppliesToAllLayers = maskAppliesToAllLayers
+        self.link = link
+        self.linkSectionID = linkSectionID
+        self.linkTargetSectionID = linkTargetSectionID
+        self.linkTargetCardID = linkTargetCardID
         self.segments = segments
         self.localBounds = localBounds
         self.segmentBounds = segmentBounds ?? localBounds
+
+        if localBounds == .null {
+            self.cullingRadiusWorld = 0
+        } else {
+            let farX = max(abs(localBounds.minX), abs(localBounds.maxX))
+            let farY = max(abs(localBounds.minY), abs(localBounds.maxY))
+            self.cullingRadiusWorld = hypot(farX, farY)
+        }
+
+        if segments.isEmpty {
+            self.batchedSegments = []
+        } else {
+            let originF = SIMD2<Float>(Float(origin.x), Float(origin.y))
+            let params = SIMD2<Float>(Float(worldWidth), StrokeDepth.metalDepth(for: depthID))
+
+            var batched: [BatchedStrokeSegmentInstance] = []
+            batched.reserveCapacity(segments.count)
+            for seg in segments {
+                batched.append(BatchedStrokeSegmentInstance(
+                    p0World: originF + seg.p0,
+                    p1World: originF + seg.p1,
+                    color: seg.color,
+                    params: params
+                ))
+            }
+            self.batchedSegments = batched
+        }
 
         if let device = device, !segments.isEmpty {
             self.segmentBuffer = device.makeBuffer(
@@ -278,6 +333,13 @@ extension Stroke {
             zoomCreation: safeFloat(zoomEffectiveAtCreation, fallback: 1),
             depthID: depthID,
             depthWrite: depthWriteEnabled,
+            maskAppliesToAllLayers: maskAppliesToAllLayers,
+            layerID: layerID,
+            link: link,
+            linkSectionID: linkSectionID,
+            linkTargetSectionID: linkTargetSectionID,
+            linkTargetCardID: linkTargetCardID,
+            sectionID: sectionID,
             points: rawPts
         )
     }
@@ -313,7 +375,29 @@ extension Stroke {
             segmentBounds: bounds,
             device: device,
             depthID: dto.depthID,
-            depthWriteEnabled: dto.depthWrite
+            depthWriteEnabled: dto.depthWrite,
+            layerID: dto.layerID,
+            sectionID: dto.sectionID,
+            maskAppliesToAllLayers: dto.maskAppliesToAllLayers ?? false,
+            link: dto.link,
+            linkSectionID: dto.linkSectionID,
+            linkTargetSectionID: dto.linkTargetSectionID,
+            linkTargetCardID: dto.linkTargetCardID
         )
+    }
+}
+
+// MARK: - Linking Helpers
+extension Stroke {
+    var linkURL: URL? {
+        guard let link, !link.isEmpty else { return nil }
+        return URL(string: link)
+    }
+
+    var hasAnyLink: Bool {
+        if let link, !link.isEmpty { return true }
+        if linkTargetSectionID != nil { return true }
+        if linkTargetCardID != nil { return true }
+        return false
     }
 }

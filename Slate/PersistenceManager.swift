@@ -7,10 +7,29 @@ final class PersistenceManager {
 
     private init() {}
 
-    func exportCanvas(rootFrame: Frame) -> Data? {
+    struct ImportedCanvas {
+        let rootFrame: Frame
+        let fractalFrameExtent: SIMD2<Double>
+        let layers: [CanvasLayer]?
+        let zOrder: [CanvasZItem]?
+        let selectedLayerID: UUID?
+    }
+
+    func exportCanvas(rootFrame: Frame,
+                      fractalFrameExtent: SIMD2<Double>,
+                      layers: [CanvasLayer]? = nil,
+                      zOrder: [CanvasZItem]? = nil,
+                      selectedLayerID: UUID? = nil) -> Data? {
         let topFrame = topmostFrame(from: rootFrame)
-        let dto = topFrame.toDTO()
-        let saveData = CanvasSaveData(timestamp: Date(), rootFrame: dto)
+        let dto = topFrame.toDTOv2()
+        let config = FractalSaveConfigDTO(frameExtent: fractalFrameExtent)
+        let saveData = CanvasSaveDataV2(timestamp: Date(),
+                                        fractal: config,
+                                        rootFrame: dto,
+                                        version: 5,
+                                        layers: layers,
+                                        zOrder: zOrder,
+                                        selectedLayerID: selectedLayerID)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -24,27 +43,45 @@ final class PersistenceManager {
         }
     }
 
-    func importCanvas(data: Data, device: MTLDevice) -> Frame? {
+    func importCanvas(data: Data,
+                      device: MTLDevice,
+                      fractalFrameExtent: SIMD2<Double> = .zero) -> ImportedCanvas? {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
 
         do {
-            let saveData = try decoder.decode(CanvasSaveData.self, from: data)
-            return restoreFrame(from: saveData.rootFrame, parent: nil, device: device)
+            let header = (try? decoder.decode(CanvasSaveHeader.self, from: data))
+            let version = header?.version ?? 0
+
+            switch version {
+            case 2, 3, 4, 5:
+                let saveData = try decoder.decode(CanvasSaveDataV2.self, from: data)
+                let root = restoreFrame(from: saveData.rootFrame, parent: nil, indexInParent: nil, device: device)
+                return ImportedCanvas(rootFrame: root,
+                                      fractalFrameExtent: saveData.fractal.toExtent(),
+                                      layers: saveData.layers,
+                                      zOrder: saveData.zOrder,
+                                      selectedLayerID: saveData.selectedLayerID)
+            default:
+                // Legacy v1 normalization (telescoping → fractal) has been removed.
+                // Only v2+ fractal saves are supported.
+                print("Import failed: unsupported save version \(version)")
+                return nil
+            }
         } catch {
             print("Import failed: \(error)")
             return nil
         }
     }
 
-    private func restoreFrame(from dto: FrameDTO, parent: Frame?, device: MTLDevice) -> Frame {
-        let frame = Frame(
-            id: dto.id,
-            parent: parent,
-            origin: double2(dto.originInParent),
-            scale: dto.scaleRelativeToParent,
-            depth: dto.depthFromRoot
-        )
+    private func restoreFrame(from dto: FrameDTOv2,
+                              parent: Frame?,
+                              indexInParent: GridIndex?,
+                              device: MTLDevice) -> Frame {
+        let frame = Frame(id: dto.id,
+                          parent: parent,
+                          indexInParent: indexInParent,
+                          depth: dto.depthFromRoot)
 
         frame.strokes = dto.strokes.map { Stroke(dto: $0, device: device) }
 
@@ -53,6 +90,8 @@ final class PersistenceManager {
             let background = cardBackgroundColor(from: cardDto)
             let card = Card(
                 id: cardDto.id,
+                name: cardDto.name ?? "Untitled",
+                sectionID: cardDto.sectionID,
                 origin: double2(cardDto.origin),
                 size: double2(cardDto.size),
                 rotation: cardDto.rotation,
@@ -60,13 +99,30 @@ final class PersistenceManager {
                 type: type,
                 backgroundColor: background,
                 opacity: cardDto.opacity ?? 1.0,
-                isLocked: cardDto.isLocked ?? false
+                isLocked: cardDto.isLocked ?? false,
+                isHidden: cardDto.isHidden ?? false
             )
             card.strokes = cardDto.strokes.map { Stroke(dto: $0, device: device) }
             return card
         }
 
-        frame.children = dto.children.map { restoreFrame(from: $0, parent: frame, device: device) }
+        let sectionDTOs = dto.sections ?? []
+        frame.sections = sectionDTOs.map { sectionDto in
+            let sectionColor = float4(sectionDto.color)
+            return Section(
+                id: sectionDto.id,
+                name: sectionDto.name,
+                color: sectionColor,
+                fillOpacity: sectionDto.fillOpacity ?? 0.3,
+                polygon: sectionDto.polygon.map { double2($0) }
+            )
+        }
+
+        for child in dto.children {
+            let index = child.index.toGridIndex()
+            let restored = restoreFrame(from: child.frame, parent: frame, indexInParent: index, device: device)
+            frame.children[index] = restored
+        }
         return frame
     }
 
@@ -88,10 +144,23 @@ final class PersistenceManager {
             return .grid(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: float4(color)))
         case .image(let data):
             let loader = MTKTextureLoader(device: device)
-            if let texture = try? loader.newTexture(data: data, options: [.origin: MTKTextureLoader.Origin.bottomLeft]) {
+            // Note: card image textures are stored exactly as the in-memory Metal texture bytes.
+            // Because our card UVs already compensate for the initial image-load vertical flip,
+            // we should NOT apply another origin flip here (or the image will import upside-down).
+            if let texture = try? loader.newTexture(
+                data: data,
+                options: [
+                    .origin: MTKTextureLoader.Origin.topLeft,
+                    // Keep card images in non-sRGB textures since the renderer targets `.bgra8Unorm`.
+                    // Sampling sRGB textures would return linear values and the result would look too dark.
+                    .SRGB: false,
+                ]
+            ) {
                 return .image(texture)
             }
             return .solidColor(SIMD4<Float>(1, 0, 1, 1))
+        case .youtube(let videoID, let aspectRatio):
+            return .youtube(videoID: videoID, aspectRatio: aspectRatio)
         }
     }
 

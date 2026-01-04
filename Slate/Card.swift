@@ -1,6 +1,7 @@
 // Card.swift defines the Card model, covering metadata, stroke contents, and size/transform state.
 import SwiftUI
 import Metal
+import MetalKit
 import UIKit
 
 // Configuration for procedural backgrounds
@@ -15,6 +16,7 @@ enum CardType {
     case image(MTLTexture)        // User photos
     case lined(LinedBackgroundConfig) // Procedural Lines
     case grid(LinedBackgroundConfig)  // Procedural Grid
+    case youtube(videoID: String, aspectRatio: Double) // Embedded YouTube video (rendered via overlay)
     case drawing([Stroke])        // Future: Mini-canvas inside the card
 }
 
@@ -30,13 +32,27 @@ struct CardShaderUniforms {
 class Card: Identifiable {
     let id: UUID
 
+    // MARK: - Identity
+    var name: String {
+        didSet {
+            labelTexture = nil
+            labelWorldSize = .zero
+        }
+    }
+    var sectionID: UUID? // Optional Section membership (nil = belongs to frame)
+
     // MARK: - Physical Properties
     // These are stored in the Parent Frame's coordinate space.
     // They use Double precision to match the Frame's "Local Realism".
     var origin: SIMD2<Double>
     var size: SIMD2<Double>   // Width, Height
     var rotation: Float       // Radians
-    var backgroundColor: SIMD4<Float>
+    var backgroundColor: SIMD4<Float> {
+        didSet {
+            labelTexture = nil
+            labelWorldSize = .zero
+        }
+    }
     var opacity: Float = 1.0  // Card opacity (0.0 - 1.0), applied to entire card including strokes
 
     // MARK: - Creation Context
@@ -54,12 +70,15 @@ class Card: Identifiable {
     }
 
     private var cachedImageSampleColor: SIMD4<Float>?
+    var youtubeThumbnailTexture: MTLTexture?
+    var youtubeThumbnailVideoID: String?
 
     // MARK: - Interaction State
     // When true, the card is selected and can be dragged with finger
     // When false, finger touches pass through to canvas pan
     var isEditing: Bool = false
     var isLocked: Bool = false
+    var isHidden: Bool = false
 
     // MARK: - Card-Local Strokes
     // Strokes drawn on this card are stored relative to the card's center (0,0)
@@ -71,7 +90,14 @@ class Card: Identifiable {
     // This optimization means we don't have to do math every frame.
     var localVertices: [StrokeVertex] = []
 
+    // MARK: - Label Rendering (cached)
+    var labelTexture: MTLTexture?
+    /// Label size in screen points (world units at zoom=1).
+    var labelWorldSize: SIMD2<Double> = .zero
+
     init(id: UUID = UUID(),
+         name: String = "Untitled",
+         sectionID: UUID? = nil,
          origin: SIMD2<Double>,
          size: SIMD2<Double>,
          rotation: Float = 0,
@@ -79,8 +105,11 @@ class Card: Identifiable {
          type: CardType,
          backgroundColor: SIMD4<Float>? = nil,
          opacity: Float = 1.0,
-         isLocked: Bool = false) {
+         isLocked: Bool = false,
+         isHidden: Bool = false) {
         self.id = id
+        self.name = name
+        self.sectionID = sectionID
         self.origin = origin
         self.size = size
         self.rotation = rotation
@@ -88,6 +117,7 @@ class Card: Identifiable {
         self.type = type
         self.opacity = opacity
         self.isLocked = isLocked
+        self.isHidden = isHidden
         if let backgroundColor = backgroundColor {
             self.backgroundColor = backgroundColor
         } else if case .solidColor(let color) = type {
@@ -98,6 +128,62 @@ class Card: Identifiable {
 
         // Generate the geometry immediately
         rebuildGeometry()
+    }
+
+    func ensureLabelTexture(device: MTLDevice) {
+        guard labelTexture == nil else { return }
+
+        let text = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : name
+
+        let bg = UIColor(red: CGFloat(backgroundColor.x),
+                         green: CGFloat(backgroundColor.y),
+                         blue: CGFloat(backgroundColor.z),
+                         alpha: 1.0)
+
+        let font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+        let textColor: UIColor = {
+            // Relative luminance approximation in linear space.
+            let lum = 0.2126 * Double(backgroundColor.x) + 0.7152 * Double(backgroundColor.y) + 0.0722 * Double(backgroundColor.z)
+            return lum > 0.6 ? .black : .white
+        }()
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: textColor
+        ]
+
+        let textSize = (text as NSString).size(withAttributes: attributes)
+        let paddingX: CGFloat = 10.0
+        let paddingY: CGFloat = 6.0
+        let sizePoints = CGSize(width: ceil(textSize.width + paddingX * 2.0),
+                                height: ceil(textSize.height + paddingY * 2.0))
+
+        labelWorldSize = SIMD2<Double>(Double(sizePoints.width), Double(sizePoints.height))
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = UIScreen.main.scale
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: sizePoints, format: format)
+        let image = renderer.image { ctx in
+            bg.setFill()
+            ctx.fill(CGRect(origin: .zero, size: sizePoints))
+
+            let textRect = CGRect(
+                x: paddingX,
+                y: (sizePoints.height - textSize.height) * 0.5,
+                width: textSize.width,
+                height: textSize.height
+            )
+            (text as NSString).draw(in: textRect, withAttributes: attributes)
+        }
+
+        guard let cgImage = image.cgImage else { return }
+        let loader = MTKTextureLoader(device: device)
+        labelTexture = try? loader.newTexture(
+            cgImage: cgImage,
+            options: [MTKTextureLoader.Option.SRGB: false]
+        )
     }
 
     // Call this whenever size changes
@@ -231,12 +317,16 @@ extension Card {
             } else {
                 content = .solid(color: [1, 0, 1, 1])
             }
+        case .youtube(let videoID, let aspectRatio):
+            content = .youtube(videoID: videoID, aspectRatio: aspectRatio)
         case .drawing:
             content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
         }
 
         return CardDTO(
             id: id,
+            name: name,
+            sectionID: sectionID,
             origin: [origin.x, origin.y],
             size: [size.x, size.y],
             rotation: rotation,
@@ -245,7 +335,8 @@ extension Card {
             strokes: strokes.map { $0.toDTO() },
             backgroundColor: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w],
             opacity: opacity,
-            isLocked: isLocked
+            isLocked: isLocked,
+            isHidden: isHidden
         )
     }
 

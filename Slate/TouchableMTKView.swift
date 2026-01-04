@@ -4,6 +4,12 @@ import UIKit
 import MetalKit
 import ObjectiveC.runtime
 import simd
+import Combine
+#if canImport(YouTubePlayerKit)
+import YouTubePlayerKit
+#else
+import WebKit
+#endif
 
 // MARK: - Associated Object Keys for gesture state storage
 private struct AssociatedKeys {
@@ -18,13 +24,15 @@ private struct AssociatedKeys {
 ///   - Child cards: scale > 1.0 (move faster)
 private class DragContext {
     let card: Card
+    let frame: Frame
     let conversionScale: Double
     let isResizing: Bool // True if dragging the handle (resize), false if dragging card body (move)
     let startOrigin: SIMD2<Double>
     let startSize: SIMD2<Double>
 
-    init(card: Card, conversionScale: Double, isResizing: Bool = false) {
+    init(card: Card, frame: Frame, conversionScale: Double, isResizing: Bool = false) {
         self.card = card
+        self.frame = frame
         self.conversionScale = conversionScale
         self.isResizing = isResizing
         self.startOrigin = card.origin
@@ -33,12 +41,34 @@ private class DragContext {
 }
 
 // MARK: - TouchableMTKView
-class TouchableMTKView: MTKView {
-    private var isRunningOnMac: Bool {
-        #if targetEnvironment(macCatalyst)
-        return true
-        #else
-        if #available(iOS 14.0, *) {
+    class TouchableMTKView: MTKView {
+        private struct ColorChoice {
+            let color: SIMD4<Float>
+        }
+
+        private static let sectionColorPalette: [ColorChoice] = [
+            ColorChoice(color: SIMD4<Float>(1.0, 0.25, 0.25, 1.0)),
+            ColorChoice(color: SIMD4<Float>(1.0, 0.55, 0.20, 1.0)),
+            ColorChoice(color: SIMD4<Float>(1.0, 0.90, 0.20, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.25, 0.85, 0.35, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.25, 0.60, 1.0, 1.0)),
+            ColorChoice(color: SIMD4<Float>(0.70, 0.35, 1.0, 1.0))
+        ]
+
+        private static let cardColorPalette: [ColorChoice] = [
+            ColorChoice(color: SIMD4<Float>(1.0, 1.0, 1.0, 1.0)),      // White
+            ColorChoice(color: SIMD4<Float>(0.95, 0.95, 0.90, 1.0)),   // Cream
+            ColorChoice(color: SIMD4<Float>(1.0, 0.95, 0.85, 1.0)),    // Warm
+            ColorChoice(color: SIMD4<Float>(0.85, 0.95, 1.0, 1.0)),    // Cool
+            ColorChoice(color: SIMD4<Float>(0.9, 0.9, 0.9, 1.0)),      // Light gray
+            ColorChoice(color: SIMD4<Float>(0.2, 0.2, 0.2, 1.0))       // Dark
+        ]
+	
+	    private var isRunningOnMac: Bool {
+	        #if targetEnvironment(macCatalyst)
+	        return true
+	        #else
+	        if #available(iOS 14.0, *) {
             return ProcessInfo.processInfo.isiOSAppOnMac
         }
         return false
@@ -48,13 +78,65 @@ class TouchableMTKView: MTKView {
     weak var coordinator: Coordinator?
 
     var panGesture: UIPanGestureRecognizer!
+    var tapGesture: UITapGestureRecognizer!
     var pinchGesture: UIPinchGestureRecognizer!
     var rotationGesture: UIRotationGestureRecognizer!
     var longPressGesture: UILongPressGestureRecognizer!
     var cardLongPressGesture: UILongPressGestureRecognizer! // Single-finger long press for card settings
+    private var pencilInteraction: UIPencilInteraction?
 
     // Debug HUD
     var debugLabel: UILabel!
+
+    // MARK: - Stroke Linking UI (Selection Handles + Menu)
+    private let linkHandleTouchSize: CGFloat = 44.0
+    // private let linkHandleVisibleSize: CGFloat = 18.0
+    private let linkHandleLineWidth: CGFloat = 3.0
+    private var linkHandleView: UIView?
+    private var linkHandlePan: UIPanGestureRecognizer?
+    private var lastLinkMenuAnchorRect: CGRect = .null
+	    private var ignoreTapsUntilTime: CFTimeInterval = 0
+	    private var isPresentingLinkPrompt: Bool = false
+	    private var isPresentingInternalLinkPicker: Bool = false
+	    private var isShowingRemoveHighlightMenu: Bool = false
+	    private var removeHighlightMenuKey: Coordinator.LinkHighlightKey?
+	    private var linkHandleLineView: UIView?
+	    private var lastLassoMenuAnchorRect: CGRect = .null
+        private var isShowingLassoSectionMenu: Bool = false
+        private var isShowingSectionColorMenu: Bool = false
+        private weak var sectionColorMenuTarget: Section?
+        private weak var cardMenuTarget: Card?
+        private var cardMenuTargetFrame: Frame?
+
+        // MARK: - Inline Section Name Editing
+        private var sectionNameTextField: UITextField?
+        private weak var sectionNameEditingTarget: Section?
+        private weak var sectionNameEditingFrame: Frame?
+
+        // MARK: - Inline Card Name Editing
+        private var cardNameTextField: UITextField?
+        private weak var cardNameEditingTarget: Card?
+        private weak var cardNameEditingFrame: Frame?
+
+        // MARK: - YouTube Card Overlay (single active player)
+        #if canImport(YouTubePlayerKit)
+        private var youtubePlayer: YouTubePlayer?
+        private var youtubeHostingView: YouTubePlayerHostingView?
+        private var youtubeStateCancellable: AnyCancellable?
+        private var youtubeEventCancellable: AnyCancellable?
+        private var youtubePendingVideoID: String?
+        #else
+        private var youtubeWebView: WKWebView?
+        #endif
+        private weak var youtubeCardTarget: Card?
+        private weak var youtubeCardFrame: Frame?
+        private var youtubeLoadedVideoID: String?
+        private var youtubeOverlayLastCenter: CGPoint?
+        private var youtubeOverlayLastSize: CGSize?
+        private var youtubeOverlayLastRotation: CGFloat?
+        private var youtubeLastErrorSummary: String?
+	    private var youtubeCloseButton: UIButton?
+	    private var youtubeCloseButtonLastFrame: CGRect = .null
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
     var pinchAnchorScreen: CGPoint = .zero
@@ -86,6 +168,11 @@ class TouchableMTKView: MTKView {
     // TODO: Implement lasso undo support
     // var lassoMoveStartSnapshot: Coordinator.LassoMoveSnapshot?
     // var lassoTransformStartSnapshot: Coordinator.LassoTransformSnapshot?
+
+    // Pan momentum/inertia
+    var panVelocity: SIMD2<Double> = .zero
+    var lastPanTime: CFTimeInterval = 0
+    var momentumDisplayLink: CADisplayLink?
 
 
 
@@ -123,7 +210,8 @@ class TouchableMTKView: MTKView {
 
     func clearAnchorIfUnused() { activeOwner = .none }
 
-    // MARK: - Telescoping Transitions
+    /*
+    // MARK: - Legacy Telescoping Transitions (Reference Only)
 
     /// Check if zoom has exceeded thresholds and perform frame transitions if needed.
     /// Returns TRUE if a transition occurred (caller should return early).
@@ -415,6 +503,157 @@ class TouchableMTKView: MTKView {
 
         return 0  // Shouldn't reach here
     }
+    */
+
+    // MARK: - 5x5 Fractal Grid Transitions
+
+    /// Wrap the active frame so `anchorWorld` stays within the current frame bounds.
+    /// This enables infinite panning without coordinate growth.
+    @discardableResult
+    private func wrapFractalIfNeeded(coord: Coordinator,
+                                     anchorWorld: SIMD2<Double>,
+                                     anchorScreen: CGPoint) -> SIMD2<Double> {
+        coord.ensureFractalExtent(viewSize: bounds.size)
+        let extent = coord.fractalFrameExtent
+        let half = extent * 0.5
+
+        var anchor = anchorWorld
+        var moved = false
+
+        while anchor.x > half.x {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .right)
+            anchor.x -= extent.x
+            moved = true
+        }
+        while anchor.x < -half.x {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .left)
+            anchor.x += extent.x
+            moved = true
+        }
+        while anchor.y > half.y {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .down)
+            anchor.y -= extent.y
+            moved = true
+        }
+        while anchor.y < -half.y {
+            coord.activeFrame = coord.neighborFrame(from: coord.activeFrame, direction: .up)
+            anchor.y += extent.y
+            moved = true
+        }
+
+        if moved {
+            coord.panOffset = solvePanOffsetForAnchor_Double(
+                anchorWorld: anchor,
+                desiredScreen: anchorScreen,
+                viewSize: bounds.size,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+        }
+
+        return anchor
+    }
+
+    /// Check if zoom has exceeded fractal thresholds and transition frames if needed.
+    /// Returns TRUE if a transition occurred (caller should return early).
+    func checkFractalTransitions(coord: Coordinator,
+                                 anchorWorld: SIMD2<Double>,
+                                 anchorScreen: CGPoint) -> Bool {
+        coord.ensureFractalExtent(viewSize: bounds.size)
+
+        let beforeWrapFrame = coord.activeFrame
+        var anchor = wrapFractalIfNeeded(coord: coord, anchorWorld: anchorWorld, anchorScreen: anchorScreen)
+        // Treat same-depth wrapping as a "transition" so the caller doesn't overwrite the solved panOffset.
+        var transitioned = (coord.activeFrame !== beforeWrapFrame)
+
+        // Drill down while zoom is large (normalize zoom back into [1, 5)).
+        while coord.zoomScale >= FractalGrid.scale {
+            anchor = drillDownToChildTile(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+            transitioned = true
+        }
+
+        // Pop up while zoom is too small (normalize zoom back into [1, 5)).
+        while coord.zoomScale < 1.0 {
+            anchor = popUpToParentTile(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+            transitioned = true
+        }
+
+        // Ensure the anchor remains in-bounds after transitions.
+        let beforeFinalWrapFrame = coord.activeFrame
+        anchor = wrapFractalIfNeeded(coord: coord, anchorWorld: anchor, anchorScreen: anchorScreen)
+        if coord.activeFrame !== beforeFinalWrapFrame {
+            transitioned = true
+        }
+
+        if transitioned {
+            // Keep the gesture anchor consistent with the new active frame.
+            self.anchorWorld = screenToWorldPixels_PureDouble(
+                anchorScreen,
+                viewSize: bounds.size,
+                panOffset: coord.panOffset,
+                zoomScale: coord.zoomScale,
+                rotationAngle: coord.rotationAngle
+            )
+            self.anchorScreen = anchorScreen
+        }
+
+        return transitioned
+    }
+
+    /// Drill down into the child tile containing `anchorWorld`.
+    private func drillDownToChildTile(coord: Coordinator,
+                                      anchorWorld: SIMD2<Double>,
+                                      anchorScreen: CGPoint) -> SIMD2<Double> {
+        let extent = coord.fractalFrameExtent
+        let index = FractalGrid.childIndex(frameExtent: extent, pointInParent: anchorWorld)
+
+        let child = coord.activeFrame.child(at: index)
+        let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+        let anchorInChild = (anchorWorld - childCenter) * FractalGrid.scale
+
+        coord.activeFrame = child
+        coord.zoomScale = coord.zoomScale / FractalGrid.scale
+        coord.panOffset = solvePanOffsetForAnchor_Double(
+            anchorWorld: anchorInChild,
+            desiredScreen: anchorScreen,
+            viewSize: bounds.size,
+            zoomScale: coord.zoomScale,
+            rotationAngle: coord.rotationAngle
+        )
+
+        return anchorInChild
+    }
+
+    /// Pop up to the parent frame, creating a super-root if needed.
+    private func popUpToParentTile(coord: Coordinator,
+                                   anchorWorld: SIMD2<Double>,
+                                   anchorScreen: CGPoint) -> SIMD2<Double> {
+        let extent = coord.fractalFrameExtent
+
+        let child = coord.activeFrame
+        if child.parent == nil {
+            _ = coord.ensureSuperRootRetained(for: child)
+        }
+
+        guard let parent = child.parent, let index = child.indexInParent else {
+            return anchorWorld
+        }
+
+        let childCenter = FractalGrid.childCenterInParent(frameExtent: extent, index: index)
+        let anchorInParent = childCenter + (anchorWorld / FractalGrid.scale)
+
+        coord.activeFrame = parent
+        coord.zoomScale = coord.zoomScale * FractalGrid.scale
+        coord.panOffset = solvePanOffsetForAnchor_Double(
+            anchorWorld: anchorInParent,
+            desiredScreen: anchorScreen,
+            viewSize: bounds.size,
+            zoomScale: coord.zoomScale,
+            rotationAngle: coord.rotationAngle
+        )
+
+        return anchorInParent
+    }
 
 
 
@@ -446,7 +685,8 @@ class TouchableMTKView: MTKView {
         addGestureRecognizer(panGesture)
 
         //  MODAL INPUT: TAP (Finger Only - Select/Edit Cards)
-        let tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tapGesture = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        tapGesture.cancelsTouchesInView = false
         if isRunningOnMac {
             var tapTouchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
             if #available(iOS 13.4, macCatalyst 13.4, *) {
@@ -485,6 +725,7 @@ class TouchableMTKView: MTKView {
         addGestureRecognizer(cardLongPressGesture)
 
         panGesture.delegate = self
+        tapGesture.delegate = self
         pinchGesture.delegate = self
         rotationGesture.delegate = self
         longPressGesture.delegate = self
@@ -492,6 +733,18 @@ class TouchableMTKView: MTKView {
 
         // Setup Debug HUD
         setupDebugHUD()
+
+        // Apple Pencil Pro squeeze (iOS 17.5+)
+        setupPencilInteractionIfAvailable()
+    }
+
+    private func setupPencilInteractionIfAvailable() {
+        guard !isRunningOnMac else { return }
+        guard #available(iOS 17.5, *) else { return }
+        let interaction = UIPencilInteraction()
+        interaction.delegate = self
+        addInteraction(interaction)
+        pencilInteraction = interaction
     }
 
     func setupDebugHUD() {
@@ -519,32 +772,1355 @@ class TouchableMTKView: MTKView {
         ])
     }
 
+    private func setupLinkSelectionOverlay() {
+        guard linkHandleView == nil else { return }
+
+        func makeHandleView() -> UIView {
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: linkHandleTouchSize))
+            container.backgroundColor = .clear
+            container.isHidden = true
+
+            /*
+            // Legacy handle: circle (reference only)
+            let circleOrigin = (linkHandleTouchSize - linkHandleVisibleSize) * 0.5
+            let circle = UIView(frame: CGRect(x: circleOrigin, y: circleOrigin, width: linkHandleVisibleSize, height: linkHandleVisibleSize))
+            circle.backgroundColor = UIColor.white.withAlphaComponent(0.95)
+            circle.layer.cornerRadius = linkHandleVisibleSize * 0.5
+            circle.layer.borderWidth = 2.0
+            circle.layer.borderColor = UIColor.systemYellow.withAlphaComponent(0.9).cgColor
+            circle.isUserInteractionEnabled = false
+            container.addSubview(circle)
+            */
+
+            let lineX = (linkHandleTouchSize - linkHandleLineWidth) * 0.5
+            let line = UIView(frame: CGRect(x: lineX, y: 0, width: linkHandleLineWidth, height: container.bounds.height))
+            line.backgroundColor = UIColor.systemYellow.withAlphaComponent(0.95)
+            line.layer.cornerRadius = linkHandleLineWidth * 0.5
+            line.layer.borderWidth = 1.0
+            line.layer.borderColor = UIColor.white.withAlphaComponent(0.85).cgColor
+            line.autoresizingMask = [.flexibleHeight, .flexibleLeftMargin, .flexibleRightMargin]
+            line.isUserInteractionEnabled = false
+            container.addSubview(line)
+            linkHandleLineView = line
+
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleLinkHandlePan(_:)))
+            pan.minimumNumberOfTouches = 1
+            pan.maximumNumberOfTouches = 1
+            pan.delegate = self
+            if isRunningOnMac {
+                var touchTypes: [NSNumber] = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+                if #available(iOS 13.4, macCatalyst 13.4, *) {
+                    touchTypes.append(NSNumber(value: UITouch.TouchType.indirectPointer.rawValue))
+                }
+                pan.allowedTouchTypes = touchTypes
+            } else {
+                pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+            }
+            container.addGestureRecognizer(pan)
+            linkHandlePan = pan
+
+            return container
+        }
+
+        let handle = makeHandleView()
+        addSubview(handle)
+        linkHandleView = handle
+    }
+
+    func updateLinkSelectionOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateLinkSelectionOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let selection = coord.linkSelection else {
+            hideLinkSelectionOverlay()
+            return
+        }
+
+        setupLinkSelectionOverlay()
+        guard let handleView = linkHandleView else { return }
+
+        let anchorRectActive = coord.linkSelectionBoundsActiveWorld()
+        let anchor: CGRect
+
+        if let rect = anchorRectActive, rect != .null, rect.width.isFinite, rect.height.isFinite {
+            let a0 = SIMD2<Double>(rect.maxX, rect.minY)
+            let a1 = SIMD2<Double>(rect.maxX, rect.maxY)
+
+            let p0 = worldToScreenPixels_PureDouble(a0,
+                                                    viewSize: bounds.size,
+                                                    panOffset: coord.panOffset,
+                                                    zoomScale: coord.zoomScale,
+                                                    rotationAngle: coord.rotationAngle)
+            let p1 = worldToScreenPixels_PureDouble(a1,
+                                                    viewSize: bounds.size,
+                                                    panOffset: coord.panOffset,
+                                                    zoomScale: coord.zoomScale,
+                                                    rotationAngle: coord.rotationAngle)
+
+            let dx = p1.x - p0.x
+            let dy = p1.y - p0.y
+            let length = max(hypot(dx, dy), 1.0)
+            // Our handle "cursor" is authored vertical (along +Y). Rotate so its Y-axis aligns with p0→p1.
+            let angle = atan2(dy, dx) - (.pi / 2.0)
+
+            let mid = CGPoint(x: (p0.x + p1.x) * 0.5, y: (p0.y + p1.y) * 0.5)
+            handleView.transform = .identity
+            handleView.bounds = CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: length)
+            handleView.center = mid
+            handleView.transform = CGAffineTransform(rotationAngle: angle)
+            handleView.isHidden = false
+            bringSubviewToFront(handleView)
+
+            anchor = CGRect(x: mid.x - 2, y: mid.y - 2, width: 4, height: 4)
+        } else {
+            let handleScreen = worldToScreenPixels_PureDouble(selection.handleActiveWorld,
+                                                              viewSize: bounds.size,
+                                                              panOffset: coord.panOffset,
+                                                              zoomScale: coord.zoomScale,
+                                                              rotationAngle: coord.rotationAngle)
+            handleView.transform = .identity
+            handleView.bounds = CGRect(x: 0, y: 0, width: linkHandleTouchSize, height: linkHandleTouchSize)
+            handleView.center = handleScreen
+            handleView.isHidden = false
+            bringSubviewToFront(handleView)
+            anchor = CGRect(x: handleScreen.x - 2, y: handleScreen.y - 2, width: 4, height: 4)
+        }
+
+        if coord.isDraggingLinkHandle {
+            hideLinkMenu()
+            lastLinkMenuAnchorRect = .null
+        } else {
+            showLinkMenuIfNeeded(anchorRect: anchor)
+        }
+    }
+
+    func updateSectionNameEditorOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateSectionNameEditorOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let field = sectionNameTextField,
+              let section = sectionNameEditingTarget,
+              let frame = sectionNameEditingFrame else { return }
+
+        guard let rect = coord.sectionLabelScreenRect(section: section,
+                                                      frame: frame,
+                                                      viewSize: bounds.size,
+                                                      ignoreHideRule: true) else { return }
+
+        if field.frame != rect {
+            field.frame = rect
+        }
+        bringSubviewToFront(field)
+    }
+
+    func updateCardNameEditorOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateCardNameEditorOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        guard let field = cardNameTextField,
+              let card = cardNameEditingTarget,
+              let frame = cardNameEditingFrame else { return }
+
+        guard let rect = coord.cardLabelScreenRect(card: card,
+                                                   frame: frame,
+                                                   viewSize: bounds.size,
+                                                   ignoreHideRule: true) else { return }
+
+        if field.frame != rect {
+            field.frame = rect
+        }
+        bringSubviewToFront(field)
+    }
+
+    func updateYouTubeOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateYouTubeOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else { return }
+        #if canImport(YouTubePlayerKit)
+        guard let hostingView = youtubeHostingView else { return }
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            deactivateYouTubeOverlay()
+            return
+        }
+        #else
+        guard let webView = youtubeWebView else { return }
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            deactivateYouTubeOverlay()
+            return
+        }
+        guard webView.superview != nil else { return }
+        #endif
+
+        guard case .youtube(let videoID, _) = card.type, !videoID.isEmpty else {
+            deactivateYouTubeOverlay()
+            return
+        }
+
+        if youtubeLoadedVideoID != videoID {
+            setYouTubeVideo(videoID: videoID)
+        }
+
+        guard let placement = coord.cardScreenTransform(card: card, frame: frame, viewSize: bounds.size) else {
+            // Keep the player alive; just hide the overlay until the target card is visible again.
+            #if canImport(YouTubePlayerKit)
+            hostingView.isHidden = true
+            #else
+            webView.isHidden = true
+            #endif
+            return
+        }
+
+        let size = placement.size
+        guard size.width.isFinite, size.height.isFinite, size.width > 1, size.height > 1 else {
+            #if canImport(YouTubePlayerKit)
+            hostingView.isHidden = true
+            #else
+            webView.isHidden = true
+            #endif
+            return
+        }
+
+        let desiredCenter = placement.center
+        let desiredSize = size
+        let desiredRotation = placement.rotation
+
+        let shouldUpdateFrame: Bool = {
+            guard let lastCenter = youtubeOverlayLastCenter,
+                  let lastSize = youtubeOverlayLastSize,
+                  let lastRotation = youtubeOverlayLastRotation else {
+                return true
+            }
+            let centerDelta = abs(desiredCenter.x - lastCenter.x) + abs(desiredCenter.y - lastCenter.y)
+            let sizeDelta = abs(desiredSize.width - lastSize.width) + abs(desiredSize.height - lastSize.height)
+            let rotationDelta = abs(desiredRotation - lastRotation)
+            return centerDelta > 0.5 || sizeDelta > 0.5 || rotationDelta > 0.002
+        }()
+
+        #if canImport(YouTubePlayerKit)
+        hostingView.isHidden = false
+        if shouldUpdateFrame {
+            hostingView.transform = .identity
+            hostingView.bounds = CGRect(x: 0, y: 0, width: desiredSize.width, height: desiredSize.height)
+            hostingView.center = desiredCenter
+            hostingView.transform = CGAffineTransform(rotationAngle: desiredRotation)
+            hostingView.layoutIfNeeded()
+            youtubeOverlayLastCenter = desiredCenter
+            youtubeOverlayLastSize = desiredSize
+            youtubeOverlayLastRotation = desiredRotation
+        }
+        bringSubviewToFront(hostingView)
+        #else
+        webView.isHidden = false
+        if shouldUpdateFrame {
+            webView.transform = .identity
+            webView.bounds = CGRect(x: 0, y: 0, width: desiredSize.width, height: desiredSize.height)
+            webView.center = desiredCenter
+            webView.transform = CGAffineTransform(rotationAngle: desiredRotation)
+            youtubeOverlayLastCenter = desiredCenter
+            youtubeOverlayLastSize = desiredSize
+            youtubeOverlayLastRotation = desiredRotation
+        }
+        bringSubviewToFront(webView)
+        #endif
+    }
+
+    func updateYouTubeCloseButtonOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateYouTubeCloseButtonOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        guard case .youtube = card.type else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        #if canImport(YouTubePlayerKit)
+        guard youtubeHostingView?.isHidden == false else {
+            hideYouTubeCloseButton()
+            return
+        }
+        #else
+        guard youtubeWebView?.superview != nil,
+              youtubeWebView?.isHidden == false else {
+            hideYouTubeCloseButton()
+            return
+        }
+        #endif
+
+        if card.labelWorldSize.x <= 0.0 || card.labelWorldSize.y <= 0.0 {
+            card.ensureLabelTexture(device: coord.device)
+        }
+
+        guard let labelRect = coord.cardLabelScreenRect(card: card,
+                                                       frame: frame,
+                                                       viewSize: bounds.size,
+                                                       ignoreHideRule: true) else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        let gap: CGFloat = 6.0
+        let side = max(labelRect.height, 20.0)
+        var buttonRect = CGRect(x: labelRect.maxX + gap,
+                                y: labelRect.minY,
+                                width: side,
+                                height: side)
+
+        // Keep the button visible if the label is near the right edge.
+        if buttonRect.maxX > bounds.size.width - 4.0 {
+            buttonRect.origin.x = labelRect.minX - gap - side
+        }
+
+        let button = ensureYouTubeCloseButton()
+        if youtubeCloseButtonLastFrame != buttonRect {
+            button.frame = buttonRect
+            youtubeCloseButtonLastFrame = buttonRect
+        }
+        button.isHidden = false
+        bringSubviewToFront(button)
+    }
+
+    func youtubeHUDText() -> String {
+        #if canImport(YouTubePlayerKit)
+        let activeVideoID: String = {
+            guard let card = youtubeCardTarget, case .youtube(let id, _) = card.type else { return "-" }
+            return id
+        }()
+        let state = youtubePlayer.map { String(describing: $0.state) } ?? "nil"
+        let originHost = youtubePlayer?.parameters.originURL?.host ?? "nil"
+        let err = youtubeLastErrorSummary ?? "ok"
+        return "YT: \(activeVideoID) | \(state) | origin: \(originHost) | \(err)"
+        #else
+        let activeVideoID: String = {
+            guard let card = youtubeCardTarget, case .youtube(let id, _) = card.type else { return "-" }
+            return id
+        }()
+        return "YT: \(activeVideoID) | WKWebView"
+        #endif
+    }
+
+    private func toggleYouTubeOverlay(card: Card, frame: Frame) {
+        #if canImport(YouTubePlayerKit)
+        let isActive = (youtubeCardTarget === card && youtubeCardFrame === frame && youtubeHostingView?.isHidden == false)
+        #else
+        let isActive = (youtubeCardTarget === card && youtubeCardFrame === frame && youtubeWebView?.superview != nil)
+        #endif
+
+        // A YouTube overlay should only stop when switching to a different YouTube card.
+        // Tapping the active YouTube card should never stop playback.
+        if !isActive {
+            activateYouTubeOverlay(card: card, frame: frame)
+        }
+    }
+
+    private func activateYouTubeOverlay(card: Card, frame: Frame) {
+        guard case .youtube(let videoID, _) = card.type, !videoID.isEmpty else { return }
+
+        #if canImport(YouTubePlayerKit)
+        let player: YouTubePlayer = youtubePlayer ?? {
+            let origin = preferredYouTubeEmbedOriginURL()
+            let userAgent = preferredYouTubeUserAgentString()
+            let params = YouTubePlayer.Parameters(
+                showControls: true,
+                showFullscreenButton: false,
+                keyboardControlsDisabled: false,
+                originURL: origin,
+                referrerURL: nil
+            )
+
+            let config = YouTubePlayer.Configuration(
+                fullscreenMode: .preferred,
+                allowsInlineMediaPlayback: true,
+                allowsAirPlayForMediaPlayback: true,
+                allowsPictureInPictureMediaPlayback: false,
+                useNonPersistentWebsiteDataStore: false,
+                automaticallyAdjustsContentInsets: true,
+                customUserAgent: userAgent,
+                htmlBuilder: .init(),
+                openURLAction: .default
+            )
+
+            let p = YouTubePlayer(
+                source: .video(id: videoID),
+                parameters: params,
+                configuration: config,
+                isLoggingEnabled: false
+            )
+            #if DEBUG
+            p.isLoggingEnabled = true
+            #endif
+
+            youtubeEventCancellable = p.eventPublisher.sink { [weak self] event in
+                guard let self else { return }
+                switch event.name {
+                case .error:
+                    let payload = event.data?.value ?? "nil"
+                    self.youtubeLastErrorSummary = "YT onError(\(payload))"
+                case .iFrameApiFailedToLoad:
+                    self.youtubeLastErrorSummary = "YT iFrameApiFailedToLoad"
+                default:
+                    break
+                }
+            }
+
+            youtubeStateCancellable = p.statePublisher.sink { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    guard let pending = self.youtubePendingVideoID else { return }
+                    self.youtubePendingVideoID = nil
+                    self.setYouTubeVideo(videoID: pending)
+                case .error(let error):
+                    self.youtubeLastErrorSummary = "YT stateError(\(error))"
+                case .idle:
+                    break
+                }
+            }
+
+            youtubePlayer = p
+            return p
+        }()
+
+        let hostingView: YouTubePlayerHostingView = youtubeHostingView ?? {
+            let view = YouTubePlayerHostingView(player: player)
+            view.backgroundColor = .clear
+            view.isOpaque = false
+            view.layer.cornerRadius = 12.0
+            view.layer.masksToBounds = true
+            view.isHidden = true
+            addSubview(view)
+            youtubeHostingView = view
+            return view
+        }()
+
+        youtubeCardTarget = card
+        youtubeCardFrame = frame
+
+        hostingView.isHidden = false
+
+        youtubeLoadedVideoID = nil
+        youtubeLastErrorSummary = nil
+        setYouTubeVideo(videoID: videoID)
+        updateYouTubeOverlay()
+        #else
+        let webView: WKWebView = youtubeWebView ?? {
+            let configuration = WKWebViewConfiguration()
+            configuration.allowsInlineMediaPlayback = true
+            configuration.allowsPictureInPictureMediaPlayback = false
+            configuration.mediaTypesRequiringUserActionForPlayback = []
+            if #available(iOS 14.0, *) {
+                configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+            } else {
+                configuration.preferences.javaScriptEnabled = true
+            }
+
+            let webView = WKWebView(frame: .zero, configuration: configuration)
+            webView.isOpaque = false
+            webView.backgroundColor = .clear
+            webView.scrollView.isScrollEnabled = false
+            webView.scrollView.bounces = false
+            webView.layer.cornerRadius = 12.0
+            webView.layer.masksToBounds = true
+            return webView
+        }()
+
+        if webView.superview == nil {
+            addSubview(webView)
+        }
+
+        youtubeWebView = webView
+        youtubeCardTarget = card
+        youtubeCardFrame = frame
+
+        youtubeLoadedVideoID = nil
+        setYouTubeVideo(videoID: videoID)
+        updateYouTubeOverlay()
+        #endif
+    }
+
+    #if canImport(YouTubePlayerKit)
+    private func preferredYouTubeEmbedOriginURL() -> URL? {
+        if let bundleID = Bundle.main.bundleIdentifier?.lowercased(), !bundleID.isEmpty {
+            // Use a stable-looking https origin with a real TLD to satisfy embed identity checks.
+            // Bundle IDs aren't valid TLDs; convert to a single DNS label and append `.app`.
+            let label = bundleID
+                .replacingOccurrences(of: ".", with: "-")
+                .replacingOccurrences(of: "_", with: "-")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+
+            if !label.isEmpty {
+                return URL(string: "https://\(label).app")
+            }
+        }
+        return URL(string: "https://example.com")
+    }
+
+    private func preferredYouTubeUserAgentString() -> String? {
+        // YouTube sometimes blocks playback in "webview" user agents. Provide a Safari-like UA.
+        #if targetEnvironment(macCatalyst)
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        #else
+        return "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+        #endif
+    }
+    #endif
+
+    private func deactivateYouTubeOverlay() {
+        youtubeCardTarget = nil
+        youtubeCardFrame = nil
+        youtubeLoadedVideoID = nil
+        youtubeOverlayLastCenter = nil
+        youtubeOverlayLastSize = nil
+        youtubeOverlayLastRotation = nil
+	    hideYouTubeCloseButton()
+        #if canImport(YouTubePlayerKit)
+        youtubePendingVideoID = nil
+        youtubeHostingView?.isHidden = true
+        if let player = youtubePlayer {
+            Task { [weak player] in
+                try? await player?.pause()
+            }
+        }
+        #else
+        youtubeWebView?.stopLoading()
+        youtubeWebView?.removeFromSuperview()
+        #endif
+    }
+
+    private func ensureYouTubeCloseButton() -> UIButton {
+        if let existing = youtubeCloseButton { return existing }
+        let button = UIButton(type: .system)
+        button.setTitle("X", for: .normal)
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 14.0, weight: .bold)
+        button.backgroundColor = .systemRed
+        button.layer.cornerRadius = 8.0
+        button.layer.masksToBounds = true
+        button.isHidden = true
+        button.addTarget(self, action: #selector(onYouTubeCloseTapped), for: .touchUpInside)
+        addSubview(button)
+        youtubeCloseButton = button
+        return button
+    }
+
+    private func hideYouTubeCloseButton() {
+        youtubeCloseButton?.isHidden = true
+        youtubeCloseButtonLastFrame = .null
+    }
+
+    @objc private func onYouTubeCloseTapped() {
+        // Explicit user action: stop and return to thumbnail view.
+        deactivateYouTubeOverlay()
+    }
+
+    private func setYouTubeVideo(videoID: String) {
+        guard !videoID.isEmpty else { return }
+        guard youtubeLoadedVideoID != videoID else { return }
+        youtubeLoadedVideoID = videoID
+
+        #if canImport(YouTubePlayerKit)
+        guard let player = youtubePlayer else { return }
+
+        let currentID = player.source?.videoID
+        if currentID == videoID {
+            return
+        }
+
+        if case .ready = player.state {
+            Task { [weak player] in
+                guard let player else { return }
+                try? await player.load(source: .video(id: videoID))
+            }
+        } else {
+            youtubePendingVideoID = videoID
+        }
+        #else
+        guard let webView = youtubeWebView else { return }
+
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "www.youtube-nocookie.com"
+        components.path = "/embed/\(videoID)"
+        components.queryItems = [
+            URLQueryItem(name: "playsinline", value: "1"),
+            URLQueryItem(name: "controls", value: "1"),
+            URLQueryItem(name: "fs", value: "0"),
+            URLQueryItem(name: "rel", value: "0"),
+            URLQueryItem(name: "modestbranding", value: "1"),
+        ]
+
+        guard let url = components.url else { return }
+        webView.load(URLRequest(url: url))
+        #endif
+    }
+
+    func deactivateYouTubeOverlayIfTarget(card: Card) {
+        if youtubeCardTarget === card {
+            deactivateYouTubeOverlay()
+        }
+    }
+
+    private func beginEditingSectionName(section: Section, frame: Frame) {
+        guard let coord = coordinator else { return }
+
+        // Ensure only one inline editor is active.
+        if cardNameTextField != nil {
+            commitAndEndCardNameEditing()
+        }
+
+        // Ensure we have an accurate label size for placement + the initial editor frame.
+        section.ensureLabelTexture(device: coord.device)
+
+        let field: UITextField = {
+            if let existing = sectionNameTextField { return existing }
+            let f = UITextField(frame: .zero)
+            f.borderStyle = .none
+            f.textAlignment = .left
+            f.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+            f.textColor = .black
+            f.autocapitalizationType = .sentences
+            f.autocorrectionType = .yes
+            f.spellCheckingType = .yes
+            f.keyboardType = .default
+            f.returnKeyType = .done
+            f.enablesReturnKeyAutomatically = false
+            f.clearButtonMode = .whileEditing
+            f.layer.cornerRadius = 8.0
+            f.layer.masksToBounds = true
+            f.delegate = self
+
+            let padX: CGFloat = 10.0
+            let leftPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            let rightPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            f.leftView = leftPad
+            f.leftViewMode = .always
+            f.rightView = rightPad
+            f.rightViewMode = .always
+
+            addSubview(f)
+            sectionNameTextField = f
+            return f
+        }()
+
+        let bg = UIColor(red: CGFloat(section.color.x),
+                         green: CGFloat(section.color.y),
+                         blue: CGFloat(section.color.z),
+                         alpha: 1.0)
+        field.backgroundColor = bg
+
+        sectionNameEditingTarget = section
+        sectionNameEditingFrame = frame
+        field.text = section.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : section.name
+
+        updateSectionNameEditorOverlay()
+        field.isHidden = false
+        bringSubviewToFront(field)
+        field.becomeFirstResponder()
+    }
+
+    private func commitAndEndSectionNameEditing() {
+        guard let field = sectionNameTextField else { return }
+        guard let section = sectionNameEditingTarget else {
+            field.resignFirstResponder()
+            field.removeFromSuperview()
+            sectionNameTextField = nil
+            sectionNameEditingFrame = nil
+            return
+        }
+
+        let trimmed = field.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        section.name = trimmed.isEmpty ? "Untitled" : trimmed
+
+        // Force a label texture rebuild with the updated name.
+        section.labelTexture = nil
+        section.labelWorldSize = .zero
+        if let coord = coordinator {
+            section.ensureLabelTexture(device: coord.device)
+            coord.refreshInternalLinkReferenceCache()
+        }
+
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        sectionNameTextField = nil
+        sectionNameEditingTarget = nil
+        sectionNameEditingFrame = nil
+    }
+
+    private func beginEditingCardName(card: Card, frame: Frame) {
+        guard let coord = coordinator else { return }
+
+        // Ensure only one inline editor is active.
+        if sectionNameTextField != nil {
+            commitAndEndSectionNameEditing()
+        }
+
+        card.ensureLabelTexture(device: coord.device)
+
+        let field: UITextField = {
+            if let existing = cardNameTextField { return existing }
+            let f = UITextField(frame: .zero)
+            f.borderStyle = .none
+            f.textAlignment = .left
+            f.font = UIFont.systemFont(ofSize: 14.0, weight: .semibold)
+            f.autocapitalizationType = .sentences
+            f.autocorrectionType = .yes
+            f.spellCheckingType = .yes
+            f.keyboardType = .default
+            f.returnKeyType = .done
+            f.enablesReturnKeyAutomatically = false
+            f.clearButtonMode = .whileEditing
+            f.layer.cornerRadius = 8.0
+            f.layer.masksToBounds = true
+            f.delegate = self
+
+            let padX: CGFloat = 10.0
+            let leftPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            let rightPad = UIView(frame: CGRect(x: 0, y: 0, width: padX, height: 1))
+            f.leftView = leftPad
+            f.leftViewMode = .always
+            f.rightView = rightPad
+            f.rightViewMode = .always
+
+            addSubview(f)
+            cardNameTextField = f
+            return f
+        }()
+
+        let bg = UIColor(red: CGFloat(card.backgroundColor.x),
+                         green: CGFloat(card.backgroundColor.y),
+                         blue: CGFloat(card.backgroundColor.z),
+                         alpha: 1.0)
+        field.backgroundColor = bg
+
+        let lum = 0.2126 * Double(card.backgroundColor.x) +
+        0.7152 * Double(card.backgroundColor.y) +
+        0.0722 * Double(card.backgroundColor.z)
+        let textColor: UIColor = lum > 0.6 ? .black : .white
+        field.textColor = textColor
+        field.tintColor = textColor
+
+        cardNameEditingTarget = card
+        cardNameEditingFrame = frame
+        field.text = card.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled" : card.name
+
+        updateCardNameEditorOverlay()
+        field.isHidden = false
+        bringSubviewToFront(field)
+        field.becomeFirstResponder()
+    }
+
+    private func commitAndEndCardNameEditing() {
+        guard let field = cardNameTextField else { return }
+        guard let card = cardNameEditingTarget else {
+            field.resignFirstResponder()
+            field.removeFromSuperview()
+            cardNameTextField = nil
+            cardNameEditingFrame = nil
+            return
+        }
+
+        let trimmed = field.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        card.name = trimmed.isEmpty ? "Untitled" : trimmed
+        if let coord = coordinator {
+            card.ensureLabelTexture(device: coord.device)
+            coord.refreshInternalLinkReferenceCache()
+        }
+
+        field.resignFirstResponder()
+        field.removeFromSuperview()
+        cardNameTextField = nil
+        cardNameEditingTarget = nil
+        cardNameEditingFrame = nil
+    }
+
+    private func hideLinkSelectionOverlay() {
+        linkHandleView?.isHidden = true
+        if !isShowingRemoveHighlightMenu && !isShowingLassoSectionMenu {
+            hideLinkMenu()
+            lastLinkMenuAnchorRect = .null
+        }
+    }
+
+	    private func showLinkMenuIfNeeded(anchorRect: CGRect) {
+	        guard let coord = coordinator else { return }
+	        guard coord.linkSelection != nil else { return }
+	        guard !coord.isDraggingLinkHandle else { return }
+	        guard !isPresentingLinkPrompt else { return }
+	        guard !isPresentingInternalLinkPicker else { return }
+	        guard !isShowingLassoSectionMenu else { return }
+	        guard !isShowingSectionColorMenu else { return }
+
+	        let menu = UIMenuController.shared
+	        if isShowingRemoveHighlightMenu, !menu.isMenuVisible {
+	            isShowingRemoveHighlightMenu = false
+	            removeHighlightMenuKey = nil
+	        }
+	        guard !isShowingRemoveHighlightMenu else { return }
+	        if isShowingSectionColorMenu, !menu.isMenuVisible {
+	            isShowingSectionColorMenu = false
+	            sectionColorMenuTarget = nil
+	        }
+	        if !anchorRect.isNull, !anchorRect.isInfinite {
+	            // Avoid re-showing the menu every frame unless the anchor moved meaningfully.
+	            let delta = abs(anchorRect.midX - lastLinkMenuAnchorRect.midX) + abs(anchorRect.midY - lastLinkMenuAnchorRect.midY)
+	            if !lastLinkMenuAnchorRect.isNull, delta < 8.0, menu.isMenuVisible {
+                return
+            }
+        }
+
+        becomeFirstResponder()
+        menu.menuItems = [
+            UIMenuItem(title: "Add Link", action: #selector(addLinkMenuItem(_:))),
+            UIMenuItem(title: "Link", action: #selector(addInternalLinkMenuItem(_:)))
+        ]
+        menu.showMenu(from: self, rect: anchorRect)
+        lastLinkMenuAnchorRect = anchorRect
+    }
+
+    private func hideLinkMenu() {
+        let menu = UIMenuController.shared
+        if menu.isMenuVisible {
+            menu.setMenuVisible(false, animated: true)
+        }
+    }
+
+    // MARK: - Section Creation Menu (Lasso → Create Section)
+
+	    func showLassoSectionMenuIfNeeded(anchorRect: CGRect) {
+	        guard let coord = coordinator else { return }
+	        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
+	        guard !isShowingSectionColorMenu else { return }
+
+	        let menu = UIMenuController.shared
+
+	        if !anchorRect.isNull, !anchorRect.isInfinite {
+            let delta = abs(anchorRect.midX - lastLassoMenuAnchorRect.midX) + abs(anchorRect.midY - lastLassoMenuAnchorRect.midY)
+            if !lastLassoMenuAnchorRect.isNull, delta < 8.0, menu.isMenuVisible {
+                return
+            }
+        }
+
+        // Ensure link menus don't fight this.
+        isShowingRemoveHighlightMenu = false
+        removeHighlightMenuKey = nil
+        lastLinkMenuAnchorRect = .null
+
+	        isShowingLassoSectionMenu = true
+	        becomeFirstResponder()
+	        menu.menuItems = [
+	            UIMenuItem(title: "Create Section", action: #selector(createSectionMenuItem(_:)))
+	        ]
+	        menu.showMenu(from: self, rect: anchorRect)
+	        lastLassoMenuAnchorRect = anchorRect
+	    }
+
+    private func hideLassoSectionMenu() {
+        isShowingLassoSectionMenu = false
+        lastLassoMenuAnchorRect = .null
+        hideLinkMenu()
+    }
+
+    private func showRemoveHighlightMenuIfNeeded(key: Coordinator.LinkHighlightKey, anchorRect: CGRect) {
+        guard !isPresentingLinkPrompt else { return }
+        guard !isPresentingInternalLinkPicker else { return }
+
+        isShowingRemoveHighlightMenu = true
+        removeHighlightMenuKey = key
+
+        // Hide any existing link menu state so it doesn't fight this menu.
+        lastLinkMenuAnchorRect = .null
+
+        becomeFirstResponder()
+        let menu = UIMenuController.shared
+        menu.menuItems = [
+            UIMenuItem(title: "Remove Highlight", action: #selector(removeHighlightMenuItem(_:)))
+        ]
+        menu.showMenu(from: self, rect: anchorRect)
+    }
+
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+
+	    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+	        if action == #selector(addLinkMenuItem(_:)) {
+	            return coordinator?.linkSelection != nil && coordinator?.isDraggingLinkHandle == false
+	        }
+	        if action == #selector(addInternalLinkMenuItem(_:)) {
+            return coordinator?.linkSelection != nil && coordinator?.isDraggingLinkHandle == false
+        }
+        if action == #selector(removeHighlightMenuItem(_:)) {
+            return removeHighlightMenuKey != nil &&
+                isPresentingLinkPrompt == false &&
+                isPresentingInternalLinkPicker == false
+        }
+	        if action == #selector(createSectionMenuItem(_:)) {
+	            guard let selection = coordinator?.lassoSelection else { return false }
+	            return selection.cardStrokes.isEmpty
+	        }
+        if action == #selector(setSectionColor0MenuItem(_:)) ||
+            action == #selector(setSectionColor1MenuItem(_:)) ||
+            action == #selector(setSectionColor2MenuItem(_:)) ||
+            action == #selector(setSectionColor3MenuItem(_:)) ||
+            action == #selector(setSectionColor4MenuItem(_:)) ||
+            action == #selector(setSectionColor5MenuItem(_:)) ||
+            action == #selector(renameSectionMenuItem(_:)) ||
+            action == #selector(deleteSectionMenuItem(_:)) {
+            return isShowingSectionColorMenu && sectionColorMenuTarget != nil
+        }
+        return super.canPerformAction(action, withSender: sender)
+	    }
+
+    @objc private func addLinkMenuItem(_ sender: Any?) {
+        presentAddLinkPrompt()
+    }
+
+    @objc private func addInternalLinkMenuItem(_ sender: Any?) {
+        presentInternalLinkPicker()
+    }
+
+    @objc private func removeHighlightMenuItem(_ sender: Any?) {
+        guard let key = removeHighlightMenuKey else { return }
+        coordinator?.removeHighlightSection(key)
+        removeHighlightMenuKey = nil
+        isShowingRemoveHighlightMenu = false
+        hideLinkMenu()
+    }
+
+		    @objc private func createSectionMenuItem(_ sender: Any?) {
+		        guard let coord = coordinator else { return }
+		        guard let selection = coord.lassoSelection, selection.cardStrokes.isEmpty else { return }
+
+		        _ = selection
+		        hideLassoSectionMenu()
+
+		        let randomColor = Self.sectionColorPalette.randomElement()?.color ?? SIMD4<Float>(1.0, 0.90, 0.20, 1.0)
+		        coord.createSectionFromLasso(name: "", color: randomColor)
+		        ignoreTapsUntilTime = CACurrentMediaTime() + 0.25
+		    }
+
+    private func showSectionColorMenuIfNeeded(section: Section, anchorRect: CGRect) {
+        guard !isPresentingLinkPrompt else { return }
+        guard !isPresentingInternalLinkPicker else { return }
+
+        sectionColorMenuTarget = section
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+
+        let colors = Self.sectionColorPalette.map { choice in
+            FloatingMenuViewController.ColorOption(
+                color: UIColor(
+                    red: CGFloat(choice.color.x),
+                    green: CGFloat(choice.color.y),
+                    blue: CGFloat(choice.color.z),
+                    alpha: 1.0
+                ),
+                simdColor: choice.color
+            )
+        }
+
+        let menuItems = [
+            FloatingMenuViewController.MenuItem(title: "Delete", icon: "trash", isDestructive: true) { [weak self] in
+                guard let self else { return }
+                self.coordinator?.deleteSection(section)
+                self.sectionColorMenuTarget = nil
+            }
+        ]
+
+        let menu = FloatingMenuViewController(
+            colors: colors,
+            menuItems: menuItems,
+            onColorSelected: { [weak self] _, simdColor in
+                section.color = simdColor
+                section.labelTexture = nil
+                self?.ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+            },
+            initialPickerColor: UIColor(
+                red: CGFloat(section.color.x),
+                green: CGFloat(section.color.y),
+                blue: CGFloat(section.color.z),
+                alpha: 1.0
+            ),
+            onDismiss: { [weak self] in
+                self?.hideSectionColorMenu()
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func showCardMenuIfNeeded(card: Card, frame: Frame, anchorRect: CGRect) {
+        cardMenuTarget = card
+        cardMenuTargetFrame = frame
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+        guard let coord = coordinator else { return }
+
+        // Previous card menu (small + sheet-based settings) kept for reference:
+        //
+        // let colors = Self.cardColorPalette.map { choice in ... }
+        // let menuItems = [ Settings (sheet), Lock, Delete ]
+        // let menu = FloatingMenuViewController(...)
+        //
+        // The new card long-press uses a popover-style floating settings menu instead.
+        let menu = CardSettingsFloatingMenu(
+            card: card,
+            shadowsEnabled: coord.cardShadowEnabled,
+            onToggleShadows: { [weak coord] enabled in
+                coord?.cardShadowEnabled = enabled
+            },
+            onDelete: { [weak self] in
+                guard let self else { return }
+                self.coordinator?.deleteCard(card)
+                self.cardMenuTarget = nil
+                self.cardMenuTargetFrame = nil
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func hideSectionColorMenu() {
+	        isShowingSectionColorMenu = false
+	        sectionColorMenuTarget = nil
+	        hideLinkMenu()
+	    }
+	
+	    private func applySectionColor(_ color: SIMD4<Float>) {
+	        guard let section = sectionColorMenuTarget else { return }
+	        section.color = color
+	        section.labelTexture = nil
+	        isShowingSectionColorMenu = false
+	        sectionColorMenuTarget = nil
+	        hideLinkMenu()
+	        ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+	    }
+	
+    @objc private func setSectionColor0MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[0].color) }
+    @objc private func setSectionColor1MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[1].color) }
+    @objc private func setSectionColor2MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[2].color) }
+    @objc private func setSectionColor3MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[3].color) }
+    @objc private func setSectionColor4MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[4].color) }
+    @objc private func setSectionColor5MenuItem(_ sender: Any?) { applySectionColor(Self.sectionColorPalette[5].color) }
+
+    @objc private func renameSectionMenuItem(_ sender: Any?) {
+        guard let section = sectionColorMenuTarget else { return }
+        hideSectionColorMenu()
+        presentSectionRenamePrompt(section: section)
+    }
+
+    @objc private func deleteSectionMenuItem(_ sender: Any?) {
+        guard let section = sectionColorMenuTarget else { return }
+        coordinator?.deleteSection(section)
+        hideSectionColorMenu()
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+    }
+
+    private func presentSectionRenamePrompt(section: Section) {
+        hideSectionColorMenu()
+        ignoreTapsUntilTime = CACurrentMediaTime() + 0.3
+
+        let alert = UIAlertController(title: "Rename Section", message: nil, preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = section.name
+            field.placeholder = "Section name"
+            field.autocapitalizationType = .sentences
+            field.autocorrectionType = .yes
+            field.returnKeyType = .done
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel, handler: nil))
+        alert.addAction(UIAlertAction(title: "Rename", style: .default) { [weak self] _ in
+            guard let self else { return }
+            let newName = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            section.name = newName.isEmpty ? "Untitled" : newName
+            section.labelTexture = nil // Force label texture regeneration
+            self.coordinator?.refreshInternalLinkReferenceCache()
+            self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.2
+        })
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(alert, animated: true) {
+            alert.textFields?.first?.becomeFirstResponder()
+        }
+    }
+
+    @objc private func handleLinkHandlePan(_ gesture: UIPanGestureRecognizer) {
+        guard let coord = coordinator else { return }
+
+        let loc = gesture.location(in: self)
+
+        switch gesture.state {
+        case .began:
+            stopMomentum()
+            coord.isDraggingLinkHandle = true
+            coord.beginLinkSelectionDrag(at: loc, viewSize: bounds.size)
+            hideLinkMenu()
+            // Prevent canvas pan from also recognizing while dragging a handle.
+            panGesture.isEnabled = false
+            panGesture.isEnabled = true
+
+        case .changed:
+            coord.extendLinkSelection(to: loc, viewSize: bounds.size)
+            updateLinkSelectionOverlay()
+
+        case .ended, .cancelled, .failed:
+            coord.isDraggingLinkHandle = false
+            coord.snapLinkSelectionHandleToBounds()
+            updateLinkSelectionOverlay()
+
+        default:
+            break
+        }
+    }
+
+    private func presentAddLinkPrompt() {
+        guard let coord = coordinator else { return }
+        guard coord.linkSelection != nil else { return }
+
+        isPresentingLinkPrompt = true
+        hideLinkMenu()
+        let anchorRect = (!lastLinkMenuAnchorRect.isNull && !lastLinkMenuAnchorRect.isInfinite)
+            ? lastLinkMenuAnchorRect
+            : CGRect(x: bounds.midX - 2, y: bounds.midY - 2, width: 4, height: 4)
+        lastLinkMenuAnchorRect = .null
+
+        let initialText: String? = {
+            if let url = UIPasteboard.general.url?.absoluteString {
+                return url
+            }
+            if let str = UIPasteboard.general.string, !str.isEmpty {
+                return str
+            }
+            return nil
+        }()
+
+        let menu = AddLinkFloatingMenuViewController(
+            initialText: initialText,
+            onAdd: { [weak self] normalized in
+                guard let self else { return }
+                guard let coord = self.coordinator else { return }
+                coord.addLinkToSelection(normalized)
+                coord.snapLinkSelectionHandleToBounds()
+                self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
+                self.updateLinkSelectionOverlay()
+            },
+            onDismiss: { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingLinkPrompt = false
+                }
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func presentInternalLinkPicker() {
+        guard let coord = coordinator else { return }
+        guard coord.linkSelection != nil else { return }
+
+        isPresentingInternalLinkPicker = true
+        hideLinkMenu()
+        let anchorRect = (!lastLinkMenuAnchorRect.isNull && !lastLinkMenuAnchorRect.isInfinite)
+            ? lastLinkMenuAnchorRect
+            : CGRect(x: bounds.midX - 2, y: bounds.midY - 2, width: 4, height: 4)
+        lastLinkMenuAnchorRect = .null
+
+        let destinations = coord.linkDestinationsInCanvas()
+        guard !destinations.isEmpty else {
+            let alert = UIAlertController(title: "No Sections or Cards",
+                                          message: "Create a section or card first.",
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default, handler: { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingInternalLinkPicker = false
+                }
+            }))
+            nearestViewController()?.present(alert, animated: true)
+            return
+        }
+
+        let menu = InternalLinkPickerFloatingMenuViewController(
+            destinations: destinations,
+            onSelect: { [weak self] destination in
+                guard let self else { return }
+                guard let coord = self.coordinator else { return }
+                coord.addInternalLinkToSelection(destination)
+                coord.snapLinkSelectionHandleToBounds()
+                self.ignoreTapsUntilTime = CACurrentMediaTime() + 0.35
+                self.updateLinkSelectionOverlay()
+            },
+            onDismiss: { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    self?.isPresentingInternalLinkPicker = false
+                }
+            },
+            sourceRect: anchorRect,
+            sourceView: self
+        )
+
+        guard let vc = nearestViewController() else { return }
+        vc.present(menu, animated: true)
+    }
+
+    private func nearestViewController() -> UIViewController? {
+        var responder: UIResponder? = self
+        while let current = responder {
+            if let vc = current as? UIViewController {
+                return vc
+            }
+            responder = current.next
+        }
+        return nil
+    }
+
     // MARK: - Gesture Handlers
 
     ///  MODAL INPUT: TAP (Finger Only - Select/Deselect Cards)
     @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-        let loc = gesture.location(in: self)
-        guard let coord = coordinator else { return }
+	        if CACurrentMediaTime() < ignoreTapsUntilTime {
+	            return
+	        }
+
+	        let loc = gesture.location(in: self)
+	        guard let coord = coordinator else { return }
+
+	        if let field = cardNameTextField {
+	            // Tap-away commits and dismisses the inline editor.
+	            if field.frame.contains(loc) {
+	                return
+	            }
+	            commitAndEndCardNameEditing()
+	            return
+	        }
+
+	        if let field = sectionNameTextField {
+	            // Tap-away commits and dismisses the inline editor.
+	            if field.frame.contains(loc) {
+	                return
+	            }
+	            commitAndEndSectionNameEditing()
+	            return
+	        }
+	
+	        if isShowingSectionColorMenu {
+	            hideSectionColorMenu()
+	            return
+	        }
 
         if coord.handleLassoTap(screenPoint: loc, viewSize: bounds.size) {
+            if coord.lassoSelection == nil {
+                hideLassoSectionMenu()
+            }
+            return
+        }
+
+        if coord.linkSelection != nil {
+            // 1) Tap on a linked selected stroke: open it.
+            if coord.openLinkIfNeeded(at: loc, viewSize: bounds.size, restrictToSelection: true) {
+                return
+            }
+
+            // 2) Tap inside selection: keep selection (no side effects).
+            if coord.linkSelectionContains(screenPoint: loc, viewSize: bounds.size) {
+                return
+            }
+
+            // 3) Tap away: clear link selection + UI.
+            coord.clearLinkSelection()
+            updateLinkSelectionOverlay()
+            return
+        }
+
+        // Tap on any linked stroke (when no selection is active).
+        if coord.openLinkIfNeeded(at: loc, viewSize: bounds.size, restrictToSelection: false) {
+            return
+        }
+
+        // Tap on card name label: inline rename.
+        if let hit = coord.hitTestCardLabelHierarchy(screenPoint: loc, viewSize: bounds.size) {
+            beginEditingCardName(card: hit.card, frame: hit.frame)
             return
         }
 
         // Use the new hierarchical hit test to find cards at any depth
         if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
-            // Toggle Edit on the card (wherever it lives - parent, active, or child)
-            result.card.isEditing.toggle()
+            if case .youtube = result.card.type {
+                if result.card.isEditing {
+                    toggleYouTubeOverlay(card: result.card, frame: result.frame)
+                } else {
+                    result.card.isEditing = true
+                }
+            } else {
+                // Toggle Edit on the card (wherever it lives - parent, active, or child)
+                result.card.isEditing.toggle()
+            }
+            return
+        }
+
+        // Tap on section name label: inline rename.
+        if let hit = coord.hitTestSectionLabelHierarchy(screenPoint: loc, viewSize: bounds.size) {
+            beginEditingSectionName(section: hit.section, frame: hit.frame)
             return
         }
 
         // If we tapped nothing, deselect all cards (requires recursive clear)
-        clearSelectionRecursive(frame: coord.rootFrame)
+        var topFrame = coord.activeFrame
+        while let parent = topFrame.parent {
+            topFrame = parent
+        }
+        clearSelectionRecursive(frame: topFrame)
     }
 
     /// Helper to clear all card selections recursively across the entire hierarchy
     func clearSelectionRecursive(frame: Frame) {
         frame.cards.forEach { $0.isEditing = false }
-        frame.children.forEach { clearSelectionRecursive(frame: $0) }
+        for child in frame.children.values {
+            clearSelectionRecursive(frame: child)
+        }
     }
 
     ///  MODAL INPUT: PAN (Finger Only - Drag Card or Pan Canvas)
@@ -561,9 +2137,13 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             lassoDragActive = false
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoDragActive = true
+                hideLassoSectionMenu()
                 dragContext = nil
                 // TODO: Capture lasso state for undo
                 return
@@ -579,11 +2159,15 @@ class TouchableMTKView: MTKView {
                     let isOnHandle = coord.isPointOnCardHandle(result.pointInFrame, card: result.card, zoom: zoomInFrame)
 
                     // Store Card + Scale Factor + Resize Mode
-                    dragContext = DragContext(card: result.card, conversionScale: result.conversionScale, isResizing: isOnHandle)
+                    dragContext = DragContext(card: result.card, frame: result.frame, conversionScale: result.conversionScale, isResizing: isOnHandle)
                     return
                 }
             }
             dragContext = nil // Pan Canvas
+
+            // Initialize velocity tracking
+            lastPanTime = CACurrentMediaTime()
+            panVelocity = .zero
 
 	        case .changed:
             let translation = gesture.translation(in: self)
@@ -630,9 +2214,31 @@ class TouchableMTKView: MTKView {
                     let localDx = frameDelta.x * cardC + frameDelta.y * cardS
                     let localDy = -frameDelta.x * cardS + frameDelta.y * cardC
 
+                    let minCardSize: Double = 10.0
+
                     // Size changes by the desired corner movement
-                    let newSizeX = max(context.card.size.x + localDx, 10.0)
-                    let newSizeY = max(context.card.size.y + localDy, 10.0)
+                    var newSizeX = max(context.card.size.x + localDx, minCardSize)
+                    var newSizeY = max(context.card.size.y + localDy, minCardSize)
+
+                    // Lock aspect ratio for YouTube embed cards.
+                    if case .youtube(_, let aspectRatio) = context.card.type,
+                       aspectRatio.isFinite, aspectRatio > 0 {
+                        let proposedWidthFromDx = context.card.size.x + localDx
+                        let proposedWidthFromDy = context.card.size.x + localDy * aspectRatio
+                        let widthCandidate = abs(localDx) >= abs(localDy * aspectRatio)
+                            ? proposedWidthFromDx
+                            : proposedWidthFromDy
+
+                        var lockedWidth = max(widthCandidate, minCardSize)
+                        var lockedHeight = lockedWidth / aspectRatio
+                        if lockedHeight < minCardSize {
+                            lockedHeight = minCardSize
+                            lockedWidth = lockedHeight * aspectRatio
+                        }
+
+                        newSizeX = lockedWidth
+                        newSizeY = lockedHeight
+                    }
 
                     // Calculate actual size change (accounting for minimum size clamping)
                     let deltaX = newSizeX - context.card.size.x
@@ -676,11 +2282,33 @@ class TouchableMTKView: MTKView {
 
                 coord.panOffset.x += dx * c + dy * s
                 coord.panOffset.y += -dx * s + dy * c
+
+                // Track velocity for momentum
+                // Since we reset translation each frame, translation IS the delta
+                let currentTime = CACurrentMediaTime()
+                let dt = currentTime - lastPanTime
+                if dt > 0 {
+                    // Calculate velocity in screen space (before rotation)
+                    panVelocity.x = Double(translation.x) / dt
+                    panVelocity.y = Double(translation.y) / dt
+                }
+                lastPanTime = currentTime
+
                 gesture.setTranslation(.zero, in: self)
+
+                // Keep coordinates bounded by swapping tiles when the camera center exits the frame.
+                let centerScreen = CGPoint(x: bounds.size.width / 2.0, y: bounds.size.height / 2.0)
+                let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+                _ = wrapFractalIfNeeded(coord: coord,
+                                       anchorWorld: cameraCenterWorld,
+                                       anchorScreen: centerScreen)
             }
 
         case .ended, .cancelled, .failed:
             // TODO: Record undo action for lasso move
+            if lassoDragActive {
+                coord.endLassoDrag()
+            }
 
             // Record undo action for card move/resize
             if let context = dragContext {
@@ -688,7 +2316,7 @@ class TouchableMTKView: MTKView {
                     // Only record if size or origin actually changed
                     if context.card.size != context.startSize || context.card.origin != context.startOrigin {
                         coord.pushUndoResizeCard(card: context.card,
-                                                frame: coord.activeFrame,
+                                                frame: context.frame,
                                                 oldOrigin: context.startOrigin,
                                                 oldSize: context.startSize)
                     }
@@ -696,11 +2324,23 @@ class TouchableMTKView: MTKView {
                     // Only record if origin actually changed
                     if context.card.origin != context.startOrigin {
                         coord.pushUndoMoveCard(card: context.card,
-                                              frame: coord.activeFrame,
+                                              frame: context.frame,
                                               oldOrigin: context.startOrigin)
                     }
                 }
+
+                // Normalize across same-depth frames (and recompute section membership).
+                coord.normalizeCardAcrossFramesIfNeeded(card: context.card, from: context.frame, viewSize: bounds.size)
             }
+
+            // Start momentum if panning canvas and velocity is significant
+            if dragContext == nil && !lassoDragActive {
+                let speed = sqrt(panVelocity.x * panVelocity.x + panVelocity.y * panVelocity.y)
+                if speed > 50.0 { // Minimum velocity threshold (points per second)
+                    startMomentum()
+                }
+            }
+
             lassoDragActive = false
             dragContext = nil
 
@@ -716,6 +2356,9 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoPinchActive = true
                 coord.beginLassoTransformIfNeeded()
@@ -778,9 +2421,9 @@ class TouchableMTKView: MTKView {
 
             // 🔑 IMPORTANT: depth switches are driven by the *shared anchor*,
             // not by re-sampling world from the current centroid.
-            if checkTelescopingTransitions(coord: coord,
-                                           anchorWorld: anchorWorld,
-                                           anchorScreen: anchorScreen) {
+            if checkFractalTransitions(coord: coord,
+                                       anchorWorld: anchorWorld,
+                                       anchorScreen: anchorScreen) {
                 // The transition functions already solved a perfect panOffset
                 // to keep the anchor pinned. Do NOT overwrite it this frame.
                 return
@@ -800,6 +2443,11 @@ class TouchableMTKView: MTKView {
             if activeOwner == .pinch {
                 anchorScreen = targetScreen
             }
+
+            // Keep coordinates bounded by swapping tiles when the anchor drifts outside the frame.
+            anchorWorld = wrapFractalIfNeeded(coord: coord,
+                                             anchorWorld: anchorWorld,
+                                             anchorScreen: anchorScreen)
 
         case .ended, .cancelled, .failed:
             if lassoPinchActive {
@@ -837,6 +2485,9 @@ class TouchableMTKView: MTKView {
 
         switch gesture.state {
         case .began:
+            // Stop any ongoing momentum
+            stopMomentum()
+
             if coord.lassoContains(screenPoint: loc, viewSize: bounds.size) {
                 lassoRotationActive = true
                 coord.beginLassoTransformIfNeeded()
@@ -888,6 +2539,11 @@ class TouchableMTKView: MTKView {
                                                              rotationAngle: coord.rotationAngle)
             if activeOwner == .rotation { anchorScreen = target }
 
+            // Keep coordinates bounded by swapping tiles when the anchor drifts outside the frame.
+            anchorWorld = wrapFractalIfNeeded(coord: coord,
+                                             anchorWorld: anchorWorld,
+                                             anchorScreen: anchorScreen)
+
         case .ended, .cancelled, .failed:
             if lassoRotationActive {
                 lassoRotationActive = false
@@ -927,8 +2583,93 @@ class TouchableMTKView: MTKView {
 
         if gesture.state == .began {
             let location = gesture.location(in: self)
+            if let key = coord.hitTestHighlightSection(at: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showRemoveHighlightMenuIfNeeded(key: key, anchorRect: anchor)
+                return
+            }
+
+            // Stroke long-press takes precedence (link selection).
+            if coord.beginLinkSelection(at: location, viewSize: bounds.size) {
+                updateLinkSelectionOverlay()
+                return
+            }
+
+            // Card long-press shows card menu.
+            if let (card, frame, _, _) = coord.hitTestHierarchy(screenPoint: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showCardMenuIfNeeded(card: card, frame: frame, anchorRect: anchor)
+                return
+            }
+
+            // Section bounds long-press shows color menu.
+            if let section = coord.hitTestSectionHierarchy(screenPoint: location, viewSize: bounds.size) {
+                let anchor = CGRect(x: location.x - 2, y: location.y - 2, width: 4, height: 4)
+                showSectionColorMenuIfNeeded(section: section, anchorRect: anchor)
+                return
+            }
+
+            // Clear any previous remove-highlight menu state if we didn't hit a highlight box.
+            removeHighlightMenuKey = nil
+            isShowingRemoveHighlightMenu = false
+
             coord.handleLongPress(at: location)
+            updateLinkSelectionOverlay()
         }
+    }
+
+    // MARK: - Pan Momentum
+
+    func startMomentum() {
+        // Stop any existing display link without resetting velocity
+        momentumDisplayLink?.invalidate()
+        momentumDisplayLink = CADisplayLink(target: self, selector: #selector(updateMomentum))
+        momentumDisplayLink?.add(to: .main, forMode: .common)
+    }
+
+    func stopMomentum() {
+        momentumDisplayLink?.invalidate()
+        momentumDisplayLink = nil
+        panVelocity = .zero
+    }
+
+    @objc func updateMomentum() {
+        guard let coord = coordinator else {
+            stopMomentum()
+            return
+        }
+
+        // Get frame duration (typically 1/60 for 60fps)
+        let dt = momentumDisplayLink?.duration ?? (1.0 / 60.0)
+
+        // Apply friction to decelerate (higher = slides more)
+        let friction = 0.96
+        panVelocity.x *= friction
+        panVelocity.y *= friction
+
+        // Check if velocity is below threshold and stop
+        let speed = sqrt(panVelocity.x * panVelocity.x + panVelocity.y * panVelocity.y)
+        if speed < 0.5 {
+            stopMomentum()
+            return
+        }
+
+        // Apply velocity to pan offset
+        let dx = panVelocity.x * dt
+        let dy = panVelocity.y * dt
+
+        let ang = Double(coord.rotationAngle)
+        let c = cos(ang), s = sin(ang)
+
+        coord.panOffset.x += dx * c + dy * s
+        coord.panOffset.y += -dx * s + dy * c
+
+        // Keep coordinates bounded by swapping tiles when the camera center exits the frame.
+        let centerScreen = CGPoint(x: bounds.size.width / 2.0, y: bounds.size.height / 2.0)
+        let cameraCenterWorld = coord.calculateCameraCenterWorld(viewSize: bounds.size)
+        _ = wrapFractalIfNeeded(coord: coord,
+                               anchorWorld: cameraCenterWorld,
+                               anchorScreen: centerScreen)
     }
 
 
@@ -978,5 +2719,163 @@ class TouchableMTKView: MTKView {
             guard event?.allTouches?.count == 1 else { return }
         }
         coordinator?.handleTouchCancelled(touchType: touch.type)
+    }
+}
+
+// MARK: - Apple Pencil Interactions
+
+extension TouchableMTKView: UIPencilInteractionDelegate {
+    @available(iOS 17.5, *)
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        guard squeeze.phase == .ended else { return }
+        coordinator?.onPencilSqueeze?()
+    }
+}
+
+// MARK: - Gesture Delegate (Ignore Inline Text Editing)
+
+extension TouchableMTKView: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        let loc = touch.location(in: self)
+
+        if let field = sectionNameTextField, field.frame.contains(loc) {
+            return false
+        }
+        if let field = cardNameTextField, field.frame.contains(loc) {
+            return false
+        }
+        if let button = youtubeCloseButton,
+           button.isHidden == false,
+           button.frame.contains(loc) {
+            return false
+        }
+        #if canImport(YouTubePlayerKit)
+        if let view = youtubeHostingView,
+           !view.isHidden,
+           view.frame.contains(loc) {
+            return false
+        }
+        #else
+        if let webView = youtubeWebView,
+           webView.superview != nil,
+           !webView.isHidden,
+           webView.frame.contains(loc) {
+            return false
+        }
+        #endif
+        return true
+    }
+}
+
+// MARK: - UITextField Delegate (Inline Section Rename)
+
+extension TouchableMTKView: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === sectionNameTextField {
+            commitAndEndSectionNameEditing()
+        } else if textField === cardNameTextField {
+            commitAndEndCardNameEditing()
+        }
+        return false
+    }
+}
+
+// MARK: - Section Options Sheet
+
+private class SectionOptionsViewController: UIViewController {
+    private let colors: [UIColor]
+    private let onColorSelected: (Int) -> Void
+    private let onRename: () -> Void
+    private let onDelete: () -> Void
+
+    init(colors: [UIColor], onColorSelected: @escaping (Int) -> Void, onRename: @escaping () -> Void, onDelete: @escaping () -> Void) {
+        self.colors = colors
+        self.onColorSelected = onColorSelected
+        self.onRename = onRename
+        self.onDelete = onDelete
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+
+        // Color buttons row
+        let colorStack = UIStackView()
+        colorStack.axis = .horizontal
+        colorStack.spacing = 16
+        colorStack.alignment = .center
+        colorStack.distribution = .equalSpacing
+
+        for (index, color) in colors.enumerated() {
+            let button = UIButton(type: .system)
+            button.backgroundColor = color
+            button.layer.cornerRadius = 22
+            button.tag = index
+            button.addTarget(self, action: #selector(colorTapped(_:)), for: .touchUpInside)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 44),
+                button.heightAnchor.constraint(equalToConstant: 44)
+            ])
+            colorStack.addArrangedSubview(button)
+        }
+
+        // Action buttons row
+        let renameButton = UIButton(type: .system)
+        renameButton.setTitle("Rename", for: .normal)
+        renameButton.titleLabel?.font = .systemFont(ofSize: 17)
+        renameButton.addTarget(self, action: #selector(renameTapped), for: .touchUpInside)
+
+        let deleteButton = UIButton(type: .system)
+        deleteButton.setTitle("Delete", for: .normal)
+        deleteButton.setTitleColor(.systemRed, for: .normal)
+        deleteButton.titleLabel?.font = .systemFont(ofSize: 17)
+        deleteButton.addTarget(self, action: #selector(deleteTapped), for: .touchUpInside)
+
+        let actionStack = UIStackView(arrangedSubviews: [renameButton, deleteButton])
+        actionStack.axis = .horizontal
+        actionStack.spacing = 40
+        actionStack.alignment = .center
+
+        // Main stack
+        let mainStack = UIStackView(arrangedSubviews: [colorStack, actionStack])
+        mainStack.axis = .vertical
+        mainStack.spacing = 24
+        mainStack.alignment = .center
+        mainStack.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(mainStack)
+        NSLayoutConstraint.activate([
+            mainStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            mainStack.topAnchor.constraint(equalTo: view.topAnchor, constant: 32)
+        ])
+    }
+
+    @objc private func colorTapped(_ sender: UIButton) {
+        dismiss(animated: true) { [weak self] in
+            self?.onColorSelected(sender.tag)
+        }
+    }
+
+    @objc private func renameTapped() {
+        dismiss(animated: true) { [weak self] in
+            self?.onRename()
+        }
+    }
+
+    @objc private func deleteTapped() {
+        dismiss(animated: true) { [weak self] in
+            self?.onDelete()
+        }
     }
 }
