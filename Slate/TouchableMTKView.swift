@@ -135,6 +135,8 @@ private class DragContext {
         private var youtubeOverlayLastSize: CGSize?
         private var youtubeOverlayLastRotation: CGFloat?
         private var youtubeLastErrorSummary: String?
+	    private var youtubeCloseButton: UIButton?
+	    private var youtubeCloseButtonLastFrame: CGRect = .null
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
     var pinchAnchorScreen: CGPoint = .zero
@@ -1044,6 +1046,76 @@ private class DragContext {
         #endif
     }
 
+    func updateYouTubeCloseButtonOverlay() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateYouTubeCloseButtonOverlay()
+            }
+            return
+        }
+
+        guard let coord = coordinator else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        guard let card = youtubeCardTarget,
+              let frame = youtubeCardFrame else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        guard case .youtube = card.type else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        #if canImport(YouTubePlayerKit)
+        guard youtubeHostingView?.isHidden == false else {
+            hideYouTubeCloseButton()
+            return
+        }
+        #else
+        guard youtubeWebView?.superview != nil,
+              youtubeWebView?.isHidden == false else {
+            hideYouTubeCloseButton()
+            return
+        }
+        #endif
+
+        if card.labelWorldSize.x <= 0.0 || card.labelWorldSize.y <= 0.0 {
+            card.ensureLabelTexture(device: coord.device)
+        }
+
+        guard let labelRect = coord.cardLabelScreenRect(card: card,
+                                                       frame: frame,
+                                                       viewSize: bounds.size,
+                                                       ignoreHideRule: true) else {
+            hideYouTubeCloseButton()
+            return
+        }
+
+        let gap: CGFloat = 6.0
+        let side = max(labelRect.height, 20.0)
+        var buttonRect = CGRect(x: labelRect.maxX + gap,
+                                y: labelRect.minY,
+                                width: side,
+                                height: side)
+
+        // Keep the button visible if the label is near the right edge.
+        if buttonRect.maxX > bounds.size.width - 4.0 {
+            buttonRect.origin.x = labelRect.minX - gap - side
+        }
+
+        let button = ensureYouTubeCloseButton()
+        if youtubeCloseButtonLastFrame != buttonRect {
+            button.frame = buttonRect
+            youtubeCloseButtonLastFrame = buttonRect
+        }
+        button.isHidden = false
+        bringSubviewToFront(button)
+    }
+
     func youtubeHUDText() -> String {
         #if canImport(YouTubePlayerKit)
         let activeVideoID: String = {
@@ -1236,6 +1308,7 @@ private class DragContext {
         youtubeOverlayLastCenter = nil
         youtubeOverlayLastSize = nil
         youtubeOverlayLastRotation = nil
+	    hideYouTubeCloseButton()
         #if canImport(YouTubePlayerKit)
         youtubePendingVideoID = nil
         youtubeHostingView?.isHidden = true
@@ -1248,6 +1321,32 @@ private class DragContext {
         youtubeWebView?.stopLoading()
         youtubeWebView?.removeFromSuperview()
         #endif
+    }
+
+    private func ensureYouTubeCloseButton() -> UIButton {
+        if let existing = youtubeCloseButton { return existing }
+        let button = UIButton(type: .system)
+        button.setTitle("X", for: .normal)
+        button.setTitleColor(.white, for: .normal)
+        button.titleLabel?.font = UIFont.systemFont(ofSize: 14.0, weight: .bold)
+        button.backgroundColor = .systemRed
+        button.layer.cornerRadius = 8.0
+        button.layer.masksToBounds = true
+        button.isHidden = true
+        button.addTarget(self, action: #selector(onYouTubeCloseTapped), for: .touchUpInside)
+        addSubview(button)
+        youtubeCloseButton = button
+        return button
+    }
+
+    private func hideYouTubeCloseButton() {
+        youtubeCloseButton?.isHidden = true
+        youtubeCloseButtonLastFrame = .null
+    }
+
+    @objc private func onYouTubeCloseTapped() {
+        // Explicit user action: stop and return to thumbnail view.
+        deactivateYouTubeOverlay()
     }
 
     private func setYouTubeVideo(videoID: String) {
@@ -2648,6 +2747,11 @@ extension TouchableMTKView: UIGestureRecognizerDelegate {
             return false
         }
         if let field = cardNameTextField, field.frame.contains(loc) {
+            return false
+        }
+        if let button = youtubeCloseButton,
+           button.isHidden == false,
+           button.frame.contains(loc) {
             return false
         }
         #if canImport(YouTubePlayerKit)

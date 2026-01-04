@@ -3874,6 +3874,7 @@ import UIKit
 	        // Update label on main thread
 	        DispatchQueue.main.async {
 	            (mtkView as? TouchableMTKView)?.updateYouTubeOverlay()
+	            (mtkView as? TouchableMTKView)?.updateYouTubeCloseButtonOverlay()
 	            (mtkView as? TouchableMTKView)?.updateLinkSelectionOverlay()
 	            (mtkView as? TouchableMTKView)?.updateSectionNameEditorOverlay()
 	            (mtkView as? TouchableMTKView)?.updateCardNameEditorOverlay()
