@@ -22,6 +22,7 @@ import UIKit
 	    var sectionFillPipelineState: MTLRenderPipelineState! // Unmasked solid triangles (Sections)
 	    var strokeSegmentPipelineState: MTLRenderPipelineState! // SDF segment pipeline
 	    var strokeSegmentBatchedPipelineState: MTLRenderPipelineState! // Batched SDF segment pipeline
+	    var depthClearPipelineState: MTLRenderPipelineState!    // Depth+stencil reset between z-stack items
 	    var postProcessPipelineState: MTLRenderPipelineState!   // FXAA fullscreen pass
 	    var samplerState: MTLSamplerState!                  // Sampler for card textures
 	    var vertexBuffer: MTLBuffer!
@@ -1786,8 +1787,13 @@ import UIKit
 		        let items = zOrder
 		        guard !items.isEmpty else { return }
 
-			        let depthMax = Float(1.0).nextDown
-			        let bandScale = depthMax / Float(max(items.count, 1))
+		        func clearDepthAndStencilForZItem() {
+		            encoder.setRenderPipelineState(depthClearPipelineState)
+		            encoder.setDepthStencilState(stencilStateWrite)
+		            encoder.setStencilReferenceValue(0)
+		            encoder.setCullMode(.none)
+		            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+		        }
 
 		        var visibleCardsByID: [UUID: (card: Card, frame: Frame, cameraCenterInFrame: SIMD2<Double>, zoomInFrame: Double)] = [:]
 		        visibleCardsByID.reserveCapacity(32)
@@ -1811,13 +1817,16 @@ import UIKit
 		        // Bottom → top, so top items draw last.
 		        for idx in stride(from: items.count - 1, through: 0, by: -1) {
 		            let item = items[idx]
-		            let bandBias = Float(idx) * bandScale
 
 		            switch item {
 		            case .layer(let layerID):
 		                if layers.first(where: { $0.id == layerID })?.isHidden == true {
 		                    continue
 		                }
+		                // Reset depth between z-stack items so each layer/card has the full depth range
+		                // available for per-stroke ordering (prevents depth quantization when many
+		                // z-items exist).
+		                clearDepthAndStencilForZItem()
 		                // Depth-write strokes for this layer (per-frame batching).
 		                for frame in visibleFractalFramesDrawOrder {
 		                    guard !frame.strokes.isEmpty else { continue }
@@ -1838,8 +1847,8 @@ import UIKit
 		                                renderCards: false,
 		                                renderNoDepthWriteStrokes: false,
 		                                strokeLayerFilterID: layerID,
-		                                zDepthBias: bandBias,
-		                                zDepthScale: bandScale)
+		                                zDepthBias: 0.0,
+		                                zDepthScale: 1.0)
 		                }
 
 		                // No-depth-write strokes for this layer (globally sorted by depthID).
@@ -1849,11 +1858,14 @@ import UIKit
 		                                                 zoomActive: zoomActive,
 		                                                 rotation: rotation,
 		                                                 strokeLayerFilterID: layerID,
-		                                                 zDepthBias: bandBias,
-		                                                 zDepthScale: bandScale)
+		                                                 zDepthBias: 0.0,
+		                                                 zDepthScale: 1.0)
 
 		            case .card(let cardID):
 		                guard let entry = visibleCardsByID[cardID] else { continue }
+		                // Reset depth between z-stack items so this card doesn't interact with
+		                // stroke depth values from other layers/cards.
+		                clearDepthAndStencilForZItem()
 		                renderFrame(entry.frame,
 		                            cameraCenterInThisFrame: entry.cameraCenterInFrame,
 		                            viewSize: viewSize,
@@ -1864,8 +1876,8 @@ import UIKit
 		                            renderCards: true,
 		                            renderNoDepthWriteStrokes: false,
 		                            cardFilterID: cardID,
-		                            zDepthBias: bandBias,
-		                            zDepthScale: bandScale)
+		                            zDepthBias: 0.0,
+		                            zDepthScale: 1.0)
 		            }
 		        }
 		    }
@@ -4183,6 +4195,22 @@ import UIKit
             postProcessPipelineState = try device.makeRenderPipelineState(descriptor: fxaaDesc)
         } catch {
             fatalError("Failed to create postProcessPipelineState: \(error)")
+        }
+
+        // Depth clear pipeline (no color writes) for resetting depth between global z-stack items.
+        let depthClearDesc = MTLRenderPipelineDescriptor()
+        depthClearDesc.vertexFunction = library.makeFunction(name: "vertex_fullscreen_triangle_depth_clear")
+        depthClearDesc.fragmentFunction = library.makeFunction(name: "fragment_depth_clear")
+        depthClearDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        depthClearDesc.colorAttachments[0].writeMask = []
+        depthClearDesc.sampleCount = viewSampleCount
+        depthClearDesc.depthAttachmentPixelFormat = depthStencilFormat
+        depthClearDesc.stencilAttachmentPixelFormat = depthStencilFormat
+
+        do {
+            depthClearPipelineState = try device.makeRenderPipelineState(descriptor: depthClearDesc)
+        } catch {
+            fatalError("Failed to create depthClearPipelineState: \(error)")
         }
 
         // Create Sampler for card textures

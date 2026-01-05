@@ -382,6 +382,22 @@ vertex PostProcessOut vertex_fullscreen_triangle(uint vid [[vertex_id]]) {
     return out;
 }
 
+vertex PostProcessOut vertex_fullscreen_triangle_depth_clear(uint vid [[vertex_id]]) {
+    // Fullscreen triangle that writes FAR depth (1.0) without needing a vertex buffer.
+    float2 pos[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    float2 uv[3] = { float2(0.0, 1.0), float2(2.0, 1.0), float2(0.0, -1.0) };
+
+    PostProcessOut out;
+    out.position = float4(pos[vid], 1.0, 1.0);
+    out.uv = uv[vid];
+    return out;
+}
+
+fragment float4 fragment_depth_clear(PostProcessOut in [[stage_in]]) {
+    (void)in;
+    return float4(0.0);
+}
+
 fragment float4 fragment_fxaa(
     PostProcessOut in [[stage_in]],
     texture2d<float> colorTex [[texture(0)]],

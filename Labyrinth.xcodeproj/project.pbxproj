@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		EB365E632F085AC300F5B54A /* YouTubePlayerKit in Frameworks */ = {isa = PBXBuildFile; productRef = EB365E622F085AC300F5B54A /* YouTubePlayerKit */; };
+		EB365F9C2F0C384700F5B54A /* labyrinth.icon in Resources */ = {isa = PBXBuildFile; fileRef = EB365F9B2F0C384700F5B54A /* labyrinth.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,6 +29,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		EB365F9B2F0C384700F5B54A /* labyrinth.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = labyrinth.icon; sourceTree = "<group>"; };
 		EBFA97D12EAFF17D00FBB8B5 /* Slate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Slate.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -80,6 +82,7 @@
 		EBFA97C82EAFF17D00FBB8B5 = {
 			isa = PBXGroup;
 			children = (
+				EB365F9B2F0C384700F5B54A /* labyrinth.icon */,
 				EBFA97D32EAFF17D00FBB8B5 /* Slate */,
 				EBFA97E12EAFF17D00FBB8B5 /* SlateTests */,
 				EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */,
@@ -221,6 +224,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EB365F9C2F0C384700F5B54A /* labyrinth.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -404,8 +408,9 @@
 		EBFA97F32EAFF17D00FBB8B5 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = labyrinth;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A282AW9YX2;
@@ -425,7 +430,8 @@
 					"$(PROJECT_DIR)/Slate/web/demo/node_modules/@next/swc-darwin-arm64",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = penny.Slate;
+				NEW_SETTING = "";
+				PRODUCT_BUNDLE_IDENTIFIER = nyc.labyrinth;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -436,8 +442,9 @@
 		EBFA97F42EAFF17D00FBB8B5 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = labyrinth;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A282AW9YX2;
@@ -457,7 +464,8 @@
 					"$(PROJECT_DIR)/Slate/web/demo/node_modules/@next/swc-darwin-arm64",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = penny.Slate;
+				NEW_SETTING = "";
+				PRODUCT_BUNDLE_IDENTIFIER = nyc.labyrinth;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
