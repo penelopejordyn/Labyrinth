@@ -7,6 +7,11 @@ final class PersistenceManager {
 
     private init() {}
 
+    struct RNNStrokeSequence: Codable {
+        let version: Int
+        let points: [[Float]]
+    }
+
     struct ImportedCanvas {
         let rootFrame: Frame
         let fractalFrameExtent: SIMD2<Double>
@@ -23,13 +28,13 @@ final class PersistenceManager {
         let topFrame = topmostFrame(from: rootFrame)
         let dto = topFrame.toDTOv2()
         let config = FractalSaveConfigDTO(frameExtent: fractalFrameExtent)
-        let saveData = CanvasSaveDataV2(timestamp: Date(),
-                                        fractal: config,
-                                        rootFrame: dto,
-                                        version: 5,
-                                        layers: layers,
-                                        zOrder: zOrder,
-                                        selectedLayerID: selectedLayerID)
+	        let saveData = CanvasSaveDataV2(timestamp: Date(),
+	                                        fractal: config,
+	                                        rootFrame: dto,
+	                                        version: 6,
+	                                        layers: layers,
+	                                        zOrder: zOrder,
+	                                        selectedLayerID: selectedLayerID)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -43,6 +48,133 @@ final class PersistenceManager {
         }
     }
 
+    func exportRNNStrokeSequence(rootFrame: Frame,
+                                 fractalFrameExtent: SIMD2<Double>,
+                                 includeCardStrokes: Bool = true) -> Data? {
+        guard fractalFrameExtent.x.isFinite,
+              fractalFrameExtent.y.isFinite,
+              fractalFrameExtent.x > 0.0,
+              fractalFrameExtent.y > 0.0 else { return nil }
+
+        struct FrameToRootTransform {
+            let scale: Double
+            let translation: SIMD2<Double>
+
+            func apply(_ point: SIMD2<Double>) -> SIMD2<Double> {
+                point * scale + translation
+            }
+        }
+
+        struct StrokeSample {
+            let depthID: UInt32
+            let order: Int
+            let pointsInRoot: [SIMD2<Double>]
+        }
+
+        let scalePerDepth = FractalGrid.scale
+        var samples: [StrokeSample] = []
+        samples.reserveCapacity(1024)
+        var insertionOrder = 0
+
+        func appendStroke(_ stroke: Stroke,
+                          transform: FrameToRootTransform,
+                          pointInFrame: (SIMD2<Double>) -> SIMD2<Double>) {
+            let local = stroke.rawPoints
+            guard !local.isEmpty else { return }
+
+            var points: [SIMD2<Double>] = []
+            points.reserveCapacity(local.count)
+
+            for p in local {
+                let framePoint = pointInFrame(SIMD2<Double>(stroke.origin.x + Double(p.x),
+                                                           stroke.origin.y + Double(p.y)))
+                let rootPoint = transform.apply(framePoint)
+                guard rootPoint.x.isFinite, rootPoint.y.isFinite else { continue }
+                points.append(rootPoint)
+            }
+
+            guard !points.isEmpty else { return }
+            samples.append(StrokeSample(depthID: stroke.depthID, order: insertionOrder, pointsInRoot: points))
+            insertionOrder += 1
+        }
+
+        func walk(frame: Frame, transform: FrameToRootTransform) {
+            for stroke in frame.strokes {
+                appendStroke(stroke, transform: transform, pointInFrame: { $0 })
+            }
+
+            if includeCardStrokes {
+                for card in frame.cards {
+                    let angle = Double(card.rotation)
+                    let c = cos(angle)
+                    let s = sin(angle)
+                    let cardOrigin = card.origin
+
+                    for stroke in card.strokes {
+                        appendStroke(stroke, transform: transform) { cardLocalPoint in
+                            let rx = cardLocalPoint.x * c - cardLocalPoint.y * s
+                            let ry = cardLocalPoint.x * s + cardLocalPoint.y * c
+                            return SIMD2<Double>(cardOrigin.x + rx, cardOrigin.y + ry)
+                        }
+                    }
+                }
+            }
+
+            let sortedKeys = frame.children.keys.sorted { lhs, rhs in
+                if lhs.row != rhs.row { return lhs.row < rhs.row }
+                return lhs.col < rhs.col
+            }
+
+            for index in sortedKeys {
+                guard let child = frame.children[index] else { continue }
+                let childCenter = FractalGrid.childCenterInParent(frameExtent: fractalFrameExtent, index: index)
+                let childScale = transform.scale / scalePerDepth
+                let childTranslation = transform.translation + childCenter * transform.scale
+                let childTransform = FrameToRootTransform(scale: childScale, translation: childTranslation)
+                walk(frame: child, transform: childTransform)
+            }
+        }
+
+        let top = topmostFrame(from: rootFrame)
+        walk(frame: top, transform: FrameToRootTransform(scale: 1.0, translation: .zero))
+
+        guard !samples.isEmpty else {
+            let empty = RNNStrokeSequence(version: 1, points: [])
+            return try? JSONEncoder().encode(empty)
+        }
+
+        samples.sort { lhs, rhs in
+            if lhs.depthID != rhs.depthID { return lhs.depthID < rhs.depthID }
+            return lhs.order < rhs.order
+        }
+
+        func safeFloat(_ value: Double) -> Float {
+            let f = Float(value)
+            return f.isFinite ? f : 0
+        }
+
+        var stitched: [[Float]] = []
+        stitched.reserveCapacity(samples.reduce(into: 0) { $0 += $1.pointsInRoot.count })
+
+        var prev: SIMD2<Double>? = nil
+        for sample in samples {
+            let pts = sample.pointsInRoot
+            for (idx, p) in pts.enumerated() {
+                let base = prev ?? p
+                let dx = safeFloat(p.x - base.x)
+                let dy = safeFloat(p.y - base.y)
+                let penUp: Float = (idx == pts.count - 1) ? 1 : 0
+                stitched.append([dx, dy, penUp])
+                prev = p
+            }
+        }
+
+        let dto = RNNStrokeSequence(version: 1, points: stitched)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try? encoder.encode(dto)
+    }
+
     func importCanvas(data: Data,
                       device: MTLDevice,
                       fractalFrameExtent: SIMD2<Double> = .zero) -> ImportedCanvas? {
@@ -54,11 +186,11 @@ final class PersistenceManager {
             let version = header?.version ?? 0
 
             switch version {
-            case 2, 3, 4, 5:
-                let saveData = try decoder.decode(CanvasSaveDataV2.self, from: data)
-                let root = restoreFrame(from: saveData.rootFrame, parent: nil, indexInParent: nil, device: device)
-                return ImportedCanvas(rootFrame: root,
-                                      fractalFrameExtent: saveData.fractal.toExtent(),
+	            case 2, 3, 4, 5, 6:
+	                let saveData = try decoder.decode(CanvasSaveDataV2.self, from: data)
+	                let root = restoreFrame(from: saveData.rootFrame, parent: nil, indexInParent: nil, device: device)
+	                return ImportedCanvas(rootFrame: root,
+	                                      fractalFrameExtent: saveData.fractal.toExtent(),
                                       layers: saveData.layers,
                                       zOrder: saveData.zOrder,
                                       selectedLayerID: saveData.selectedLayerID)
