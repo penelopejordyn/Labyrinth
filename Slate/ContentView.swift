@@ -3,17 +3,18 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-struct ContentView: View {
-    // Reference to MetalView's coordinator for adding cards
-    @State private var metalViewCoordinator: MetalView.Coordinator?
-    @State private var editingCard: Card? // The card being edited
-    @State private var showSettingsSheet = false
-    @State private var showingImportPicker = false
-    @State private var isExporting = false
-    @State private var exportDocument = CanvasDocument()
-    @State private var isBrushMenuExpanded = false
-    @State private var isMenuExpanded = false
-    @State private var showClearConfirmation = false
+	struct ContentView: View {
+	    // Reference to MetalView's coordinator for adding cards
+	    @State private var metalViewCoordinator: MetalView.Coordinator?
+	    @State private var editingCard: Card? // The card being edited
+	    @State private var showSettingsSheet = false
+	    @State private var showingImportPicker = false
+	    @State private var isExporting = false
+	    @State private var exportDocument = CanvasDocument()
+	    @State private var exportFilename = "canvas"
+	    @State private var isBrushMenuExpanded = false
+	    @State private var isMenuExpanded = false
+	    @State private var showClearConfirmation = false
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -106,34 +107,55 @@ struct ContentView: View {
                             }
                         }
 
-                        HStack(spacing: 12) {
-                            Button(action: {
-                                if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame,
-                                                                                    fractalFrameExtent: coordinator.fractalFrameExtent,
-                                                                                    layers: coordinator.layers,
-                                                                                    zOrder: coordinator.zOrder,
-                                                                                    selectedLayerID: coordinator.selectedLayerID) {
-                                    exportDocument = CanvasDocument(data: data)
-                                    isExporting = true
-                                }
-                            }) {
-                                VStack(spacing: 2) {
-                                    Image(systemName: "square.and.arrow.up")
-                                        .font(.system(size: 20))
-                                    Text("Export")
-                                        .font(.caption)
-                                }
-                                .foregroundColor(.white)
-                                .padding(8)
-                                .background(.ultraThinMaterial)
-                                .cornerRadius(12)
-                            }
+	                        HStack(spacing: 12) {
+	                            Button(action: {
+	                                if let data = PersistenceManager.shared.exportCanvas(rootFrame: coordinator.rootFrame,
+	                                                                                    fractalFrameExtent: coordinator.fractalFrameExtent,
+	                                                                                    layers: coordinator.layers,
+	                                                                                    zOrder: coordinator.zOrder,
+	                                                                                    selectedLayerID: coordinator.selectedLayerID) {
+	                                    exportDocument = CanvasDocument(data: data)
+	                                    exportFilename = "canvas"
+	                                    isExporting = true
+	                                }
+	                            }) {
+	                                VStack(spacing: 2) {
+	                                    Image(systemName: "square.and.arrow.up")
+	                                        .font(.system(size: 20))
+	                                    Text("Export")
+	                                        .font(.caption)
+	                                }
+	                                .foregroundColor(.white)
+	                                .padding(8)
+	                                .background(.ultraThinMaterial)
+	                                .cornerRadius(12)
+	                            }
 
-                            Button(action: { showingImportPicker = true }) {
-                                VStack(spacing: 2) {
-                                    Image(systemName: "square.and.arrow.down")
-                                        .font(.system(size: 20))
-                                    Text("Import")
+	                            Button(action: {
+	                                if let data = PersistenceManager.shared.exportRNNStrokeSequence(rootFrame: coordinator.rootFrame,
+	                                                                                             fractalFrameExtent: coordinator.fractalFrameExtent) {
+	                                    exportDocument = CanvasDocument(data: data)
+	                                    exportFilename = "rnn_strokes"
+	                                    isExporting = true
+	                                }
+	                            }) {
+	                                VStack(spacing: 2) {
+	                                    Image(systemName: "waveform.path")
+	                                        .font(.system(size: 20))
+	                                    Text("RNN")
+	                                        .font(.caption)
+	                                }
+	                                .foregroundColor(.white)
+	                                .padding(8)
+	                                .background(.ultraThinMaterial)
+	                                .cornerRadius(12)
+	                            }
+
+	                            Button(action: { showingImportPicker = true }) {
+	                                VStack(spacing: 2) {
+	                                    Image(systemName: "square.and.arrow.down")
+	                                        .font(.system(size: 20))
+	                                    Text("Import")
                                         .font(.caption)
                                 }
                                 .foregroundColor(.white)
@@ -305,7 +327,7 @@ struct ContentView: View {
                     .presentationDetents([.medium])
             }
         }
-        .fileImporter(isPresented: $showingImportPicker, allowedContentTypes: [.json]) { result in
+	        .fileImporter(isPresented: $showingImportPicker, allowedContentTypes: [.json]) { result in
             switch result {
             case .success(let url):
                 let access = url.startAccessingSecurityScopedResource()
@@ -328,14 +350,14 @@ struct ContentView: View {
 	            case .failure(let error):
 	                print("Import error: \(error)")
 	            }
+		        }
+	        .fileExporter(isPresented: $isExporting, document: exportDocument, contentType: .json, defaultFilename: exportFilename) { result in
+	            if case .failure(let error) = result {
+	                print("Export error: \(error)")
+	            }
 	        }
-        .fileExporter(isPresented: $isExporting, document: exportDocument, contentType: .json, defaultFilename: "canvas") { result in
-            if case .failure(let error) = result {
-                print("Export error: \(error)")
-            }
-        }
-    }
-}
+	    }
+	}
 
 // MARK: - Stroke Size Slider Component
 

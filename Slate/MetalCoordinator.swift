@@ -274,51 +274,45 @@ import UIKit
         let depth = pathReversed.count
         guard depth > 0 else { return nil } // activeFrame is topmost; no same-depth neighbors unless we expand.
 
-        // Convert the index path into a global tile coordinate at this depth using balanced base-5 digits.
-        var activeX = 0
-        var activeY = 0
+        // Represent the root→active path as balanced base-5 digits in [-2, 2].
+        var xDigits: [Int] = []
+        var yDigits: [Int] = []
+        xDigits.reserveCapacity(depth)
+        yDigits.reserveCapacity(depth)
         for idx in pathReversed.reversed() { // root → active
-            activeX = activeX * GridIndex.gridSize + (idx.col - GridIndex.center.col)
-            activeY = activeY * GridIndex.gridSize + (idx.row - GridIndex.center.row)
+            xDigits.append(idx.col - GridIndex.center.col)
+            yDigits.append(idx.row - GridIndex.center.row)
         }
 
-        let targetX = activeX + dx
-        let targetY = activeY + dy
+        func applyOffset(to digits: [Int], offset: Int) -> [Int]? {
+            let base = GridIndex.gridSize
+            let half = base / 2
+            var out = digits
+            var carry = offset
 
-        func balancedQuintDigits(value: Int, count: Int) -> [Int]? {
-            var v = value
-            var digitsLSB: [Int] = []
-            digitsLSB.reserveCapacity(count)
-
-            for _ in 0..<count {
-                let r = ((v % GridIndex.gridSize) + GridIndex.gridSize) % GridIndex.gridSize // 0...4
-                let digit: Int
-                switch r {
-                case 0, 1, 2:
-                    digit = r
-                case 3:
-                    digit = -2 // carry +1
-                case 4:
-                    digit = -1 // carry +1
-                default:
-                    digit = 0
+            for i in stride(from: out.count - 1, through: 0, by: -1) {
+                let sum = out[i] + carry
+                var digit = sum % base
+                if digit > half {
+                    digit -= base
+                } else if digit < -half {
+                    digit += base
                 }
-                digitsLSB.append(digit)
-                v = (v - digit) / GridIndex.gridSize
+                carry = (sum - digit) / base
+                out[i] = digit
             }
 
-            // If there's still carry/overflow, the coordinate is out of range for the current topmost root.
-            guard v == 0 else { return nil }
-            return digitsLSB.reversed() // MSB → LSB
+            guard carry == 0 else { return nil }
+            return out
         }
 
-        guard let xDigits = balancedQuintDigits(value: targetX, count: depth),
-              let yDigits = balancedQuintDigits(value: targetY, count: depth) else { return nil }
+        guard let targetXDigits = applyOffset(to: xDigits, offset: dx),
+              let targetYDigits = applyOffset(to: yDigits, offset: dy) else { return nil }
 
         var f: Frame? = rootFrame
         for i in 0..<depth {
-            let idx = GridIndex(col: xDigits[i] + GridIndex.center.col,
-                                row: yDigits[i] + GridIndex.center.row)
+            let idx = GridIndex(col: targetXDigits[i] + GridIndex.center.col,
+                                row: targetYDigits[i] + GridIndex.center.row)
             f = f?.childIfExists(at: idx)
             if f == nil { return nil }
         }
@@ -354,6 +348,14 @@ import UIKit
 		    private let linkHighlightPersistentAlphaScale: Float = 0.55
 		    private let cardCornerRadiusPx: Float = 12.0
 		    var cardShadowEnabled: Bool = true
+		    private enum DefaultsKeys {
+		        static let cardNamesVisible = "slate.cardNamesVisible"
+		    }
+		    var cardNamesVisible: Bool = (UserDefaults.standard.object(forKey: DefaultsKeys.cardNamesVisible) as? Bool) ?? true {
+		        didSet {
+		            UserDefaults.standard.set(cardNamesVisible, forKey: DefaultsKeys.cardNamesVisible)
+		        }
+		    }
 		    private let cardShadowBlurPx: Float = 18.0
 		    private let cardShadowOpacity: Float = 0.25
 		    private let cardShadowOffsetPx = SIMD2<Float>(0.0, 0.0)
@@ -2847,15 +2849,16 @@ import UIKit
             }
 
             // F. Draw Card Name Label (opaque box, fixed on-screen size, outside the card bounds)
-            if card.labelTexture == nil && !pendingCardLabelBuilds.contains(card.id) {
-                pendingCardLabelBuilds.insert(card.id)
-                let cardID = card.id
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    card.ensureLabelTexture(device: self.device)
-                    self.pendingCardLabelBuilds.remove(cardID)
+            if cardNamesVisible {
+                if card.labelTexture == nil && !pendingCardLabelBuilds.contains(card.id) {
+                    pendingCardLabelBuilds.insert(card.id)
+                    let cardID = card.id
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        card.ensureLabelTexture(device: self.device)
+                        self.pendingCardLabelBuilds.remove(cardID)
+                    }
                 }
-            }
 
 	            if let labelTexture = card.labelTexture,
 	               card.labelWorldSize.x > 0, card.labelWorldSize.y > 0 {
@@ -2925,6 +2928,7 @@ import UIKit
 
                 debugDrawnNodesThisFrame += 1
                 debugDrawnVerticesThisFrame += 6
+            }
             }
         }
         }
@@ -6690,6 +6694,7 @@ import UIKit
 	                             viewSize: CGSize,
 	                             ignoreHideRule: Bool = false) -> CGRect? {
 	        guard !card.isHidden else { return nil }
+	        guard cardNamesVisible || ignoreHideRule else { return nil }
 	        guard card.labelWorldSize.x > 0, card.labelWorldSize.y > 0 else { return nil }
 	        guard let transform = transformFromActive(to: frame) else { return nil }
 
@@ -6796,6 +6801,7 @@ import UIKit
 
 	    /// Hit test card name labels across all visible frames (depth neighborhood + 5x5).
 	    func hitTestCardLabelHierarchy(screenPoint: CGPoint, viewSize: CGSize) -> (card: Card, frame: Frame)? {
+	        guard cardNamesVisible else { return nil }
 	        if !visibleFractalFramesDrawOrder.isEmpty {
 	            for frame in visibleFractalFramesDrawOrder.reversed() {
 	                guard !frame.cards.isEmpty else { continue }

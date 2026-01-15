@@ -315,9 +315,16 @@ extension Stroke {
             value.isFinite ? value : fallback
         }
 
-        let rawPts = rawPoints.compactMap { point -> [Float]? in
-            guard point.x.isFinite, point.y.isFinite else { return nil }
-            return [point.x, point.y]
+        let finitePoints = rawPoints.filter { $0.x.isFinite && $0.y.isFinite }
+        var deltaPoints: [[Float]] = []
+        deltaPoints.reserveCapacity(finitePoints.count)
+        var last = SIMD2<Float>(0, 0)
+        for (index, point) in finitePoints.enumerated() {
+            let dx = safeFloat(point.x - last.x)
+            let dy = safeFloat(point.y - last.y)
+            last = point
+            let penLift: Float = (index == finitePoints.count - 1) ? 1 : 0
+            deltaPoints.append([dx, dy, penLift])
         }
 
         return StrokeDTO(
@@ -340,16 +347,32 @@ extension Stroke {
             linkTargetSectionID: linkTargetSectionID,
             linkTargetCardID: linkTargetCardID,
             sectionID: sectionID,
-            points: rawPts
+            points: deltaPoints
         )
     }
 
     convenience init(dto: StrokeDTO, device: MTLDevice?) {
-        let localPoints = dto.points.map { point in
-            let x = point.count > 0 ? point[0] : 0
-            let y = point.count > 1 ? point[1] : 0
-            return SIMD2<Float>(x, y)
-        }
+        let localPoints: [SIMD2<Float>] = {
+            if dto.points.contains(where: { $0.count >= 3 }) {
+                var current = SIMD2<Float>(0, 0)
+                var decoded: [SIMD2<Float>] = []
+                decoded.reserveCapacity(dto.points.count)
+                for entry in dto.points {
+                    let dx = entry.count > 0 ? entry[0] : 0
+                    let dy = entry.count > 1 ? entry[1] : 0
+                    current.x += dx.isFinite ? dx : 0
+                    current.y += dy.isFinite ? dy : 0
+                    decoded.append(current)
+                }
+                return decoded
+            }
+
+            return dto.points.map { point in
+                let x = point.count > 0 ? point[0] : 0
+                let y = point.count > 1 ? point[1] : 0
+                return SIMD2<Float>(x.isFinite ? x : 0, y.isFinite ? y : 0)
+            }
+        }()
 
         let color = SIMD4<Float>(
             dto.color.count > 0 ? dto.color[0] : 0,

@@ -173,6 +173,10 @@ private class DragContext {
     var panVelocity: SIMD2<Double> = .zero
     var lastPanTime: CFTimeInterval = 0
     var momentumDisplayLink: CADisplayLink?
+	    // macOS keyboard zoom-in (hold "z")
+	    private var zoomInKeyDisplayLink: CADisplayLink?
+	    private var zoomInKeyLastTimestamp: CFTimeInterval = 0
+	    private var isZoomInKeyHeld: Bool = false
 
 
 
@@ -666,6 +670,105 @@ private class DragContext {
         super.init(coder: coder)
         setupGestures()
     }
+
+	override func didMoveToWindow() {
+	    super.didMoveToWindow()
+	    guard isRunningOnMac else { return }
+	    if window == nil {
+	        stopZoomInKey()
+	        return
+	    }
+	    DispatchQueue.main.async { [weak self] in
+	        _ = self?.becomeFirstResponder()
+	    }
+	}
+
+	override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+	    if isRunningOnMac,
+	       presses.contains(where: { $0.key?.charactersIgnoringModifiers.lowercased() == "z" }) {
+	        if !isZoomInKeyHeld {
+	            isZoomInKeyHeld = true
+	            startZoomInKey()
+	        }
+	        return
+	    }
+	    super.pressesBegan(presses, with: event)
+	}
+
+	override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+	    if isRunningOnMac,
+	       presses.contains(where: { $0.key?.charactersIgnoringModifiers.lowercased() == "z" }) {
+	        isZoomInKeyHeld = false
+	        stopZoomInKey()
+	        return
+	    }
+	    super.pressesEnded(presses, with: event)
+	}
+
+	override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+	    if isRunningOnMac,
+	       presses.contains(where: { $0.key?.charactersIgnoringModifiers.lowercased() == "z" }) {
+	        isZoomInKeyHeld = false
+	        stopZoomInKey()
+	        return
+	    }
+	    super.pressesCancelled(presses, with: event)
+	}
+
+	private func startZoomInKey() {
+	    guard zoomInKeyDisplayLink == nil else { return }
+	    zoomInKeyLastTimestamp = CACurrentMediaTime()
+	    let link = CADisplayLink(target: self, selector: #selector(stepZoomInKey(_:)))
+	    link.add(to: .main, forMode: .common)
+	    zoomInKeyDisplayLink = link
+	}
+
+	private func stopZoomInKey() {
+	    zoomInKeyDisplayLink?.invalidate()
+	    zoomInKeyDisplayLink = nil
+	}
+
+	@objc private func stepZoomInKey(_ link: CADisplayLink) {
+	    guard isRunningOnMac, window != nil else {
+	        stopZoomInKey()
+	        return
+	    }
+	    guard let coord = coordinator else {
+	        stopZoomInKey()
+	        return
+	    }
+
+	    let now = CACurrentMediaTime()
+	    let rawDt = now - zoomInKeyLastTimestamp
+	    zoomInKeyLastTimestamp = now
+	    let dt = max(0.0, min(rawDt, 0.05))
+
+	    stopMomentum()
+
+	    let anchorScreen = CGPoint(x: bounds.midX, y: bounds.midY)
+	    let anchorWorld = screenToWorldPixels_PureDouble(anchorScreen,
+	                                                     viewSize: bounds.size,
+	                                                     panOffset: coord.panOffset,
+	                                                     zoomScale: coord.zoomScale,
+	                                                     rotationAngle: coord.rotationAngle)
+
+	    // Smooth exponential zoom (multiplier per second).
+	    let zoomPerSecond: Double = 1.45
+	    let scale = pow(zoomPerSecond, dt)
+	    coord.zoomScale = max(coord.zoomScale * scale, 1e-12)
+
+	    if checkFractalTransitions(coord: coord, anchorWorld: anchorWorld, anchorScreen: anchorScreen) {
+	        return
+	    }
+
+	    coord.panOffset = solvePanOffsetForAnchor_Double(anchorWorld: anchorWorld,
+	                                                     desiredScreen: anchorScreen,
+	                                                     viewSize: bounds.size,
+	                                                     zoomScale: coord.zoomScale,
+	                                                     rotationAngle: coord.rotationAngle)
+
+	    _ = wrapFractalIfNeeded(coord: coord, anchorWorld: anchorWorld, anchorScreen: anchorScreen)
+	}
 
     func setupGestures() {
         //  MODAL INPUT: PAN (Finger Only - 1 finger for card drag/canvas pan)
@@ -1480,6 +1583,11 @@ private class DragContext {
         sectionNameTextField = nil
         sectionNameEditingTarget = nil
         sectionNameEditingFrame = nil
+        if isRunningOnMac {
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.becomeFirstResponder()
+            }
+        }
     }
 
     private func beginEditingCardName(card: Card, frame: Frame) {
@@ -1567,6 +1675,11 @@ private class DragContext {
         cardNameTextField = nil
         cardNameEditingTarget = nil
         cardNameEditingFrame = nil
+        if isRunningOnMac {
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.becomeFirstResponder()
+            }
+        }
     }
 
     private func hideLinkSelectionOverlay() {
@@ -1805,6 +1918,10 @@ private class DragContext {
             shadowsEnabled: coord.cardShadowEnabled,
             onToggleShadows: { [weak coord] enabled in
                 coord?.cardShadowEnabled = enabled
+            },
+            cardNamesVisible: coord.cardNamesVisible,
+            onToggleCardNames: { [weak coord] enabled in
+                coord?.cardNamesVisible = enabled
             },
             onDelete: { [weak self] in
                 guard let self else { return }

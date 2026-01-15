@@ -417,6 +417,8 @@ final class CardSettingsFloatingMenu: UIViewController {
     private let card: Card
     private var shadowsEnabled: Bool
     private let onToggleShadows: (Bool) -> Void
+    private var cardNamesVisible: Bool
+    private let onToggleCardNames: (Bool) -> Void
     private let onDelete: () -> Void
     private let sourceRect: CGRect
     private let sourceView: UIView
@@ -442,6 +444,7 @@ final class CardSettingsFloatingMenu: UIViewController {
     private var opacitySlider: UISlider!
     private var opacityLabel: UILabel!
     private var shadowsSwitch: UISwitch?
+    private var cardNamesSwitch: UISwitch?
     private var lineSettingsStack: UIStackView!
     private var backgroundColorWell: UIColorWell?
     private var lineColorWell: UIColorWell?
@@ -465,12 +468,16 @@ final class CardSettingsFloatingMenu: UIViewController {
     init(card: Card,
          shadowsEnabled: Bool,
          onToggleShadows: @escaping (Bool) -> Void,
+         cardNamesVisible: Bool,
+         onToggleCardNames: @escaping (Bool) -> Void,
          onDelete: @escaping () -> Void,
          sourceRect: CGRect,
          sourceView: UIView) {
         self.card = card
         self.shadowsEnabled = shadowsEnabled
         self.onToggleShadows = onToggleShadows
+        self.cardNamesVisible = cardNamesVisible
+        self.onToggleCardNames = onToggleCardNames
         self.onDelete = onDelete
         self.sourceRect = sourceRect
         self.sourceView = sourceView
@@ -900,6 +907,26 @@ final class CardSettingsFloatingMenu: UIViewController {
         opacityStack.addArrangedSubview(opacitySlider)
         mainStack.addArrangedSubview(opacityStack)
 
+        // Card Names toggle (global)
+        let cardNamesRow = UIStackView()
+        cardNamesRow.axis = .horizontal
+        cardNamesRow.alignment = .center
+        cardNamesRow.distribution = .equalSpacing
+
+        let cardNamesLabel = UILabel()
+        cardNamesLabel.text = "Show Card Names"
+        cardNamesLabel.font = .systemFont(ofSize: 13)
+        cardNamesLabel.textColor = .secondaryLabel
+
+        let namesSwitch = UISwitch()
+        namesSwitch.isOn = cardNamesVisible
+        namesSwitch.addTarget(self, action: #selector(cardNamesToggled(_:)), for: .valueChanged)
+        cardNamesSwitch = namesSwitch
+
+        cardNamesRow.addArrangedSubview(cardNamesLabel)
+        cardNamesRow.addArrangedSubview(namesSwitch)
+        mainStack.addArrangedSubview(cardNamesRow)
+
         // Shadows toggle (global)
         let shadowsRow = UIStackView()
         shadowsRow.axis = .horizontal
@@ -1276,6 +1303,11 @@ final class CardSettingsFloatingMenu: UIViewController {
     @objc private func shadowsToggled(_ sender: UISwitch) {
         shadowsEnabled = sender.isOn
         onToggleShadows(sender.isOn)
+    }
+
+    @objc private func cardNamesToggled(_ sender: UISwitch) {
+        cardNamesVisible = sender.isOn
+        onToggleCardNames(sender.isOn)
     }
 
     @objc private func dismissMenu() {
