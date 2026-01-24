@@ -181,6 +181,34 @@ import UIKit
     var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
     var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
 
+    // MARK: - Handwriting Refinement (CoreML)
+    // Refines committed strokes after the user pauses (debounced), similar to Smart Script.
+    // Wire these up to UI when ready.
+    var handwritingRefinementEnabled: Bool = false
+    var handwritingRefinementBias: Float = 2.0
+    var handwritingRefinementInputScale: Float = 2.0
+    /// 0 = keep raw strokes, 1 = fully refined.
+    var handwritingRefinementStrength: Float = 0.7
+    /// User must be idle (no new stroke started) for this long before refinement runs.
+    var handwritingRefinementDebounceSeconds: TimeInterval = 0.5
+
+    private struct PendingHandwritingStroke {
+        let stroke: Stroke
+        let target: DrawingTarget
+        let rawScreenPoints: [CGPoint]
+        let viewSize: CGSize
+        let zoomAtCreation: Double
+        let panAtCreation: SIMD2<Double>
+        let rotationAngle: Float
+        let baseWidth: Double
+        let constantScreenSize: Bool
+    }
+
+    private var handwritingRefiner: HandwritingRefinerEngine?
+    private var pendingHandwritingStrokes: [PendingHandwritingStroke] = []
+    private var handwritingRefinementWorkItem: DispatchWorkItem?
+    private let handwritingRefinementQueue = DispatchQueue(label: "slate.handwritingRefinement", qos: .userInitiated)
+
 	    var lassoDrawingPoints: [CGPoint] = []
 	    var lassoPredictedPoints: [CGPoint] = []
 	    var lassoSelection: LassoSelection?
@@ -2500,11 +2528,11 @@ import UIKit
             encoder.setDepthStencilState(stencilStateWrite)
             encoder.setStencilReferenceValue(1)
 
-            // C. Set Pipeline & Bind Content Based on Card Type
-            switch card.type {
-            case .solidColor:
-                // Use solid color pipeline (no texture required)
-                encoder.setRenderPipelineState(cardSolidPipelineState)
+	            // C. Set Pipeline & Bind Content Based on Card Type
+	            switch card.type {
+	            case .solidColor:
+	                // Use solid color pipeline (no texture required)
+	                encoder.setRenderPipelineState(cardSolidPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 var c = card.backgroundColor
                 encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
@@ -2568,26 +2596,42 @@ import UIKit
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
-            case .youtube(let videoID, _):
-                if let texture = ensureYouTubeThumbnailTexture(card: card, videoID: videoID) {
-                    // Render the cached thumbnail like an image card.
-                    encoder.setRenderPipelineState(cardPipelineState)
-                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                    encoder.setFragmentTexture(texture, index: 0)
-                    encoder.setFragmentSamplerState(samplerState, index: 0)
-                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
-                } else {
-                    // Placeholder background (thumbnail loads async).
-                    encoder.setRenderPipelineState(cardSolidPipelineState)
-                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                    var c = card.backgroundColor
-                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
-                }
+	            case .youtube(let videoID, _):
+	                if let texture = ensureYouTubeThumbnailTexture(card: card, videoID: videoID) {
+	                    // Render the cached thumbnail like an image card.
+	                    encoder.setRenderPipelineState(cardPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    encoder.setFragmentTexture(texture, index: 0)
+	                    encoder.setFragmentSamplerState(samplerState, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                } else {
+	                    // Placeholder background (thumbnail loads async).
+	                    encoder.setRenderPipelineState(cardSolidPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    var c = card.backgroundColor
+	                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                }
 
-            case .drawing:
-                continue // Future: Render nested strokes
-            }
+	            case .plugin:
+	                // Plugin cards render a snapshot placeholder (when available); interactive UI is hosted via an overlay runtime.
+	                if let texture = card.pluginSnapshotTexture {
+	                    encoder.setRenderPipelineState(cardPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    encoder.setFragmentTexture(texture, index: 0)
+	                    encoder.setFragmentSamplerState(samplerState, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                } else {
+	                    encoder.setRenderPipelineState(cardSolidPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    var c = card.backgroundColor
+	                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                }
+
+	            case .drawing:
+	                continue // Future: Render nested strokes
+	            }
 
             // D. Draw the Card Quad (writes to both color buffer and stencil)
             let vertexBuffer = device.makeBuffer(
@@ -2974,6 +3018,241 @@ import UIKit
         }
 
         return screenPoints
+    }
+
+    // MARK: - Handwriting Refinement (Debounced)
+
+    private func handwritingTargetsMatch(_ a: DrawingTarget, _ b: DrawingTarget) -> Bool {
+        switch (a, b) {
+        case (.canvas(let fa), .canvas(let fb)):
+            return fa.id == fb.id
+        case (.card(let ca, let fa), .card(let cb, let fb)):
+            return ca.id == cb.id && fa.id == fb.id
+        default:
+            return false
+        }
+    }
+
+    private func smoothStrokePointsForCommit(_ points: [CGPoint]) -> [CGPoint] {
+        guard !points.isEmpty else { return [] }
+        if points.count < 3 {
+            return points
+        }
+
+        var paddedPoints = points
+
+        // Add phantom point at the start: 2A - B
+        if paddedPoints.count >= 2 {
+            let first = paddedPoints[0]
+            let second = paddedPoints[1]
+            let phantomStart = CGPoint(x: 2 * first.x - second.x, y: 2 * first.y - second.y)
+            paddedPoints.insert(phantomStart, at: 0)
+        }
+
+        // Add phantom point at the end: 2D - C
+        if paddedPoints.count >= 3 {
+            let last = paddedPoints[paddedPoints.count - 1]
+            let secondLast = paddedPoints[paddedPoints.count - 2]
+            let phantomEnd = CGPoint(x: 2 * last.x - secondLast.x, y: 2 * last.y - secondLast.y)
+            paddedPoints.append(phantomEnd)
+        }
+
+        var smooth = catmullRomPoints(points: paddedPoints,
+                                      closed: false,
+                                      alpha: 0.5,
+                                      segmentsPerCurve: 20)
+
+        smooth = simplifyStroke(smooth, minScreenDist: 1.5, minAngleDeg: 5.0)
+        return smooth
+    }
+
+    private func denoiseRefinedStrokePoints(_ points: [CGPoint], passes: Int = 4) -> [CGPoint] {
+        guard points.count > 2, passes > 0 else { return points }
+
+        var current = points
+        for _ in 0..<passes {
+            var next = current
+            for i in 1..<(current.count - 1) {
+                let p0 = current[i - 1]
+                let p1 = current[i]
+                let p2 = current[i + 1]
+                next[i] = CGPoint(
+                    x: (p0.x + 2.0 * p1.x + p2.x) / 4.0,
+                    y: (p0.y + 2.0 * p1.y + p2.y) / 4.0
+                )
+            }
+            current = next
+        }
+        return current
+    }
+
+    private func scheduleHandwritingRefinement() {
+        handwritingRefinementWorkItem?.cancel()
+
+        let delay = max(0.0, handwritingRefinementDebounceSeconds)
+        let item = DispatchWorkItem { [weak self] in
+            self?.flushPendingHandwritingRefinement()
+        }
+        handwritingRefinementWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func flushPendingHandwritingRefinement() {
+        handwritingRefinementWorkItem = nil
+
+        guard handwritingRefinementEnabled else {
+            pendingHandwritingStrokes.removeAll()
+            return
+        }
+
+        let pending = pendingHandwritingStrokes
+        pendingHandwritingStrokes = []
+        guard !pending.isEmpty else { return }
+
+        // Note: This model is text-conditioned, but we intentionally do not expose
+        // text context in the UI right now. An empty string still produces a valid
+        // one-hot input (terminator-only) so we can run refinement without a textbox.
+        let text = ""
+        let bias = handwritingRefinementBias
+        let inputScale = handwritingRefinementInputScale
+        let strength = handwritingRefinementStrength
+
+        // Enforce a consistent coordinate transform across the phrase.
+        let zoom = pending[0].zoomAtCreation
+        let rotation = pending[0].rotationAngle
+        let rotationEpsilon: Float = 1e-6
+        let consistent = pending.allSatisfy {
+            abs($0.zoomAtCreation - zoom) < 1e-6 && abs($0.rotationAngle - rotation) < rotationEpsilon
+        }
+        guard consistent else { return }
+
+        handwritingRefinementQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                if self.handwritingRefiner == nil {
+                    self.handwritingRefiner = try HandwritingRefinerEngine()
+                }
+                guard let refiner = self.handwritingRefiner else { return }
+
+                var settings = HandwritingRefinerEngine.Settings()
+                settings.bias = bias
+                settings.inputScale = inputScale
+                settings.refinementStrength = strength
+
+                let session = try refiner.makeSession(text: text, settings: settings)
+                let refinedPoints = try self.refineHandwritingPhrase(pending, session: session, zoom: zoom, rotation: rotation)
+
+                DispatchQueue.main.async { [weak self] in
+                    self?.applyHandwritingRefinement(pending: pending, refinedPoints: refinedPoints)
+                }
+	            } catch {
+	                // Fail open: keep raw strokes (but surface error in debug builds).
+	                #if DEBUG
+	                print("Handwriting refinement failed: \(error)")
+	                #endif
+	            }
+	        }
+	    }
+
+    private func refineHandwritingPhrase(_ pending: [PendingHandwritingStroke],
+                                        session: HandwritingRefinerEngine.Session,
+                                        zoom: Double,
+                                        rotation: Float) throws -> [[CGPoint]] {
+        guard let firstPoint = pending.first?.rawScreenPoints.first else { return [] }
+
+        try session.beginStroke(firstScreenPoint: firstPoint, zoom: zoom, rotationAngle: rotation)
+
+        var refinedFlat: [CGPoint] = [firstPoint]
+        refinedFlat.reserveCapacity(pending.reduce(0) { $0 + $1.rawScreenPoints.count })
+
+        for (strokeIndex, capture) in pending.enumerated() {
+            let pts = capture.rawScreenPoints
+            for (i, p) in pts.enumerated() {
+                if strokeIndex == 0 && i == 0 { continue }
+                let isStrokeEnd = (i == pts.count - 1)
+                let refined = try session.addPoint(p, isFinal: isStrokeEnd)
+                refinedFlat.append(refined)
+            }
+        }
+
+        var perStroke: [[CGPoint]] = []
+        perStroke.reserveCapacity(pending.count)
+
+        var offset = 0
+        for capture in pending {
+            let count = capture.rawScreenPoints.count
+            if count == 0 {
+                perStroke.append([])
+                continue
+            }
+            perStroke.append(Array(refinedFlat[offset..<(offset + count)]))
+            offset += count
+        }
+        return perStroke
+    }
+
+    private func replaceStrokeReferences(oldStrokeID: UUID, with newStroke: Stroke) {
+        func map(_ action: UndoAction) -> UndoAction {
+            switch action {
+            case .drawStroke(let stroke, let target) where stroke.id == oldStrokeID:
+                return .drawStroke(stroke: newStroke, target: target)
+            case .eraseStroke(let stroke, let strokeIndex, let target) where stroke.id == oldStrokeID:
+                return .eraseStroke(stroke: newStroke, strokeIndex: strokeIndex, target: target)
+            default:
+                return action
+            }
+        }
+        undoStack = undoStack.map(map)
+        redoStack = redoStack.map(map)
+    }
+
+    private func applyHandwritingRefinement(pending: [PendingHandwritingStroke], refinedPoints: [[CGPoint]]) {
+        guard pending.count == refinedPoints.count else { return }
+
+        for (capture, refinedRawPoints) in zip(pending, refinedPoints) {
+            let oldStroke = capture.stroke
+            let denoised = denoiseRefinedStrokePoints(refinedRawPoints)
+            let smoothed = smoothStrokePointsForCommit(denoised)
+
+            switch capture.target {
+            case .canvas(let frame):
+                guard let index = frame.strokes.firstIndex(where: { $0.id == oldStroke.id }) else { continue }
+
+                let refinedStroke = Stroke(
+                    id: oldStroke.id,
+                    screenPoints: smoothed,
+                    zoomAtCreation: capture.zoomAtCreation,
+                    panAtCreation: capture.panAtCreation,
+                    viewSize: capture.viewSize,
+                    rotationAngle: capture.rotationAngle,
+                    color: oldStroke.color,
+                    baseWidth: capture.baseWidth,
+                    zoomEffectiveAtCreation: oldStroke.zoomEffectiveAtCreation,
+                    device: device,
+                    depthID: oldStroke.depthID,
+                    depthWriteEnabled: oldStroke.depthWriteEnabled,
+                    constantScreenSize: capture.constantScreenSize
+                )
+
+                refinedStroke.layerID = oldStroke.layerID ?? selectedLayerID
+                refinedStroke.maskAppliesToAllLayers = oldStroke.maskAppliesToAllLayers
+                refinedStroke.link = oldStroke.link
+                refinedStroke.linkSectionID = oldStroke.linkSectionID
+                refinedStroke.linkTargetSectionID = oldStroke.linkTargetSectionID
+                refinedStroke.linkTargetCardID = oldStroke.linkTargetCardID
+
+                let anchor = strokeMembershipAnchorPointInFrame(refinedStroke)
+                refinedStroke.sectionID = resolveSectionIDForPointInFrameHierarchy(pointInFrame: anchor, frame: frame)
+
+                frame.strokes[index] = refinedStroke
+                replaceStrokeReferences(oldStrokeID: oldStroke.id, with: refinedStroke)
+
+            case .card(let card, _):
+                // Not yet supported (card-local stroke conversion differs); keep raw.
+                _ = card
+                continue
+            }
+        }
     }
 
     private func buildLassoScreenPoints() -> [CGPoint]? {
@@ -3887,48 +4166,54 @@ import UIKit
         let cameraPos = calculateCameraCenterWorld(viewSize: view.bounds.size)
         let cameraPosText = String(format: "(%.1f, %.1f)", cameraPos.x, cameraPos.y)
 
-	        // Update label on main thread
-	        DispatchQueue.main.async {
-	            (mtkView as? TouchableMTKView)?.updateYouTubeOverlay()
-	            (mtkView as? TouchableMTKView)?.updateYouTubeCloseButtonOverlay()
-	            (mtkView as? TouchableMTKView)?.updateLinkSelectionOverlay()
-	            (mtkView as? TouchableMTKView)?.updateSectionNameEditorOverlay()
-	            (mtkView as? TouchableMTKView)?.updateCardNameEditorOverlay()
+        let updateUI = {
+            (mtkView as? TouchableMTKView)?.updateWebCardOverlays()
+            (mtkView as? TouchableMTKView)?.updateYouTubeOverlay()
+            (mtkView as? TouchableMTKView)?.updateYouTubeCloseButtonOverlay()
+            (mtkView as? TouchableMTKView)?.updateLinkSelectionOverlay()
+            (mtkView as? TouchableMTKView)?.updateSectionNameEditorOverlay()
+            (mtkView as? TouchableMTKView)?.updateCardNameEditorOverlay()
 
-	            let refs: String = {
-	                let edges = self.internalLinkReferenceEdges
-	                guard !edges.isEmpty else { return "Refs: 0" }
+            let refs: String = {
+                let edges = self.internalLinkReferenceEdges
+                guard !edges.isEmpty else { return "Refs: 0" }
 
-	                let names = self.internalLinkReferenceNamesByID
-	                let maxLines = 6
-	                var lines: [String] = []
-	                lines.reserveCapacity(min(edges.count, maxLines))
+                let names = self.internalLinkReferenceNamesByID
+                let maxLines = 6
+                var lines: [String] = []
+                lines.reserveCapacity(min(edges.count, maxLines))
 
-	                for edge in edges.prefix(maxLines) {
-	                    let src = (names[edge.sourceID] ?? "(\(edge.sourceID.uuidString.prefix(6)))")
-	                    let dst = (names[edge.targetID] ?? "(\(edge.targetID.uuidString.prefix(6)))")
-	                    lines.append("\(src) -> \(dst)")
-	                }
+                for edge in edges.prefix(maxLines) {
+                    let src = (names[edge.sourceID] ?? "(\(edge.sourceID.uuidString.prefix(6)))")
+                    let dst = (names[edge.targetID] ?? "(\(edge.targetID.uuidString.prefix(6)))")
+                    lines.append("\(src) -> \(dst)")
+                }
 
-	                if edges.count > maxLines {
-	                    lines.append("+\(edges.count - maxLines) more")
-	                }
+                if edges.count > maxLines {
+                    lines.append("+\(edges.count - maxLines) more")
+                }
 
-	                return "Refs: \(edges.count)\n" + lines.joined(separator: "\n")
-	            }()
+                return "Refs: \(edges.count)\n" + lines.joined(separator: "\n")
+            }()
 
-	            debugLabel.text = """
-	            Depth: \(depth) | Tile: \(tileText) | Zoom: \(zoomText)
-	            Path: \(pathText)
-	            Effective: \(effectiveText)
-	            Strokes: \(self.activeFrame.strokes.count)
-	            Camera: \(cameraPosText)
-	            Vertices: \(self.debugDrawnVerticesThisFrame) | Draws: \(self.debugDrawnNodesThisFrame)
-	            \((mtkView as? TouchableMTKView)?.youtubeHUDText() ?? "")
-	            \(refs)
-	            """
-	            mtkView.bringSubviewToFront(debugLabel)
-	        }
+            debugLabel.text = """
+            Depth: \(depth) | Tile: \(tileText) | Zoom: \(zoomText)
+            Path: \(pathText)
+            Effective: \(effectiveText)
+            Strokes: \(self.activeFrame.strokes.count)
+            Camera: \(cameraPosText)
+            Vertices: \(self.debugDrawnVerticesThisFrame) | Draws: \(self.debugDrawnNodesThisFrame)
+            \((mtkView as? TouchableMTKView)?.youtubeHUDText() ?? "")
+            \(refs)
+            """
+            mtkView.bringSubviewToFront(debugLabel)
+        }
+
+        if Thread.isMainThread {
+            updateUI()
+        } else {
+            DispatchQueue.main.async(execute: updateUI)
+        }
 	    }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -5792,6 +6077,9 @@ import UIKit
 
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
+        // Cancel any pending refinement; this stroke continues the phrase.
+        handwritingRefinementWorkItem?.cancel()
+        handwritingRefinementWorkItem = nil
     }
 
     func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
@@ -6059,27 +6347,28 @@ import UIKit
 
         // Keep final point in SCREEN space
         currentTouchPoints.append(point)
+        let rawStrokePoints = currentTouchPoints
+        let sourceScreenPoints = rawStrokePoints
 
         //  FIX 1: Allow dots (Don't return if count < 4)
-        guard !currentTouchPoints.isEmpty else {
+        guard !sourceScreenPoints.isEmpty else {
             currentTouchPoints = []
             liveStrokeOrigin = nil
             currentDrawingTarget = nil
             return
         }
 
+        var smoothScreenPoints: [CGPoint]
         //  FIX 2: Phantom Points for Catmull-Rom
         // Extrapolate phantom points to ensure the spline reaches the start and end
-        var smoothScreenPoints: [CGPoint]
-
-        if currentTouchPoints.count < 3 {
+        if sourceScreenPoints.count < 3 {
             // Too few points for a spline, just use lines/dots
-            smoothScreenPoints = currentTouchPoints
+            smoothScreenPoints = sourceScreenPoints
         } else {
             // Extrapolate phantom points instead of duplicating
             // First phantom: A - (B - A) = 2A - B (extends backward from A)
             // Last phantom: D + (D - C) = 2D - C (extends forward from D)
-            var paddedPoints = currentTouchPoints
+            var paddedPoints = sourceScreenPoints
 
             // Add phantom point at the start
             if paddedPoints.count >= 2 {
@@ -6141,6 +6430,26 @@ import UIKit
 		                }
 		                let routedTarget = appendCanvasStroke(stroke, to: frame)
 		                pushUndo(.drawStroke(stroke: stroke, target: routedTarget))
+
+                        if handwritingRefinementEnabled,
+                           brushSettings.toolMode == .paint {
+                            if let firstPending = pendingHandwritingStrokes.first,
+                               !handwritingTargetsMatch(firstPending.target, routedTarget) {
+                                flushPendingHandwritingRefinement()
+                            }
+                            pendingHandwritingStrokes.append(PendingHandwritingStroke(
+                                stroke: stroke,
+                                target: routedTarget,
+                                rawScreenPoints: rawStrokePoints,
+                                viewSize: view.bounds.size,
+                                zoomAtCreation: zoomScale,
+                                panAtCreation: panOffset,
+                                rotationAngle: rotationAngle,
+                                baseWidth: brushSettings.size,
+                                constantScreenSize: brushSettings.constantScreenSize
+                            ))
+                            scheduleHandwritingRefinement()
+                        }
             } else {
                 // DRAW ON CANVAS (Other Frame in Telescope Chain)
                 let stroke = createStrokeForFrame(
@@ -7357,15 +7666,16 @@ import UIKit
 	        } else {
 	            return
 	        }
-	        zOrder.removeAll { item in
-	            if case .card(let id) = item {
-	                return id == card.id
-	            }
-	            return false
-	        }
-	        (metalView as? TouchableMTKView)?.deactivateYouTubeOverlayIfTarget(card: card)
-	        card.isEditing = false
-	        clearLassoSelection()
+		        zOrder.removeAll { item in
+		            if case .card(let id) = item {
+		                return id == card.id
+		            }
+		            return false
+		        }
+		        (metalView as? TouchableMTKView)?.deactivateYouTubeOverlayIfTarget(card: card)
+		        (metalView as? TouchableMTKView)?.closeWebCardOverlayIfOpen(card: card)
+		        card.isEditing = false
+		        clearLassoSelection()
 
 	        if case .card(let targetCard, _) = currentDrawingTarget, targetCard === card {
 	            currentDrawingTarget = nil
@@ -7567,6 +7877,52 @@ import UIKit
 	        }
 	        zOrder.insert(.card(card.id), at: 0)
 	    }
+
+	    func addPluginCard(typeID: String) {
+	        guard let view = metalView else {
+	            return
+	        }
+
+	        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+	        let definition = CardPluginRegistry.shared.definition(for: typeID)
+	        let defaultSizePt = definition?.defaultSizePt ?? CGSize(width: 300.0, height: 200.0)
+	        let worldW = Double(defaultSizePt.width) / max(zoomScale, 1e-9)
+	        let worldH = Double(defaultSizePt.height) / max(zoomScale, 1e-9)
+	        let cardSize = SIMD2<Double>(worldW, worldH)
+
+	        let defaultCardColor = SIMD4<Float>(0.2, 0.2, 0.2, 1.0)
+	        let baseName = definition?.name ?? "Plugin"
+	        let defaultName = nextNumberedName(base: baseName, existingNames: allCardsInCanvas(from: rootFrame).map(\.name))
+	        let payload = definition?.defaultPayload ?? Data()
+
+	        let card = Card(
+	            name: defaultName,
+	            origin: cameraCenterWorld,
+	            size: cardSize,
+	            rotation: 0,
+	            zoom: zoomScale,
+	            type: .plugin(typeID: typeID, payload: payload),
+	            backgroundColor: defaultCardColor
+	        )
+
+	        appendCard(card, to: activeFrame)
+	        syncZOrderWithCanvas()
+	        zOrder.removeAll { item in
+	            if case .card(let id) = item {
+	                return id == card.id
+	            }
+	            return false
+	        }
+	        zOrder.insert(.card(card.id), at: 0)
+	    }
+
+	    #if DEBUG
+	    func addSampleWebCard() {
+	        let typeID = CardPluginRegistry.shared.allDefinitions.first?.typeID ?? "labyrinth.sample.hello"
+	        addPluginCard(typeID: typeID)
+	    }
+	    #endif
 
     /// Create a stroke in a target frame's coordinate system (canvas strokes).
     /// Converts screen points into the target frame, even across telescope transitions.

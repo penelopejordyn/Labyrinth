@@ -5,15 +5,66 @@ import MetalKit
 import ObjectiveC.runtime
 import simd
 import Combine
+import WebKit
 #if canImport(YouTubePlayerKit)
 import YouTubePlayerKit
-#else
-import WebKit
 #endif
+
+private final class WebCardScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var owner: TouchableMTKView?
+    let cardID: UUID
+
+    init(owner: TouchableMTKView, cardID: UUID) {
+        self.owner = owner
+        self.cardID = cardID
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        owner?.handleWebCardScriptMessage(message, cardID: cardID)
+    }
+}
+
+private final class WebCardOverlay {
+    let cardID: UUID
+    weak var card: Card?
+    weak var frame: Frame?
+    let webView: WKWebView
+    let closeButton: UIButton
+    let scriptMessageHandler: WebCardScriptMessageHandler
+
+    var loadedTypeID: String?
+    var pendingInit: Bool = false
+    var isClosing: Bool = false
+
+    var baseZoomInFrame: Double?
+    var lastAppliedPageZoom: CGFloat?
+
+    var lastCenter: CGPoint?
+    var lastSize: CGSize?
+    var lastWorldSize: CGSize?
+    var lastRotation: CGFloat?
+
+    var closeButtonLastFrame: CGRect = .null
+
+    init(cardID: UUID,
+         card: Card,
+         frame: Frame,
+         webView: WKWebView,
+         closeButton: UIButton,
+         scriptMessageHandler: WebCardScriptMessageHandler) {
+        self.cardID = cardID
+        self.card = card
+        self.frame = frame
+        self.webView = webView
+        self.closeButton = closeButton
+        self.scriptMessageHandler = scriptMessageHandler
+    }
+}
 
 // MARK: - Associated Object Keys for gesture state storage
 private struct AssociatedKeys {
     static var dragContext: UInt8 = 0
+    static var webCardCloseCardID: UInt8 = 0
 }
 
 // MARK: - Drag Context for Cross-Depth Dragging
@@ -137,6 +188,14 @@ private class DragContext {
         private var youtubeLastErrorSummary: String?
 	    private var youtubeCloseButton: UIButton?
 	    private var youtubeCloseButtonLastFrame: CGRect = .null
+
+	        // MARK: - Web Card Overlays (Plugin Cards)
+	        private static let webCardMessageHandlerName: String = "labyrinthCard"
+	        private let webCardMaxPayloadBytes: Int = 256 * 1024
+	        private let webCardMaxOpenCount: Int = 10
+	        private var webCardOverlaysByCardID: [UUID: WebCardOverlay] = [:]
+	        /// Back-to-front ordering; last id is topmost.
+	        private var webCardOverlayOrder: [UUID] = []
 
     //  UPGRADED: Anchors now use Double for infinite precision at extreme zoom
     var pinchAnchorScreen: CGPoint = .zero
@@ -1184,40 +1243,82 @@ private class DragContext {
             hideYouTubeCloseButton()
             return
         }
-        #endif
+	        #endif
 
-        if card.labelWorldSize.x <= 0.0 || card.labelWorldSize.y <= 0.0 {
-            card.ensureLabelTexture(device: coord.device)
-        }
+	        let placement: (center: CGPoint, size: CGSize, rotation: CGFloat)? = coord.cardScreenTransform(
+	            card: card,
+	            frame: frame,
+	            viewSize: bounds.size
+	        )
+	        guard let placement else {
+	            hideYouTubeCloseButton()
+	            return
+	        }
 
-        guard let labelRect = coord.cardLabelScreenRect(card: card,
-                                                       frame: frame,
-                                                       viewSize: bounds.size,
-                                                       ignoreHideRule: true) else {
-            hideYouTubeCloseButton()
-            return
-        }
+	        if card.labelWorldSize.x <= 0.0 || card.labelWorldSize.y <= 0.0 {
+	            card.ensureLabelTexture(device: coord.device)
+	        }
 
-        let gap: CGFloat = 6.0
-        let side = max(labelRect.height, 20.0)
-        var buttonRect = CGRect(x: labelRect.maxX + gap,
-                                y: labelRect.minY,
-                                width: side,
-                                height: side)
+	        // Mirror the card label's hide rule: if the label would stop rendering because it's > 1/2
+	        // of the card width, hide the close button too (prevents the button from looking huge
+	        // when zoomed far out).
+	        if card.labelWorldSize.x.isFinite,
+	           placement.size.width.isFinite,
+	           card.labelWorldSize.x > Double(placement.size.width) * 0.5 {
+	            hideYouTubeCloseButton()
+	            return
+	        }
 
-        // Keep the button visible if the label is near the right edge.
-        if buttonRect.maxX > bounds.size.width - 4.0 {
-            buttonRect.origin.x = labelRect.minX - gap - side
-        }
+		        let buttonRect: CGRect = {
+		            if coord.cardNamesVisible {
+		                // When names are visible, render next to the actual label (YouTube-style).
+		                guard let labelRect = coord.cardLabelScreenRect(card: card,
+		                                                               frame: frame,
+		                                                               viewSize: bounds.size,
+		                                                               ignoreHideRule: false) else {
+		                    return .null
+		                }
+		                let gap: CGFloat = 6.0
+		                let side = max(labelRect.height, 20.0)
+		                return CGRect(x: labelRect.maxX + gap,
+		                              y: labelRect.minY,
+		                              width: side,
+		                              height: side)
+		            }
 
-        let button = ensureYouTubeCloseButton()
-        if youtubeCloseButtonLastFrame != buttonRect {
-            button.frame = buttonRect
-            youtubeCloseButtonLastFrame = buttonRect
-        }
-        button.isHidden = false
-        bringSubviewToFront(button)
-    }
+	            // When names are hidden, put the close button in the label slot (not next to it).
+	            if let labelRect = coord.cardLabelScreenRect(card: card,
+	                                                         frame: frame,
+	                                                         viewSize: bounds.size,
+	                                                         ignoreHideRule: true) {
+	                let side = max(labelRect.height, 20.0)
+	                return CGRect(x: labelRect.minX,
+	                              y: labelRect.minY,
+	                              width: side,
+	                              height: side)
+	            }
+
+	            // Fallback: pin to an unrotated top-left corner in screen space.
+	            let side: CGFloat = 24.0
+	            return CGRect(x: placement.center.x - placement.size.width * 0.5,
+	                          y: placement.center.y - placement.size.height * 0.5,
+	                          width: side,
+	                          height: side)
+	        }()
+
+		        guard buttonRect.isNull == false else {
+		            hideYouTubeCloseButton()
+		            return
+		        }
+
+		        let button = ensureYouTubeCloseButton()
+		        if youtubeCloseButtonLastFrame != buttonRect {
+		            button.frame = buttonRect
+		            youtubeCloseButtonLastFrame = buttonRect
+		        }
+		        button.isHidden = false
+		        bringSubviewToFront(button)
+		    }
 
     func youtubeHUDText() -> String {
         #if canImport(YouTubePlayerKit)
@@ -1498,6 +1599,610 @@ private class DragContext {
             deactivateYouTubeOverlay()
         }
     }
+
+	    // MARK: - Web Card Overlays (Plugin Cards)
+
+		    func updateWebCardOverlays() {
+		        if !Thread.isMainThread {
+		            DispatchQueue.main.async { [weak self] in
+		                self?.updateWebCardOverlays()
+	            }
+	            return
+	        }
+
+	        guard let coord = coordinator else {
+	            for (_, overlay) in webCardOverlaysByCardID {
+	                overlay.webView.isHidden = true
+	                overlay.closeButton.isHidden = true
+	            }
+	            return
+	        }
+
+	        var stale: [UUID] = []
+
+	        for cardID in webCardOverlayOrder {
+	            guard let overlay = webCardOverlaysByCardID[cardID] else { continue }
+	            guard !overlay.isClosing else { continue }
+	            guard let card = overlay.card,
+	                  let frame = overlay.frame else {
+	                stale.append(cardID)
+	                continue
+	            }
+
+	            guard case .plugin(let typeID, _) = card.type, !typeID.isEmpty else {
+	                stale.append(cardID)
+	                continue
+	            }
+
+	            guard let placement = coord.cardScreenTransform(card: card, frame: frame, viewSize: bounds.size) else {
+	                overlay.webView.isHidden = true
+	                overlay.closeButton.isHidden = true
+	                continue
+	            }
+
+		            let size = placement.size
+		            guard size.width.isFinite, size.height.isFinite, size.width > 1, size.height > 1 else {
+		                overlay.webView.isHidden = true
+		                overlay.closeButton.isHidden = true
+		                continue
+		            }
+
+		            overlay.webView.isHidden = false
+
+		            let desiredCenter = placement.center
+		            let desiredRotation = placement.rotation
+		            let worldSize = CGSize(width: max(1.0, CGFloat(abs(card.size.x))),
+		                                   height: max(1.0, CGFloat(abs(card.size.y))))
+		            let scaleX = size.width / worldSize.width
+		            let scaleY = size.height / worldSize.height
+
+		            let shouldUpdateFrame: Bool = {
+		                guard let lastCenter = overlay.lastCenter,
+		                      let lastSize = overlay.lastSize,
+		                      let lastWorldSize = overlay.lastWorldSize,
+		                      let lastRotation = overlay.lastRotation else {
+		                    return true
+		                }
+		                let centerDelta = abs(desiredCenter.x - lastCenter.x) + abs(desiredCenter.y - lastCenter.y)
+		                let sizeDelta = abs(size.width - lastSize.width) + abs(size.height - lastSize.height)
+		                let worldDelta = abs(worldSize.width - lastWorldSize.width) + abs(worldSize.height - lastWorldSize.height)
+		                let rotationDelta = abs(desiredRotation - lastRotation)
+		                return centerDelta > 0.5 || sizeDelta > 0.5 || worldDelta > 0.5 || rotationDelta > 0.002
+		            }()
+
+		            if shouldUpdateFrame {
+		                overlay.webView.transform = .identity
+		                // Important: keep the WebView's viewport in *card space* so canvas zoom scales the view
+		                // as a whole (like a canvas object), instead of resizing the viewport and triggering
+		                // responsive breakpoints / reflow.
+		                overlay.webView.bounds = CGRect(x: 0, y: 0, width: worldSize.width, height: worldSize.height)
+		                overlay.webView.center = desiredCenter
+		                overlay.webView.transform = CGAffineTransform(rotationAngle: desiredRotation).scaledBy(x: scaleX, y: scaleY)
+		                overlay.lastCenter = desiredCenter
+		                overlay.lastSize = size
+		                overlay.lastWorldSize = worldSize
+		                overlay.lastRotation = desiredRotation
+		            }
+
+	            if overlay.pendingInit, webCardSendInitMessageIfPossible(overlay: overlay) {
+	                overlay.pendingInit = false
+	            }
+
+	            updateWebCardCloseButtonOverlay(overlay: overlay, placement: placement, coord: coord)
+
+	            bringSubviewToFront(overlay.webView)
+	            bringSubviewToFront(overlay.closeButton)
+	        }
+
+	        for cardID in stale {
+	            destroyWebCardOverlay(cardID: cardID)
+	        }
+	    }
+
+	    private func toggleWebCardOverlay(card: Card, frame: Frame) {
+	        guard case .plugin(let typeID, _) = card.type, !typeID.isEmpty else { return }
+
+	        if let overlay = webCardOverlaysByCardID[card.id], overlay.isClosing == false {
+	            focusWebCardOverlay(cardID: card.id)
+	            return
+	        }
+
+	        activateWebCardOverlay(card: card, frame: frame)
+	    }
+
+	    private func activateWebCardOverlay(card: Card, frame: Frame) {
+	        guard case .plugin(let typeID, _) = card.type, !typeID.isEmpty else { return }
+
+	        if webCardOverlaysByCardID[card.id] != nil {
+	            focusWebCardOverlay(cardID: card.id)
+	            return
+	        }
+
+	        guard webCardOverlaysByCardID.count < webCardMaxOpenCount else {
+	            print("WebCard: max open overlays reached (\(webCardMaxOpenCount))")
+	            return
+	        }
+
+	        let overlay = createWebCardOverlay(card: card, frame: frame)
+	        overlay.loadedTypeID = typeID
+	        overlay.pendingInit = true
+	        loadWebCard(typeID: typeID, into: overlay.webView)
+
+	        webCardOverlaysByCardID[card.id] = overlay
+	        webCardOverlayOrder.removeAll { $0 == card.id }
+	        webCardOverlayOrder.append(card.id)
+
+	        updateWebCardOverlays()
+	    }
+
+	    private func focusWebCardOverlay(cardID: UUID) {
+	        webCardOverlayOrder.removeAll { $0 == cardID }
+	        webCardOverlayOrder.append(cardID)
+	        updateWebCardOverlays()
+	    }
+
+	    private func createWebCardOverlay(card: Card, frame: Frame) -> WebCardOverlay {
+	        let controller = WKUserContentController()
+	        let handler = WebCardScriptMessageHandler(owner: self, cardID: card.id)
+	        controller.add(handler, name: Self.webCardMessageHandlerName)
+
+	        let bridgeSource = """
+	        (function () {
+	          if (window.__labyrinth) return;
+	          const listeners = [];
+	          function emit(msg) {
+	            try { window.webkit.messageHandlers.\(Self.webCardMessageHandlerName).postMessage(msg); } catch (e) {}
+	          }
+	          function onHostMessage(fn) {
+	            if (typeof fn === 'function') listeners.push(fn);
+	          }
+	          function _dispatchHostMessage(msg) {
+	            for (const fn of listeners.slice()) {
+	              try { fn(msg); } catch (e) {}
+	            }
+	          }
+	          window.__labyrinth = { emit, onHostMessage, _dispatchHostMessage };
+	        })();
+	        """
+	        controller.addUserScript(WKUserScript(source: bridgeSource, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+
+	        let config = WKWebViewConfiguration()
+	        config.userContentController = controller
+	        config.websiteDataStore = .nonPersistent()
+
+	        let webView = WKWebView(frame: .zero, configuration: config)
+	        webView.navigationDelegate = self
+	        webView.isHidden = true
+	        webView.isOpaque = false
+	        webView.backgroundColor = .clear
+	        webView.scrollView.backgroundColor = .clear
+	        addSubview(webView)
+
+	        let closeButton = UIButton(type: .system)
+	        closeButton.setTitle("X", for: .normal)
+	        closeButton.setTitleColor(.white, for: .normal)
+	        closeButton.titleLabel?.font = UIFont.systemFont(ofSize: 14.0, weight: .bold)
+	        closeButton.backgroundColor = .systemRed
+	        closeButton.layer.cornerRadius = 8.0
+	        closeButton.layer.masksToBounds = true
+	        closeButton.isHidden = true
+	        closeButton.addTarget(self, action: #selector(onWebCardCloseTapped(_:)), for: .touchUpInside)
+	        objc_setAssociatedObject(closeButton, &AssociatedKeys.webCardCloseCardID, card.id as NSUUID, .OBJC_ASSOCIATION_RETAIN)
+	        addSubview(closeButton)
+
+	        return WebCardOverlay(cardID: card.id,
+	                              card: card,
+	                              frame: frame,
+	                              webView: webView,
+	                              closeButton: closeButton,
+	                              scriptMessageHandler: handler)
+	    }
+
+	    @objc private func onWebCardCloseTapped(_ sender: UIButton) {
+	        guard let nsid = objc_getAssociatedObject(sender, &AssociatedKeys.webCardCloseCardID) as? NSUUID else { return }
+	        guard let cardID = UUID(uuidString: nsid.uuidString) else { return }
+	        closeWebCardOverlay(cardID: cardID, captureSnapshot: true)
+	    }
+
+	    func closeWebCardOverlayIfOpen(card: Card) {
+	        closeWebCardOverlay(cardID: card.id, captureSnapshot: false)
+	    }
+
+	    private func closeWebCardOverlay(cardID: UUID, captureSnapshot: Bool) {
+	        guard let overlay = webCardOverlaysByCardID[cardID] else { return }
+	        guard overlay.isClosing == false else { return }
+	        overlay.isClosing = true
+	        overlay.closeButton.isEnabled = false
+	        overlay.closeButton.isHidden = true
+	        overlay.webView.isUserInteractionEnabled = false
+
+	        guard captureSnapshot else {
+	            overlay.webView.isHidden = true
+	            destroyWebCardOverlay(cardID: cardID)
+	            return
+	        }
+
+	        // Snapshot must be taken while the web view is still visible; hiding it first can yield nil/blank images.
+	        let snapshotConfig: WKSnapshotConfiguration = {
+	            let c = WKSnapshotConfiguration()
+	            c.rect = overlay.webView.bounds
+	            let maxWidth: CGFloat = 1024.0
+	            if overlay.webView.bounds.width.isFinite, overlay.webView.bounds.width > maxWidth {
+	                c.snapshotWidth = NSNumber(value: Double(maxWidth))
+	            }
+	            return c
+	        }()
+
+	        overlay.webView.takeSnapshot(with: snapshotConfig) { [weak self, weak overlay] image, error in
+	            DispatchQueue.main.async {
+	                guard let self else { return }
+	                defer { self.destroyWebCardOverlay(cardID: cardID) }
+
+	                let snapshotImage: UIImage? = {
+	                    if let image { return image }
+	                    if let overlay { return self.fallbackWebViewSnapshotImage(webView: overlay.webView) }
+	                    return nil
+	                }()
+
+	                guard let snapshotImage else {
+	                    #if DEBUG
+	                    if let error {
+	                        print("WebCard snapshot failed (cardID=\(cardID.uuidString.prefix(6))): \(error)")
+	                    } else {
+	                        print("WebCard snapshot failed (cardID=\(cardID.uuidString.prefix(6))): nil image")
+	                    }
+	                    #endif
+	                    return
+	                }
+	                guard let coord = self.coordinator else { return }
+	                guard let card = overlay?.card, case .plugin = card.type else { return }
+
+	                let normalizedImage: UIImage = {
+	                    // `WKWebView` snapshots can produce images in pixel formats/color spaces that `MTKTextureLoader`
+	                    // doesn't like. Normalize through a renderer into an 8-bit RGBA-ish image first.
+	                    let pixelW = snapshotImage.size.width * snapshotImage.scale
+	                    let pixelH = snapshotImage.size.height * snapshotImage.scale
+	                    let maxPixel = max(pixelW, pixelH)
+	                    let maxDimension: CGFloat = 2048.0
+	                    let ratio: CGFloat = {
+	                        guard maxPixel.isFinite, maxPixel > 0 else { return 1.0 }
+	                        return min(1.0, maxDimension / maxPixel)
+	                    }()
+	                    let targetSizePx = CGSize(width: max(1, floor(pixelW * ratio)),
+	                                              height: max(1, floor(pixelH * ratio)))
+
+	                    let format = UIGraphicsImageRendererFormat()
+	                    format.scale = 1.0
+	                    format.opaque = false
+	                    if #available(iOS 12.0, *) {
+	                        format.preferredRange = .standard
+	                    }
+	                    let renderer = UIGraphicsImageRenderer(size: targetSizePx, format: format)
+	                    return renderer.image { _ in
+	                        snapshotImage.draw(in: CGRect(origin: .zero, size: targetSizePx))
+	                    }
+	                }()
+
+	                let loader = MTKTextureLoader(device: coord.device)
+	                let options: [MTKTextureLoader.Option: Any] = [
+	                    .origin: MTKTextureLoader.Origin.bottomLeft,
+	                    .SRGB: false,
+	                ]
+
+	                var texture: MTLTexture?
+	                do {
+	                    if let cgImage = normalizedImage.cgImage {
+	                        texture = try loader.newTexture(cgImage: cgImage, options: options)
+	                    }
+	                } catch {
+	                    #if DEBUG
+	                    print("WebCard snapshot texture load failed (cgImage) (cardID=\(cardID.uuidString.prefix(6))): \(error)")
+	                    #endif
+	                }
+
+	                if texture == nil {
+	                    do {
+	                        if let data = normalizedImage.pngData() {
+	                            texture = try loader.newTexture(data: data, options: options)
+	                        }
+	                    } catch {
+	                        #if DEBUG
+	                        print("WebCard snapshot texture load failed (png) (cardID=\(cardID.uuidString.prefix(6))): \(error)")
+	                        #endif
+	                    }
+	                }
+
+	                if texture == nil {
+	                    texture = self.makeBGRA8UnormTexture(from: normalizedImage, device: coord.device)
+	                }
+
+	                if let texture {
+	                    card.pluginSnapshotTexture = texture
+	                    self.setNeedsDisplay()
+	                } else {
+	                    #if DEBUG
+	                    let w = Int(normalizedImage.size.width * normalizedImage.scale)
+	                    let h = Int(normalizedImage.size.height * normalizedImage.scale)
+	                    print("WebCard snapshot produced no texture (cardID=\(cardID.uuidString.prefix(6))) image=\(w)x\(h)")
+	                    #endif
+	                }
+	            }
+	        }
+	    }
+
+	    private func destroyWebCardOverlay(cardID: UUID) {
+	        guard let overlay = webCardOverlaysByCardID.removeValue(forKey: cardID) else { return }
+	        webCardOverlayOrder.removeAll { $0 == cardID }
+
+	        overlay.webView.stopLoading()
+	        overlay.webView.navigationDelegate = nil
+	        overlay.webView.removeFromSuperview()
+	        overlay.closeButton.removeFromSuperview()
+	    }
+
+	    private func fallbackWebViewSnapshotImage(webView: WKWebView) -> UIImage? {
+	        let bounds = webView.bounds
+	        guard bounds.width.isFinite, bounds.height.isFinite, bounds.width >= 2, bounds.height >= 2 else { return nil }
+
+	        let format = UIGraphicsImageRendererFormat()
+	        format.scale = UIScreen.main.scale
+	        format.opaque = false
+	        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
+	        return renderer.image { context in
+	            let ok = webView.drawHierarchy(in: bounds, afterScreenUpdates: true)
+	            if !ok {
+	                webView.layer.render(in: context.cgContext)
+	            }
+	        }
+	    }
+
+	    private func makeBGRA8UnormTexture(from image: UIImage, device: MTLDevice) -> MTLTexture? {
+	        guard let cgImage = image.cgImage else { return nil }
+
+	        let width = cgImage.width
+	        let height = cgImage.height
+	        guard width > 0, height > 0 else { return nil }
+
+	        let bytesPerPixel = 4
+	        let bytesPerRow = bytesPerPixel * width
+	        let byteCount = bytesPerRow * height
+
+	        var bytes = [UInt8](repeating: 0, count: byteCount)
+
+	        let colorSpace = CGColorSpaceCreateDeviceRGB()
+	        let bitmapInfo = CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.premultipliedFirst.rawValue
+	        guard let ctx = CGContext(data: &bytes,
+	                                  width: width,
+	                                  height: height,
+	                                  bitsPerComponent: 8,
+	                                  bytesPerRow: bytesPerRow,
+	                                  space: colorSpace,
+	                                  bitmapInfo: bitmapInfo) else {
+	            return nil
+	        }
+
+	        // Flip vertically so the resulting pixel memory matches the same "origin: bottomLeft" convention
+	        // used by the rest of the app's card textures.
+	        ctx.translateBy(x: 0, y: CGFloat(height))
+	        ctx.scaleBy(x: 1, y: -1)
+	        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+	        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+	                                                           width: width,
+	                                                           height: height,
+	                                                           mipmapped: false)
+	        desc.usage = [.shaderRead]
+	        desc.storageMode = .shared
+
+	        guard let texture = device.makeTexture(descriptor: desc) else { return nil }
+	        texture.replace(region: MTLRegionMake2D(0, 0, width, height),
+	                        mipmapLevel: 0,
+	                        withBytes: bytes,
+	                        bytesPerRow: bytesPerRow)
+	        return texture
+	    }
+
+    private func updateWebCardCloseButtonOverlay(overlay: WebCardOverlay,
+                                                 placement: (center: CGPoint, size: CGSize, rotation: CGFloat),
+                                                 coord: Coordinator) {
+        guard let card = overlay.card,
+              let frame = overlay.frame else {
+            overlay.closeButton.isHidden = true
+            return
+        }
+
+	        guard overlay.webView.isHidden == false else {
+	            overlay.closeButton.isHidden = true
+	            overlay.closeButtonLastFrame = .null
+	            return
+	        }
+
+	        if card.labelWorldSize.x <= 0.0 || card.labelWorldSize.y <= 0.0 {
+	            card.ensureLabelTexture(device: coord.device)
+	        }
+
+	        // Mirror the card label's hide rule: if the label would stop rendering because it's > 1/2
+	        // of the card width, hide the close button too.
+	        if card.labelWorldSize.x.isFinite,
+	           placement.size.width.isFinite,
+	           card.labelWorldSize.x > Double(placement.size.width) * 0.5 {
+	            overlay.closeButton.isHidden = true
+	            overlay.closeButtonLastFrame = .null
+	            return
+	        }
+
+	        let buttonRect: CGRect = {
+	            if coord.cardNamesVisible {
+	                // When names are visible, render next to the actual label (YouTube-style).
+	                guard let labelRect = coord.cardLabelScreenRect(card: card,
+	                                                               frame: frame,
+	                                                               viewSize: bounds.size,
+	                                                               ignoreHideRule: false) else {
+	                    return .null
+	                }
+	                let gap: CGFloat = 6.0
+	                let side = max(labelRect.height, 20.0)
+	                return CGRect(x: labelRect.maxX + gap,
+	                              y: labelRect.minY,
+	                              width: side,
+	                              height: side)
+	            }
+
+	            // When names are hidden, put the close button in the label slot (not next to it).
+	            if let labelRect = coord.cardLabelScreenRect(card: card,
+	                                                         frame: frame,
+	                                                         viewSize: bounds.size,
+	                                                         ignoreHideRule: true) {
+	                let side = max(labelRect.height, 20.0)
+	                return CGRect(x: labelRect.minX,
+	                              y: labelRect.minY,
+	                              width: side,
+	                              height: side)
+	            }
+
+	            // Fallback: pin to an unrotated top-left corner in screen space.
+	            let side: CGFloat = 24.0
+	            return CGRect(x: placement.center.x - placement.size.width * 0.5,
+	                          y: placement.center.y - placement.size.height * 0.5,
+	                          width: side,
+	                          height: side)
+	        }()
+
+	        guard buttonRect.isNull == false else {
+	            overlay.closeButton.isHidden = true
+	            overlay.closeButtonLastFrame = .null
+	            return
+	        }
+
+	        if overlay.closeButtonLastFrame != buttonRect {
+	            overlay.closeButton.frame = buttonRect
+	            overlay.closeButtonLastFrame = buttonRect
+		        }
+		        overlay.closeButton.isHidden = false
+		    }
+
+	    private func loadWebCard(typeID: String, into webView: WKWebView) {
+	        guard let def = CardPluginRegistry.shared.definition(for: typeID) else {
+	            let html = """
+	            <!doctype html>
+	            <html><body style="margin:0;font-family:-apple-system,system-ui;background:#111;color:#fff;">
+	              <div style="padding:12px;">
+	                <div style="font-weight:600;">Missing Card Type</div>
+	                <div style="opacity:0.7;font-size:12px;">\(typeID)</div>
+	              </div>
+	            </body></html>
+	            """
+	            webView.loadHTMLString(html, baseURL: nil)
+	            return
+	        }
+
+	        switch def.webSource {
+	        case .htmlString(let html):
+	            webView.loadHTMLString(html, baseURL: nil)
+	        case .file(let url, let readAccessURL):
+	            webView.loadFileURL(url, allowingReadAccessTo: readAccessURL)
+	        }
+	    }
+
+		    private func webCardSendInitMessageIfPossible(overlay: WebCardOverlay) -> Bool {
+		        guard let card = overlay.card,
+		              let frame = overlay.frame else { return false }
+		        guard case .plugin(let typeID, let payload) = card.type else { return false }
+		        guard let coord = coordinator else { return false }
+
+		        guard let _ = coord.cardScreenTransform(card: card, frame: frame, viewSize: bounds.size) else { return false }
+
+		        let payloadJSON: Any? = {
+		            guard !payload.isEmpty else { return nil }
+		            return try? JSONSerialization.jsonObject(with: payload, options: [])
+		        }()
+
+		        let message: [String: Any] = [
+		            "type": "init",
+		            "payload": [
+		                "cardInstanceID": card.id.uuidString,
+		                "typeID": typeID,
+		                "payloadBase64": payload.base64EncodedString(),
+		                "payloadJSON": payloadJSON as Any,
+		                "bounds": [
+		                    "widthPt": card.size.x,
+		                    "heightPt": card.size.y
+		                ]
+		            ]
+		        ]
+
+	        sendWebCardHostMessage(message, in: overlay.webView)
+	        return true
+	    }
+
+	    private func sendWebCardHostMessage(_ message: [String: Any], in webView: WKWebView) {
+	        guard JSONSerialization.isValidJSONObject(message) else { return }
+	        guard let data = try? JSONSerialization.data(withJSONObject: message, options: []),
+	              let json = String(data: data, encoding: .utf8) else {
+	            return
+	        }
+
+	        let js = "window.__labyrinth && window.__labyrinth._dispatchHostMessage(\(json));"
+	        webView.evaluateJavaScript(js, completionHandler: nil)
+	    }
+
+	    fileprivate func handleWebCardScriptMessage(_ message: WKScriptMessage, cardID: UUID) {
+	        guard message.name == Self.webCardMessageHandlerName else { return }
+	        guard let overlay = webCardOverlaysByCardID[cardID],
+	              let card = overlay.card,
+	              let frame = overlay.frame else { return }
+	        guard case .plugin(let typeID, _) = card.type, !typeID.isEmpty else { return }
+
+	        guard let body = message.body as? [String: Any],
+	              let eventType = body["type"] as? String else {
+	            return
+	        }
+
+	        switch eventType {
+	        case "setPayload":
+	            let payloadObj = body["payload"]
+	            let payloadData: Data? = {
+	                if payloadObj == nil || payloadObj is NSNull {
+	                    return Data()
+	                }
+	                if let s = payloadObj as? String {
+	                    return Data(s.utf8)
+	                }
+	                if let obj = payloadObj, JSONSerialization.isValidJSONObject(obj) {
+	                    return try? JSONSerialization.data(withJSONObject: obj, options: [])
+	                }
+	                return nil
+	            }()
+
+	            guard let payloadData else { return }
+	            guard payloadData.count <= webCardMaxPayloadBytes else { return }
+	            card.type = .plugin(typeID: typeID, payload: payloadData)
+
+	        case "sizePreferenceChanged":
+	            guard let payload = body["payload"] as? [String: Any] else { return }
+
+	            func doubleValue(_ any: Any?) -> Double? {
+	                if let v = any as? Double { return v }
+	                if let v = any as? Float { return Double(v) }
+	                if let v = any as? Int { return Double(v) }
+	                return nil
+	            }
+
+	            guard let widthPt = doubleValue(payload["widthPt"]),
+	                  let heightPt = doubleValue(payload["heightPt"]) else { return }
+	            guard let coord = coordinator else { return }
+	            guard let placement = coord.cardScreenTransform(card: card, frame: frame, viewSize: bounds.size) else { return }
+	            let zoomInFrame = max(Double(placement.size.width) / max(card.size.x, 1e-12), 1e-12)
+
+	            let clampedW = max(widthPt, 60.0)
+	            let clampedH = max(heightPt, 60.0)
+	            card.size = SIMD2<Double>(clampedW / zoomInFrame, clampedH / zoomInFrame)
+	            card.rebuildGeometry()
+
+	        default:
+	            return
+	        }
+	    }
 
     private func beginEditingSectionName(section: Section, frame: Frame) {
         guard let coord = coordinator else { return }
@@ -1929,6 +2634,11 @@ private class DragContext {
                 self.cardMenuTarget = nil
                 self.cardMenuTargetFrame = nil
             },
+            onActivatePlugin: { [weak self, weak card, weak frame] in
+                guard let self, let card, let frame else { return }
+                card.isEditing = true
+                self.activateWebCardOverlay(card: card, frame: frame)
+            },
             sourceRect: anchorRect,
             sourceView: self
         )
@@ -2203,20 +2913,26 @@ private class DragContext {
             return
         }
 
-        // Use the new hierarchical hit test to find cards at any depth
-        if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
-            if case .youtube = result.card.type {
-                if result.card.isEditing {
-                    toggleYouTubeOverlay(card: result.card, frame: result.frame)
-                } else {
-                    result.card.isEditing = true
-                }
-            } else {
-                // Toggle Edit on the card (wherever it lives - parent, active, or child)
-                result.card.isEditing.toggle()
-            }
-            return
-        }
+		        // Use the new hierarchical hit test to find cards at any depth
+		        if let result = coord.hitTestHierarchy(screenPoint: loc, viewSize: bounds.size, ignoringLocked: true) {
+		            if case .plugin = result.card.type {
+		                if result.card.isEditing {
+		                    toggleWebCardOverlay(card: result.card, frame: result.frame)
+		                } else {
+		                    result.card.isEditing = true
+		                }
+		            } else if case .youtube = result.card.type {
+		                if result.card.isEditing {
+		                    toggleYouTubeOverlay(card: result.card, frame: result.frame)
+		                } else {
+		                    result.card.isEditing = true
+		                }
+		            } else {
+		                // Toggle Edit on the card (wherever it lives - parent, active, or child)
+		                result.card.isEditing.toggle()
+		            }
+		            return
+		        }
 
         // Tap on section name label: inline rename.
         if let hit = coord.hitTestSectionLabelHierarchy(screenPoint: loc, viewSize: bounds.size) {
@@ -2224,13 +2940,13 @@ private class DragContext {
             return
         }
 
-        // If we tapped nothing, deselect all cards (requires recursive clear)
-        var topFrame = coord.activeFrame
-        while let parent = topFrame.parent {
-            topFrame = parent
-        }
-        clearSelectionRecursive(frame: topFrame)
-    }
+	        // If we tapped nothing, deselect all cards (requires recursive clear)
+	        var topFrame = coord.activeFrame
+	        while let parent = topFrame.parent {
+	            topFrame = parent
+	        }
+		        clearSelectionRecursive(frame: topFrame)
+		    }
 
     /// Helper to clear all card selections recursively across the entire hierarchy
     func clearSelectionRecursive(frame: Frame) {
@@ -2830,16 +3546,53 @@ private class DragContext {
         let location = touch.location(in: self)
         coordinator?.handleTouchEnded(at: location, touchType: touch.type)
     }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
-        if !isRunningOnMac {
-            guard event?.allTouches?.count == 1 else { return }
+	    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+	        guard let touch = touches.first else { return }
+	        if !isRunningOnMac {
+	            guard event?.allTouches?.count == 1 else { return }
+	        }
+	        coordinator?.handleTouchCancelled(touchType: touch.type)
+	    }
+	}
+
+// MARK: - Web Card Navigation
+
+extension TouchableMTKView: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let isPluginWebCard = webCardOverlaysByCardID.values.contains { $0.webView === webView }
+        guard isPluginWebCard else {
+            decisionHandler(.allow)
+            return
         }
-        coordinator?.handleTouchCancelled(touchType: touch.type)
+
+        if navigationAction.targetFrame == nil {
+            decisionHandler(.cancel)
+            return
+        }
+
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.cancel)
+            return
+        }
+
+        let scheme = url.scheme?.lowercased()
+        switch scheme {
+        case nil, "about", "file", "data", "blob":
+            decisionHandler(.allow)
+        default:
+            decisionHandler(.cancel)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let overlay = webCardOverlaysByCardID.values.first(where: { $0.webView === webView }) else { return }
+        if overlay.pendingInit, webCardSendInitMessageIfPossible(overlay: overlay) {
+            overlay.pendingInit = false
+        }
     }
 }
 
-// MARK: - Apple Pencil Interactions
+	// MARK: - Apple Pencil Interactions
 
 extension TouchableMTKView: UIPencilInteractionDelegate {
     @available(iOS 17.5, *)
@@ -2877,17 +3630,29 @@ extension TouchableMTKView: UIGestureRecognizerDelegate {
            view.frame.contains(loc) {
             return false
         }
-        #else
-        if let webView = youtubeWebView,
-           webView.superview != nil,
-           !webView.isHidden,
-           webView.frame.contains(loc) {
-            return false
-        }
-        #endif
-        return true
-    }
-}
+	        #else
+	        if let webView = youtubeWebView,
+	           webView.superview != nil,
+	           !webView.isHidden,
+	           webView.frame.contains(loc) {
+	            return false
+	        }
+	        #endif
+	        for (_, overlay) in webCardOverlaysByCardID {
+	            if overlay.closeButton.isHidden == false,
+	               overlay.closeButton.frame.contains(loc) {
+	                return false
+	            }
+	            let webView = overlay.webView
+	            if webView.superview != nil,
+	               webView.isHidden == false,
+	               webView.frame.contains(loc) {
+	                return false
+	            }
+	        }
+	        return true
+	    }
+	}
 
 // MARK: - UITextField Delegate (Inline Section Rename)
 

@@ -30,9 +30,9 @@
 
 /* Begin PBXFileReference section */
 		EB365F9B2F0C384700F5B54A /* labyrinth.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = labyrinth.icon; sourceTree = "<group>"; };
-		EBFA97D12EAFF17D00FBB8B5 /* Slate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Slate.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Labyrinth.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		EBFA97DE2EAFF17D00FBB8B5 /* LabyrinthTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LabyrinthTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EBFA97E82EAFF17D00FBB8B5 /* LabyrinthUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LabyrinthUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -79,6 +79,13 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		EB8D89AF2F24994C00F39D47 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		EBFA97C82EAFF17D00FBB8B5 = {
 			isa = PBXGroup;
 			children = (
@@ -87,15 +94,16 @@
 				EBFA97E12EAFF17D00FBB8B5 /* SlateTests */,
 				EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */,
 				EBFA97D22EAFF17D00FBB8B5 /* Products */,
+				EB8D89AF2F24994C00F39D47 /* Frameworks */,
 			);
 			sourceTree = "<group>";
 		};
 		EBFA97D22EAFF17D00FBB8B5 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				EBFA97D12EAFF17D00FBB8B5 /* Slate.app */,
-				EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */,
-				EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */,
+				EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */,
+				EBFA97DE2EAFF17D00FBB8B5 /* LabyrinthTests.xctest */,
+				EBFA97E82EAFF17D00FBB8B5 /* LabyrinthUITests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -103,9 +111,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		EBFA97D02EAFF17D00FBB8B5 /* Slate */ = {
+		EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Slate" */;
+			buildConfigurationList = EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Labyrinth" */;
 			buildPhases = (
 				EBFA97CD2EAFF17D00FBB8B5 /* Sources */,
 				EBFA97CE2EAFF17D00FBB8B5 /* Frameworks */,
@@ -118,17 +126,17 @@
 			fileSystemSynchronizedGroups = (
 				EBFA97D32EAFF17D00FBB8B5 /* Slate */,
 			);
-			name = Slate;
+			name = Labyrinth;
 			packageProductDependencies = (
 				EB365E622F085AC300F5B54A /* YouTubePlayerKit */,
 			);
 			productName = Slate;
-			productReference = EBFA97D12EAFF17D00FBB8B5 /* Slate.app */;
+			productReference = EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */;
 			productType = "com.apple.product-type.application";
 		};
-		EBFA97DD2EAFF17D00FBB8B5 /* SlateTests */ = {
+		EBFA97DD2EAFF17D00FBB8B5 /* LabyrinthTests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = EBFA97F52EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "SlateTests" */;
+			buildConfigurationList = EBFA97F52EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "LabyrinthTests" */;
 			buildPhases = (
 				EBFA97DA2EAFF17D00FBB8B5 /* Sources */,
 				EBFA97DB2EAFF17D00FBB8B5 /* Frameworks */,
@@ -142,16 +150,16 @@
 			fileSystemSynchronizedGroups = (
 				EBFA97E12EAFF17D00FBB8B5 /* SlateTests */,
 			);
-			name = SlateTests;
+			name = LabyrinthTests;
 			packageProductDependencies = (
 			);
 			productName = SlateTests;
-			productReference = EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */;
+			productReference = EBFA97DE2EAFF17D00FBB8B5 /* LabyrinthTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		EBFA97E72EAFF17D00FBB8B5 /* SlateUITests */ = {
+		EBFA97E72EAFF17D00FBB8B5 /* LabyrinthUITests */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = EBFA97F82EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "SlateUITests" */;
+			buildConfigurationList = EBFA97F82EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "LabyrinthUITests" */;
 			buildPhases = (
 				EBFA97E42EAFF17D00FBB8B5 /* Sources */,
 				EBFA97E52EAFF17D00FBB8B5 /* Frameworks */,
@@ -165,11 +173,11 @@
 			fileSystemSynchronizedGroups = (
 				EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */,
 			);
-			name = SlateUITests;
+			name = LabyrinthUITests;
 			packageProductDependencies = (
 			);
 			productName = SlateUITests;
-			productReference = EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */;
+			productReference = EBFA97E82EAFF17D00FBB8B5 /* LabyrinthUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
 /* End PBXNativeTarget section */
@@ -195,7 +203,7 @@
 					};
 				};
 			};
-			buildConfigurationList = EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Slate" */;
+			buildConfigurationList = EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Labyrinth" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -212,9 +220,9 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				EBFA97D02EAFF17D00FBB8B5 /* Slate */,
-				EBFA97DD2EAFF17D00FBB8B5 /* SlateTests */,
-				EBFA97E72EAFF17D00FBB8B5 /* SlateUITests */,
+				EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */,
+				EBFA97DD2EAFF17D00FBB8B5 /* LabyrinthTests */,
+				EBFA97E72EAFF17D00FBB8B5 /* LabyrinthUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -271,12 +279,12 @@
 /* Begin PBXTargetDependency section */
 		EBFA97E02EAFF17D00FBB8B5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = EBFA97D02EAFF17D00FBB8B5 /* Slate */;
+			target = EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */;
 			targetProxy = EBFA97DF2EAFF17D00FBB8B5 /* PBXContainerItemProxy */;
 		};
 		EBFA97EA2EAFF17D00FBB8B5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = EBFA97D02EAFF17D00FBB8B5 /* Slate */;
+			target = EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */;
 			targetProxy = EBFA97E92EAFF17D00FBB8B5 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -415,6 +423,15 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A282AW9YX2;
 				ENABLE_PREVIEWS = YES;
+				EXCLUDED_SOURCE_FILE_NAMES = (
+					"strokes*.xml",
+					"handwriting-synthesis",
+					"handwriting-synthesis/*",
+					"handwriting-synthesis/**",
+					"Slate/handwriting-synthesis",
+					"Slate/handwriting-synthesis/*",
+					"Slate/handwriting-synthesis/**",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -449,6 +466,15 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = A282AW9YX2;
 				ENABLE_PREVIEWS = YES;
+				EXCLUDED_SOURCE_FILE_NAMES = (
+					"strokes*.xml",
+					"handwriting-synthesis",
+					"handwriting-synthesis/*",
+					"handwriting-synthesis/**",
+					"Slate/handwriting-synthesis",
+					"Slate/handwriting-synthesis/*",
+					"Slate/handwriting-synthesis/**",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -488,7 +514,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Slate.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Slate";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Labyrinth.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Labyrinth";
 			};
 			name = Debug;
 		};
@@ -507,7 +533,7 @@
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Slate.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Slate";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Labyrinth.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Labyrinth";
 			};
 			name = Release;
 		};
@@ -548,7 +574,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Slate" */ = {
+		EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Labyrinth" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F02EAFF17D00FBB8B5 /* Debug */,
@@ -557,7 +583,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Slate" */ = {
+		EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Labyrinth" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F32EAFF17D00FBB8B5 /* Debug */,
@@ -566,7 +592,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		EBFA97F52EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "SlateTests" */ = {
+		EBFA97F52EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "LabyrinthTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F62EAFF17D00FBB8B5 /* Debug */,
@@ -575,7 +601,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		EBFA97F82EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "SlateUITests" */ = {
+		EBFA97F82EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "LabyrinthUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F92EAFF17D00FBB8B5 /* Debug */,

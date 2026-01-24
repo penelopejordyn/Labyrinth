@@ -133,7 +133,8 @@ class Stroke: Identifiable {
     ///   - device: MTLDevice for creating cached vertex buffer
     ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
     ///  OPTIMIZATION: Now caches GPU segment buffer in init
-    convenience init(screenPoints: [CGPoint],
+    convenience init(id: UUID = UUID(),
+                     screenPoints: [CGPoint],
                      zoomAtCreation: Double,
                      panAtCreation: SIMD2<Double>,
                      viewSize: CGSize,
@@ -150,7 +151,7 @@ class Stroke: Identifiable {
 
         guard let firstScreenPt = screenPoints.first else {
             self.init(
-                id: UUID(),
+                id: id,
                 origin: .zero,
                 worldWidth: 0,
                 color: color,
@@ -225,7 +226,7 @@ class Stroke: Identifiable {
         // 5. Calculate bounds expanded by stroke radius for culling
         let bounds = Stroke.calculateBounds(for: centerPoints, radius: Float(worldWidth) * 0.5)
         self.init(
-            id: UUID(),
+            id: id,
             origin: origin,
             worldWidth: worldWidth,
             color: color,

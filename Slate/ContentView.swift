@@ -15,6 +15,13 @@ import UniformTypeIdentifiers
 	    @State private var isBrushMenuExpanded = false
 	    @State private var isMenuExpanded = false
 	    @State private var showClearConfirmation = false
+	    @State private var isHandwritingRefinementMenuExpanded = false
+
+	    @State private var handwritingRefinementEnabled: Bool = false
+	    @State private var handwritingRefinementBias: Double = 2.0
+	    @State private var handwritingRefinementInputScale: Double = 2.0
+	    @State private var handwritingRefinementStrength: Double = 0.7
+	    @State private var handwritingRefinementDebounceSeconds: Double = 0.5
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -40,6 +47,15 @@ import UniformTypeIdentifiers
                             }
                         }
                     }
+                }
+
+                if let newCoord {
+                    // Keep UI state in sync with coordinator defaults (and vice versa).
+                    handwritingRefinementEnabled = newCoord.handwritingRefinementEnabled
+                    handwritingRefinementBias = Double(newCoord.handwritingRefinementBias)
+                    handwritingRefinementInputScale = Double(newCoord.handwritingRefinementInputScale)
+                    handwritingRefinementStrength = Double(newCoord.handwritingRefinementStrength)
+                    handwritingRefinementDebounceSeconds = newCoord.handwritingRefinementDebounceSeconds
                 }
             }
 
@@ -165,11 +181,11 @@ import UniformTypeIdentifiers
                             }
                         }
 
-	                        HStack(spacing: 12) {
-	                            Button(action: { coordinator.debugPopulateFrames() }) {
-	                                VStack(spacing: 2) {
-	                                    Image(systemName: "bolt.fill")
-	                                        .font(.system(size: 20))
+		                        HStack(spacing: 12) {
+		                            Button(action: { coordinator.debugPopulateFrames() }) {
+		                                VStack(spacing: 2) {
+		                                    Image(systemName: "bolt.fill")
+		                                        .font(.system(size: 20))
 	                                    Text("Fill")
 	                                        .font(.caption)
 	                                }
@@ -217,6 +233,111 @@ import UniformTypeIdentifiers
 	                            .padding(.vertical, 10)
 	                            .background(.ultraThinMaterial)
 	                            .cornerRadius(16)
+	                        }
+
+	                        Button(action: {
+	                            withAnimation(.easeInOut(duration: 0.2)) {
+	                                isHandwritingRefinementMenuExpanded.toggle()
+	                            }
+	                        }) {
+	                            HStack(spacing: 8) {
+	                                Image(systemName: isHandwritingRefinementMenuExpanded ? "wand.and.stars.inverse" : "wand.and.stars")
+	                                    .font(.system(size: 16))
+	                                Text("Refinement")
+	                                    .font(.system(size: 14, weight: .medium))
+	                            }
+	                            .foregroundColor(.white)
+	                            .padding(.horizontal, 12)
+	                            .padding(.vertical, 10)
+	                            .background(.ultraThinMaterial)
+	                            .cornerRadius(16)
+	                        }
+
+	                        if isHandwritingRefinementMenuExpanded {
+	                            VStack(alignment: .trailing, spacing: 10) {
+	                                Toggle(isOn: $handwritingRefinementEnabled) {
+	                                    HStack(spacing: 8) {
+	                                        Image(systemName: handwritingRefinementEnabled ? "pencil.and.outline" : "pencil")
+	                                            .font(.system(size: 14))
+	                                            .foregroundColor(.white)
+	                                        Text(handwritingRefinementEnabled ? "Refinement On" : "Refinement Off")
+	                                            .font(.system(size: 14, weight: .medium))
+	                                            .foregroundColor(.white)
+	                                    }
+	                                }
+	                                .toggleStyle(SwitchToggleStyle(tint: .blue))
+
+	                                VStack(alignment: .trailing, spacing: 6) {
+	                                    HStack(spacing: 8) {
+	                                        Image(systemName: "wand.and.stars")
+	                                            .font(.system(size: 14))
+	                                            .foregroundColor(.white)
+	                                        Text("Bias: \(String(format: "%.2f", handwritingRefinementBias))")
+	                                            .font(.system(size: 14, weight: .medium))
+	                                            .foregroundColor(.white)
+	                                    }
+	                                    Slider(value: $handwritingRefinementBias, in: 0.5...6.0, step: 0.05)
+	                                        .tint(.white)
+	                                }
+
+	                                VStack(alignment: .trailing, spacing: 6) {
+	                                    HStack(spacing: 8) {
+	                                        Image(systemName: "slider.horizontal.3")
+	                                            .font(.system(size: 14))
+	                                            .foregroundColor(.white)
+	                                        Text("Strength: \(String(format: "%.2f", handwritingRefinementStrength))")
+	                                            .font(.system(size: 14, weight: .medium))
+	                                            .foregroundColor(.white)
+	                                    }
+	                                    Slider(value: $handwritingRefinementStrength, in: 0.0...1.0, step: 0.05)
+	                                        .tint(.white)
+	                                }
+
+	                                VStack(alignment: .trailing, spacing: 6) {
+	                                    HStack(spacing: 8) {
+	                                        Image(systemName: "arrow.left.and.right")
+	                                            .font(.system(size: 14))
+	                                            .foregroundColor(.white)
+	                                        Text("Scale: \(String(format: "%.1f", handwritingRefinementInputScale))")
+	                                            .font(.system(size: 14, weight: .medium))
+	                                            .foregroundColor(.white)
+	                                    }
+	                                    Slider(value: $handwritingRefinementInputScale, in: 0.5...10.0, step: 0.1)
+	                                        .tint(.white)
+	                                }
+
+	                                VStack(alignment: .trailing, spacing: 6) {
+	                                    HStack(spacing: 8) {
+	                                        Image(systemName: "timer")
+	                                            .font(.system(size: 14))
+	                                            .foregroundColor(.white)
+	                                        Text("Debounce: \(Int(handwritingRefinementDebounceSeconds * 1000))ms")
+	                                            .font(.system(size: 14, weight: .medium))
+	                                            .foregroundColor(.white)
+	                                    }
+	                                    Slider(value: $handwritingRefinementDebounceSeconds, in: 0.1...1.5, step: 0.05)
+	                                        .tint(.white)
+	                                }
+	                            }
+	                            .padding(.horizontal, 16)
+	                            .padding(.vertical, 12)
+	                            .background(.ultraThinMaterial)
+	                            .cornerRadius(20)
+	                            .onChange(of: handwritingRefinementEnabled) { _, newValue in
+	                                coordinator.handwritingRefinementEnabled = newValue
+	                            }
+	                            .onChange(of: handwritingRefinementBias) { _, newValue in
+	                                coordinator.handwritingRefinementBias = Float(newValue)
+	                            }
+	                            .onChange(of: handwritingRefinementStrength) { _, newValue in
+	                                coordinator.handwritingRefinementStrength = Float(newValue)
+	                            }
+	                            .onChange(of: handwritingRefinementInputScale) { _, newValue in
+	                                coordinator.handwritingRefinementInputScale = Float(newValue)
+	                            }
+	                            .onChange(of: handwritingRefinementDebounceSeconds) { _, newValue in
+	                                coordinator.handwritingRefinementDebounceSeconds = newValue
+	                            }
 	                        }
 
 	                        Button(action: {
