@@ -16,9 +16,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "EBFA97D02EAFF17D00FBB8B5"
-               BuildableName = "Slate.app"
-               BlueprintName = "Slate"
-               ReferencedContainer = "container:Slate.xcodeproj">
+               BuildableName = "Labyrinth.app"
+               BlueprintName = "Labyrinth"
+               ReferencedContainer = "container:Labyrinth.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -38,7 +38,7 @@
                BlueprintIdentifier = "EBFA97DD2EAFF17D00FBB8B5"
                BuildableName = "SlateTests.xctest"
                BlueprintName = "SlateTests"
-               ReferencedContainer = "container:Slate.xcodeproj">
+               ReferencedContainer = "container:Labyrinth.xcodeproj">
             </BuildableReference>
          </TestableReference>
          <TestableReference
@@ -49,7 +49,7 @@
                BlueprintIdentifier = "EBFA97E72EAFF17D00FBB8B5"
                BuildableName = "SlateUITests.xctest"
                BlueprintName = "SlateUITests"
-               ReferencedContainer = "container:Slate.xcodeproj">
+               ReferencedContainer = "container:Labyrinth.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -63,15 +63,16 @@
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
+      showGraphicsOverview = "Yes"
       allowLocationSimulation = "YES">
       <BuildableProductRunnable
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "EBFA97D02EAFF17D00FBB8B5"
-            BuildableName = "Slate.app"
-            BlueprintName = "Slate"
-            ReferencedContainer = "container:Slate.xcodeproj">
+            BuildableName = "Labyrinth.app"
+            BlueprintName = "Labyrinth"
+            ReferencedContainer = "container:Labyrinth.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>
@@ -86,9 +87,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "EBFA97D02EAFF17D00FBB8B5"
-            BuildableName = "Slate.app"
-            BlueprintName = "Slate"
-            ReferencedContainer = "container:Slate.xcodeproj">
+            BuildableName = "Labyrinth.app"
+            BlueprintName = "Labyrinth"
+            ReferencedContainer = "container:Labyrinth.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

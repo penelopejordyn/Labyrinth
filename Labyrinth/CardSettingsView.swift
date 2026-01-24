@@ -16,6 +16,8 @@ struct CardSettingsView: View {
     @State private var isLocked: Bool = false
     @State private var showImagePicker = false
     @State private var uiImage: UIImage?
+    @State private var youtubeURL: String = ""
+    @State private var pluginTypeID: String = ""
     @Environment(\.dismiss) var dismiss
 
     init(card: Card, onDelete: (() -> Void)? = nil) {
@@ -48,17 +50,40 @@ struct CardSettingsView: View {
             ScrollView {
                 VStack(spacing: 20) {
                     // Type Picker
-                    Picker("Background Type", selection: $selectedTab) {
-                        Text("Solid").tag(0)
-                        Text("Lined").tag(1)
-                        Text("Grid").tag(2)
-                        Text("Image").tag(3)
+                    let tabs: [(title: String, tag: Int)] = [
+                        ("Solid", 0),
+                        ("Lined", 1),
+                        ("Grid", 2),
+                        ("Image", 3),
+                        ("YouTube", 4),
+                        ("Plugin", 5),
+                    ]
+                    let columns = [
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8),
+                        GridItem(.flexible(), spacing: 8),
+                    ]
+                    LazyVGrid(columns: columns, spacing: 8) {
+                        ForEach(tabs, id: \.tag) { tab in
+                            Button {
+                                selectedTab = tab.tag
+                                updateCardType(for: tab.tag)
+                            } label: {
+                                Text(tab.title)
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(selectedTab == tab.tag ? Color.accentColor.opacity(0.25) : Color(.systemGray6))
+                                    )
+                                    .foregroundColor(selectedTab == tab.tag ? .primary : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
-                    .pickerStyle(.segmented)
-                    .padding()
-                    .onChange(of: selectedTab) { _, newValue in
-                        updateCardType(for: newValue)
-                    }
+                    .padding(.horizontal)
+                    .padding(.top, 8)
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Background Color")
@@ -180,6 +205,60 @@ struct CardSettingsView: View {
                             }
                         }
                         .padding(.horizontal)
+                    } else if selectedTab == 4 {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("YouTube Link")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+
+                            TextField("Paste a YouTube URL", text: $youtubeURL)
+                                .textFieldStyle(.roundedBorder)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .keyboardType(.URL)
+
+                            Button("Set YouTube Video") {
+                                applyYouTubeLink(youtubeURL)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.horizontal)
+                    } else if selectedTab == 5 {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Plugin Card")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+
+                            let defs = CardPluginRegistry.shared.allDefinitions
+                            if defs.isEmpty {
+                                Text("No card plugins installed.")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                Picker("Plugin", selection: $pluginTypeID) {
+                                    ForEach(defs, id: \.typeID) { def in
+                                        Text(def.name).tag(def.typeID)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+                                .onChange(of: pluginTypeID) { _, newValue in
+                                    applyPluginType(newValue, resetPayload: true)
+                                }
+
+                                if !pluginTypeID.isEmpty {
+                                    Text(pluginTypeID)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .textSelection(.enabled)
+                                }
+
+                                Button("Reset Plugin State") {
+                                    applyPluginType(pluginTypeID, resetPayload: true)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .padding(.horizontal)
                     }
 
                     Spacer(minLength: 20)
@@ -207,7 +286,16 @@ struct CardSettingsView: View {
             let loader = MTKTextureLoader(device: device)
 
             if let cgImg = img.cgImage,
-               let texture = try? loader.newTexture(cgImage: cgImg, options: [.origin: MTKTextureLoader.Origin.bottomLeft]) {
+               let texture = try? loader.newTexture(
+                cgImage: cgImg,
+                options: [
+                    .origin: MTKTextureLoader.Origin.bottomLeft,
+                    // The renderer targets `.bgra8Unorm` (non-sRGB). If we load card images as sRGB textures,
+                    // Metal will convert them to linear on sample, making them appear too dark when written
+                    // into a non-sRGB render target.
+                    .SRGB: false,
+                ]
+               ) {
 
                 card.type = .image(texture)
 
@@ -238,8 +326,18 @@ struct CardSettingsView: View {
                 lineColor = colorFromSIMD(config.color)
             case .image:
                 selectedTab = 3
+            case .youtube(let videoID, _):
+                selectedTab = 4
+                youtubeURL = videoID
             case .drawing:
                 selectedTab = 0 // Default to solid for now
+            case .plugin(let typeID, _):
+                selectedTab = 5
+                pluginTypeID = typeID
+            }
+
+            if pluginTypeID.isEmpty, let first = CardPluginRegistry.shared.allDefinitions.first {
+                pluginTypeID = first.typeID
             }
         }
     }
@@ -267,6 +365,13 @@ struct CardSettingsView: View {
         case 3: // Image
             // Will be handled in Phase 4
             break
+        case 4: // YouTube
+            card.type = .youtube(videoID: "", aspectRatio: 16.0 / 9.0)
+        case 5: // Plugin
+            if pluginTypeID.isEmpty, let first = CardPluginRegistry.shared.allDefinitions.first {
+                pluginTypeID = first.typeID
+            }
+            applyPluginType(pluginTypeID, resetPayload: false)
         default:
             break
         }
@@ -298,5 +403,94 @@ struct CardSettingsView: View {
               green: Double(color.y),
               blue: Double(color.z),
               opacity: Double(color.w))
+    }
+
+    private func applyYouTubeLink(_ input: String) {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let info = parseYouTubeVideoInfo(from: trimmed) else { return }
+
+        card.type = .youtube(videoID: info.videoID, aspectRatio: info.aspectRatio)
+
+        if info.aspectRatio.isFinite, info.aspectRatio > 0 {
+            let newHeight = card.size.x / info.aspectRatio
+            if newHeight.isFinite, newHeight > 0 {
+                card.size.y = newHeight
+            }
+        }
+        card.rebuildGeometry()
+    }
+
+    private func applyPluginType(_ typeID: String, resetPayload: Bool) {
+        let trimmed = typeID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            card.pluginSnapshotTexture = nil
+            card.type = .plugin(typeID: "", payload: Data())
+            return
+        }
+
+        if case .plugin(let currentTypeID, let currentPayload) = card.type,
+           currentTypeID == trimmed,
+           resetPayload == false {
+            return
+        }
+
+        let payload: Data = {
+            if resetPayload {
+                return CardPluginRegistry.shared.definition(for: trimmed)?.defaultPayload ?? Data()
+            }
+            if case .plugin(let currentTypeID, let currentPayload) = card.type,
+               currentTypeID == trimmed {
+                return currentPayload
+            }
+            return CardPluginRegistry.shared.definition(for: trimmed)?.defaultPayload ?? Data()
+        }()
+
+        card.pluginSnapshotTexture = nil
+        card.type = .plugin(typeID: trimmed, payload: payload)
+    }
+
+    private func parseYouTubeVideoInfo(from input: String) -> (videoID: String, aspectRatio: Double)? {
+        guard !input.isEmpty else { return nil }
+
+        if !input.contains("://"),
+           input.range(of: #"^[A-Za-z0-9_-]{6,}$"#, options: .regularExpression) != nil {
+            return (videoID: input, aspectRatio: 16.0 / 9.0)
+        }
+
+        guard let url = URL(string: input),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+
+        let host = (components.host ?? "").lowercased()
+        let path = components.path
+
+        if host.contains("youtube.com") || host.contains("youtube-nocookie.com") {
+            if let v = components.queryItems?.first(where: { $0.name == "v" })?.value,
+               !v.isEmpty {
+                return (videoID: v, aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if host.contains("youtu.be") {
+            let parts = path.split(separator: "/")
+            if let first = parts.first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if let range = path.range(of: "/embed/") {
+            let rest = path[range.upperBound...]
+            if let first = rest.split(separator: "/").first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 16.0 / 9.0)
+            }
+        }
+
+        if let range = path.range(of: "/shorts/") {
+            let rest = path[range.upperBound...]
+            if let first = rest.split(separator: "/").first, !first.isEmpty {
+                return (videoID: String(first), aspectRatio: 9.0 / 16.0)
+            }
+        }
+
+        return nil
     }
 }

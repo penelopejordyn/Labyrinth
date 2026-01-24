@@ -20,15 +20,29 @@ class Stroke: Identifiable {
     let zoomEffectiveAtCreation: Float  // Effective zoom when the stroke was committed
     let depthID: UInt32                // Global draw order for depth testing (larger = newer)
     var depthWriteEnabled: Bool         // Allows disabling depth writes for specific strokes (e.g. translucent markers)
+    var layerID: UUID?                 // Optional Layer membership (nil = default layer)
+    var sectionID: UUID?              // Optional Section membership (nil = belongs to frame)
+    /// When true, this (mask eraser) stroke is rendered in every layer pass (so it can erase across layers)
+    /// without duplicating geometry per layer.
+    var maskAppliesToAllLayers: Bool
+    var link: String?                  // Optional URL string attached to this stroke (linking feature)
+    var linkSectionID: UUID?           // Groups multiple strokes into one highlight section (separate boxes even for same URL)
+    var linkTargetSectionID: UUID?     // Optional internal link target (Section)
+    var linkTargetCardID: UUID?        // Optional internal link target (Card)
 
     /// GPU segment instances for SDF rendering
     let segments: [StrokeSegmentInstance]
     var segmentBuffer: MTLBuffer?
 
+    /// Cached batched segment instances in frame/world coordinates (for single-draw batching).
+    let batchedSegments: [BatchedStrokeSegmentInstance]
+
     /// Bounding box in local space for culling
     var localBounds: CGRect = .zero
     /// Optional duplicate for future BVH/tiling
     var segmentBounds: CGRect = .zero
+    /// Cached radius (world units) from origin to farthest stroke bounds (includes stroke radius).
+    let cullingRadiusWorld: Double
 
     init(id: UUID = UUID(),
          origin: SIMD2<Double>,
@@ -40,7 +54,14 @@ class Stroke: Identifiable {
          segmentBounds: CGRect? = nil,
          device: MTLDevice?,
          depthID: UInt32,
-         depthWriteEnabled: Bool = true) {
+         depthWriteEnabled: Bool = true,
+         layerID: UUID? = nil,
+         sectionID: UUID? = nil,
+         maskAppliesToAllLayers: Bool = false,
+         link: String? = nil,
+         linkSectionID: UUID? = nil,
+         linkTargetSectionID: UUID? = nil,
+         linkTargetCardID: UUID? = nil) {
         self.id = id
         self.origin = origin
         self.worldWidth = worldWidth
@@ -48,9 +69,43 @@ class Stroke: Identifiable {
         self.zoomEffectiveAtCreation = max(zoomEffectiveAtCreation, 1e-6)
         self.depthID = depthID
         self.depthWriteEnabled = depthWriteEnabled
+        self.layerID = layerID
+        self.sectionID = sectionID
+        self.maskAppliesToAllLayers = maskAppliesToAllLayers
+        self.link = link
+        self.linkSectionID = linkSectionID
+        self.linkTargetSectionID = linkTargetSectionID
+        self.linkTargetCardID = linkTargetCardID
         self.segments = segments
         self.localBounds = localBounds
         self.segmentBounds = segmentBounds ?? localBounds
+
+        if localBounds == .null {
+            self.cullingRadiusWorld = 0
+        } else {
+            let farX = max(abs(localBounds.minX), abs(localBounds.maxX))
+            let farY = max(abs(localBounds.minY), abs(localBounds.maxY))
+            self.cullingRadiusWorld = hypot(farX, farY)
+        }
+
+        if segments.isEmpty {
+            self.batchedSegments = []
+        } else {
+            let originF = SIMD2<Float>(Float(origin.x), Float(origin.y))
+            let params = SIMD2<Float>(Float(worldWidth), StrokeDepth.metalDepth(for: depthID))
+
+            var batched: [BatchedStrokeSegmentInstance] = []
+            batched.reserveCapacity(segments.count)
+            for seg in segments {
+                batched.append(BatchedStrokeSegmentInstance(
+                    p0World: originF + seg.p0,
+                    p1World: originF + seg.p1,
+                    color: seg.color,
+                    params: params
+                ))
+            }
+            self.batchedSegments = batched
+        }
 
         if let device = device, !segments.isEmpty {
             self.segmentBuffer = device.makeBuffer(
@@ -78,7 +133,8 @@ class Stroke: Identifiable {
     ///   - device: MTLDevice for creating cached vertex buffer
     ///  UPGRADED: Now accepts Double for zoom and pan to maintain precision
     ///  OPTIMIZATION: Now caches GPU segment buffer in init
-    convenience init(screenPoints: [CGPoint],
+    convenience init(id: UUID = UUID(),
+                     screenPoints: [CGPoint],
                      zoomAtCreation: Double,
                      panAtCreation: SIMD2<Double>,
                      viewSize: CGSize,
@@ -95,7 +151,7 @@ class Stroke: Identifiable {
 
         guard let firstScreenPt = screenPoints.first else {
             self.init(
-                id: UUID(),
+                id: id,
                 origin: .zero,
                 worldWidth: 0,
                 color: color,
@@ -170,7 +226,7 @@ class Stroke: Identifiable {
         // 5. Calculate bounds expanded by stroke radius for culling
         let bounds = Stroke.calculateBounds(for: centerPoints, radius: Float(worldWidth) * 0.5)
         self.init(
-            id: UUID(),
+            id: id,
             origin: origin,
             worldWidth: worldWidth,
             color: color,
@@ -260,9 +316,16 @@ extension Stroke {
             value.isFinite ? value : fallback
         }
 
-        let rawPts = rawPoints.compactMap { point -> [Float]? in
-            guard point.x.isFinite, point.y.isFinite else { return nil }
-            return [point.x, point.y]
+        let finitePoints = rawPoints.filter { $0.x.isFinite && $0.y.isFinite }
+        var deltaPoints: [[Float]] = []
+        deltaPoints.reserveCapacity(finitePoints.count)
+        var last = SIMD2<Float>(0, 0)
+        for (index, point) in finitePoints.enumerated() {
+            let dx = safeFloat(point.x - last.x)
+            let dy = safeFloat(point.y - last.y)
+            last = point
+            let penLift: Float = (index == finitePoints.count - 1) ? 1 : 0
+            deltaPoints.append([dx, dy, penLift])
         }
 
         return StrokeDTO(
@@ -278,16 +341,39 @@ extension Stroke {
             zoomCreation: safeFloat(zoomEffectiveAtCreation, fallback: 1),
             depthID: depthID,
             depthWrite: depthWriteEnabled,
-            points: rawPts
+            maskAppliesToAllLayers: maskAppliesToAllLayers,
+            layerID: layerID,
+            link: link,
+            linkSectionID: linkSectionID,
+            linkTargetSectionID: linkTargetSectionID,
+            linkTargetCardID: linkTargetCardID,
+            sectionID: sectionID,
+            points: deltaPoints
         )
     }
 
     convenience init(dto: StrokeDTO, device: MTLDevice?) {
-        let localPoints = dto.points.map { point in
-            let x = point.count > 0 ? point[0] : 0
-            let y = point.count > 1 ? point[1] : 0
-            return SIMD2<Float>(x, y)
-        }
+        let localPoints: [SIMD2<Float>] = {
+            if dto.points.contains(where: { $0.count >= 3 }) {
+                var current = SIMD2<Float>(0, 0)
+                var decoded: [SIMD2<Float>] = []
+                decoded.reserveCapacity(dto.points.count)
+                for entry in dto.points {
+                    let dx = entry.count > 0 ? entry[0] : 0
+                    let dy = entry.count > 1 ? entry[1] : 0
+                    current.x += dx.isFinite ? dx : 0
+                    current.y += dy.isFinite ? dy : 0
+                    decoded.append(current)
+                }
+                return decoded
+            }
+
+            return dto.points.map { point in
+                let x = point.count > 0 ? point[0] : 0
+                let y = point.count > 1 ? point[1] : 0
+                return SIMD2<Float>(x.isFinite ? x : 0, y.isFinite ? y : 0)
+            }
+        }()
 
         let color = SIMD4<Float>(
             dto.color.count > 0 ? dto.color[0] : 0,
@@ -313,7 +399,29 @@ extension Stroke {
             segmentBounds: bounds,
             device: device,
             depthID: dto.depthID,
-            depthWriteEnabled: dto.depthWrite
+            depthWriteEnabled: dto.depthWrite,
+            layerID: dto.layerID,
+            sectionID: dto.sectionID,
+            maskAppliesToAllLayers: dto.maskAppliesToAllLayers ?? false,
+            link: dto.link,
+            linkSectionID: dto.linkSectionID,
+            linkTargetSectionID: dto.linkTargetSectionID,
+            linkTargetCardID: dto.linkTargetCardID
         )
+    }
+}
+
+// MARK: - Linking Helpers
+extension Stroke {
+    var linkURL: URL? {
+        guard let link, !link.isEmpty else { return nil }
+        return URL(string: link)
+    }
+
+    var hasAnyLink: Bool {
+        if let link, !link.isEmpty { return true }
+        if linkTargetSectionID != nil { return true }
+        if linkTargetCardID != nil { return true }
+        return false
     }
 }

@@ -23,6 +23,27 @@ struct SegmentInstance {
     float4 color;
 };
 
+/// Shared camera transform for batched segment rendering.
+struct BatchedStrokeTransform {
+    float2 cameraCenterWorld;  // Camera center in the current frame coordinate system
+    float zoomScale;
+    float screenWidth;
+    float screenHeight;
+    float rotationAngle;
+    float featherPx;
+    float depthBias;
+    float depthScale;
+};
+
+/// Per-segment instance data for batched SDF segments.
+/// params.x = worldWidth, params.y = depth (Metal NDC [0,1], smaller = closer)
+struct BatchedSegmentInstance {
+    float2 p0World;
+    float2 p1World;
+    float4 color;
+    float2 params;
+};
+
 /// Vertex input for batched stroke rendering
 struct VertexIn {
     float2 position [[attribute(0)]];  // Camera-relative position (calculated on CPU)
@@ -49,6 +70,15 @@ struct SegmentOut {
     float2 p0Screen;      // segment endpoint in pixels
     float2 p1Screen;
     float4 color;
+};
+
+struct BatchedSegmentOut {
+    float4 position [[position]];
+    float2 fragScreen;    // pixel coords of this fragment
+    float2 p0Screen;      // segment endpoint in pixels
+    float2 p1Screen;
+    float4 color;
+    float halfPixelWidth;
 };
 
 vertex SegmentOut vertex_segment_sdf(
@@ -129,6 +159,86 @@ fragment float4 fragment_segment_sdf(
 
     // No alpha blending needed - the stroke is either fully inside or fully outside
     // Hardware MSAA will automatically smooth the edges at sub-pixel level
+    return in.color;
+}
+
+vertex BatchedSegmentOut vertex_segment_sdf_batched(
+    QuadIn vin [[stage_in]],
+    constant BatchedStrokeTransform *t [[buffer(1)]],
+    const device BatchedSegmentInstance *instances [[buffer(2)]],
+    uint iid [[instance_id]]
+) {
+    BatchedSegmentInstance seg = instances[iid];
+
+    float2 rel0 = seg.p0World - t->cameraCenterWorld;
+    float2 rel1 = seg.p1World - t->cameraCenterWorld;
+
+    float c = cos(t->rotationAngle);
+    float s = sin(t->rotationAngle);
+
+    float2 r0 = float2(rel0.x * c - rel0.y * s, rel0.x * s + rel0.y * c);
+    float2 r1 = float2(rel1.x * c - rel1.y * s, rel1.x * s + rel1.y * c);
+
+    float2 p0 = r0 * t->zoomScale;
+    float2 p1 = r1 * t->zoomScale;
+
+    float2 d = p1 - p0;
+    float len = length(d);
+    float2 dir = (len > 0.0) ? (d / len) : float2(1.0, 0.0);
+    float2 nrm = float2(-dir.y, dir.x);
+
+    float worldWidth = seg.params.x;
+    float basePixelWidth = worldWidth * t->zoomScale;
+    float halfPixelWidth = max(basePixelWidth * 0.5, 0.5);
+    float R = halfPixelWidth;
+
+    float x = mix(-R, len + R, vin.corner.x);
+    float y = mix(-R, +R,        vin.corner.y);
+
+    float2 screenPos = p0 + dir * x + nrm * y;
+
+    float ndcX = (screenPos.x / t->screenWidth) * 2.0;
+    float ndcY = -(screenPos.y / t->screenHeight) * 2.0;
+    float depth = t->depthBias + seg.params.y * t->depthScale;
+
+    BatchedSegmentOut out;
+    out.position = float4(ndcX, ndcY, depth, 1.0);
+    out.fragScreen = screenPos;
+    out.p0Screen = p0;
+    out.p1Screen = p1;
+    out.color = seg.color;
+    out.halfPixelWidth = halfPixelWidth;
+    return out;
+}
+
+fragment float4 fragment_segment_sdf_batched(
+    BatchedSegmentOut in [[stage_in]],
+    constant BatchedStrokeTransform *t [[buffer(1)]]
+) {
+    (void)t;
+
+    float2 p = in.fragScreen;
+    float2 a = in.p0Screen;
+    float2 b = in.p1Screen;
+
+    float2 ab = b - a;
+    float denom = dot(ab, ab);
+
+    float h = 0.0;
+    if (denom > 0.0) {
+        h = dot(p - a, ab) / denom;
+        h = clamp(h, 0.0, 1.0);
+    }
+
+    float2 closest = a + h * ab;
+    float dist = length(p - closest);
+
+    float R = in.halfPixelWidth;
+
+    if (dist > R) {
+        discard_fragment();
+    }
+
     return in.color;
 }
 
@@ -270,6 +380,22 @@ vertex PostProcessOut vertex_fullscreen_triangle(uint vid [[vertex_id]]) {
     out.position = float4(pos[vid], 0.0, 1.0);
     out.uv = uv[vid];
     return out;
+}
+
+vertex PostProcessOut vertex_fullscreen_triangle_depth_clear(uint vid [[vertex_id]]) {
+    // Fullscreen triangle that writes FAR depth (1.0) without needing a vertex buffer.
+    float2 pos[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    float2 uv[3] = { float2(0.0, 1.0), float2(2.0, 1.0), float2(0.0, -1.0) };
+
+    PostProcessOut out;
+    out.position = float4(pos[vid], 1.0, 1.0);
+    out.uv = uv[vid];
+    return out;
+}
+
+fragment float4 fragment_depth_clear(PostProcessOut in [[stage_in]]) {
+    (void)in;
+    return float4(0.0);
 }
 
 fragment float4 fragment_fxaa(
@@ -545,4 +671,12 @@ fragment float4 fragment_card_shadow(CardVertexOut in [[stage_in]],
 
     float alpha = (1.0 - smoothstep(0.0, blurPx, distPx)) * style.shadowOpacity;
     return float4(0.0, 0.0, 0.0, alpha);
+}
+
+// MARK: - Unmasked Solid (for arbitrary triangles, e.g. Sections)
+
+fragment float4 fragment_solid_unmasked(CardVertexOut in [[stage_in]],
+                                        constant float4 &color [[buffer(0)]]) {
+    (void)in;
+    return color;
 }
