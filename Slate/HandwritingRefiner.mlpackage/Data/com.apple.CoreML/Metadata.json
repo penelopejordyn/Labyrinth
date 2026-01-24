@@ -1,0 +1,11 @@
+{
+  "MLModelVersionStringKey" : "--",
+  "MLModelDescriptionKey" : "--",
+  "MLModelCreatorDefinedKey" : {
+    "com.github.apple.coremltools.version" : "9.0",
+    "com.github.apple.coremltools.conversion_date" : "2026-01-23",
+    "com.github.apple.coremltools.source" : "tensorflow==2.17.0"
+  },
+  "MLModelAuthorKey" : "--",
+  "MLModelLicenseKey" : "--"
+}
