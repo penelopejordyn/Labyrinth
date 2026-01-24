@@ -12,12 +12,11 @@ struct LinedBackgroundConfig {
 }
 
 enum CardType {
-    case solidColor(SIMD4<Float>) // For testing/backgrounds
+    case solidColor(SIMD4<Float>) //
     case image(MTLTexture)        // User photos
     case lined(LinedBackgroundConfig) // Procedural Lines
     case grid(LinedBackgroundConfig)  // Procedural Grid
     case youtube(videoID: String, aspectRatio: Double) // Embedded YouTube video (rendered via overlay)
-    case drawing([Stroke])        // Future: Mini-canvas inside the card
 }
 
 // Helper to get raw values for Metal (Uniform buffer)
