@@ -420,6 +420,7 @@ final class CardSettingsFloatingMenu: UIViewController {
     private var cardNamesVisible: Bool
     private let onToggleCardNames: (Bool) -> Void
     private let onDelete: () -> Void
+    private let onActivatePlugin: (() -> Void)?
     private let sourceRect: CGRect
     private let sourceView: UIView
 
@@ -453,6 +454,9 @@ final class CardSettingsFloatingMenu: UIViewController {
     private var youtubeURLField: UITextField!
     private var youtubeErrorLabel: UILabel!
     private var youtubeInputText: String = ""
+    private var pluginSettingsStack: UIStackView!
+    private var pluginTypeButton: UIButton!
+    private var pluginTypeID: String = ""
 
     private var lineColor: SIMD4<Float> = SIMD4<Float>(0.7, 0.8, 1.0, 0.5)
 
@@ -471,6 +475,7 @@ final class CardSettingsFloatingMenu: UIViewController {
          cardNamesVisible: Bool,
          onToggleCardNames: @escaping (Bool) -> Void,
          onDelete: @escaping () -> Void,
+         onActivatePlugin: (() -> Void)? = nil,
          sourceRect: CGRect,
          sourceView: UIView) {
         self.card = card
@@ -479,6 +484,7 @@ final class CardSettingsFloatingMenu: UIViewController {
         self.cardNamesVisible = cardNamesVisible
         self.onToggleCardNames = onToggleCardNames
         self.onDelete = onDelete
+        self.onActivatePlugin = onActivatePlugin
         self.sourceRect = sourceRect
         self.sourceView = sourceView
         super.init(nibName: nil, bundle: nil)
@@ -518,11 +524,11 @@ final class CardSettingsFloatingMenu: UIViewController {
 
     private func loadCardState() {
         cardOpacity = card.opacity
-        switch card.type {
-        case .solidColor:
-            selectedTab = 0
-        case .lined(let config):
-            selectedTab = 1
+	        switch card.type {
+	        case .solidColor:
+	            selectedTab = 0
+	        case .lined(let config):
+	            selectedTab = 1
             spacing = config.spacing
             lineWidth = config.lineWidth
             lineColor = config.color
@@ -533,11 +539,14 @@ final class CardSettingsFloatingMenu: UIViewController {
             lineColor = config.color
         case .image:
             selectedTab = 3
-        case .youtube(let videoID, _):
-            selectedTab = 4
-            youtubeInputText = videoID
+	        case .youtube(let videoID, _):
+	            selectedTab = 4
+	            youtubeInputText = videoID
         case .drawing:
             selectedTab = 0
+        case .plugin(let typeID, _):
+            selectedTab = 5
+            pluginTypeID = typeID
         }
     }
 
@@ -720,8 +729,8 @@ final class CardSettingsFloatingMenu: UIViewController {
         mainStack.addArrangedSubview(colorGrid)
 
         // Type segment
-        typeSegment = UISegmentedControl(items: ["Solid", "Lined", "Grid", "Image", "YouTube"])
-        typeSegment.selectedSegmentIndex = min(selectedTab, 4)
+        typeSegment = UISegmentedControl(items: ["Solid", "Lined", "Grid", "Image", "YouTube", "Plugin"])
+        typeSegment.selectedSegmentIndex = min(selectedTab, 5)
         typeSegment.addTarget(self, action: #selector(typeChanged(_:)), for: .valueChanged)
         mainStack.addArrangedSubview(typeSegment)
 
@@ -890,6 +899,39 @@ final class CardSettingsFloatingMenu: UIViewController {
 
         mainStack.addArrangedSubview(youtubeSettingsStack)
 
+        // Plugin settings (only shown for Plugin)
+        pluginSettingsStack = UIStackView()
+        pluginSettingsStack.axis = .vertical
+        pluginSettingsStack.spacing = 8
+        pluginSettingsStack.isHidden = selectedTab != 5
+
+        let pluginLabel = UILabel()
+        pluginLabel.text = "Plugin Card"
+        pluginLabel.font = .systemFont(ofSize: 13)
+        pluginLabel.textColor = .secondaryLabel
+        pluginSettingsStack.addArrangedSubview(pluginLabel)
+
+        let chooseButton = makeCompactButton(title: "Choose Plugin", systemImage: "puzzlepiece") { [weak self] in
+            self?.presentPluginPicker()
+        }
+        pluginTypeButton = chooseButton
+        pluginSettingsStack.addArrangedSubview(chooseButton)
+
+        let resetPluginStateButton = makeCompactButton(title: "Reset State", systemImage: "arrow.counterclockwise") { [weak self] in
+            self?.applyPluginType(resetPayload: true)
+        }
+        pluginSettingsStack.addArrangedSubview(resetPluginStateButton)
+
+        mainStack.addArrangedSubview(pluginSettingsStack)
+
+        // Prime the plugin title from current selection.
+        if let def = CardPluginRegistry.shared.definition(for: pluginTypeID) {
+            pluginTypeButton.setTitle(def.name, for: .normal)
+        } else if pluginTypeID.isEmpty, let first = CardPluginRegistry.shared.allDefinitions.first {
+            pluginTypeID = first.typeID
+            pluginTypeButton.setTitle(first.name, for: .normal)
+        }
+
         // Opacity
         let opacityStack = UIStackView()
         opacityStack.axis = .vertical
@@ -1041,6 +1083,8 @@ final class CardSettingsFloatingMenu: UIViewController {
             break
         case 4:
             break
+        case 5:
+            applyPluginType(resetPayload: false)
         default:
             break
         }
@@ -1094,6 +1138,70 @@ final class CardSettingsFloatingMenu: UIViewController {
         card.rebuildGeometry()
 
         fetchYouTubeThumbnail(videoID: videoID)
+    }
+
+    private func applyPluginType(resetPayload: Bool) {
+        let defs = CardPluginRegistry.shared.allDefinitions
+        if pluginTypeID.isEmpty, let first = defs.first {
+            pluginTypeID = first.typeID
+        }
+
+        guard !pluginTypeID.isEmpty else {
+            pluginTypeButton?.setTitle("Choose Plugin", for: .normal)
+            return
+        }
+
+        let payload: Data = {
+            if resetPayload {
+                return CardPluginRegistry.shared.definition(for: pluginTypeID)?.defaultPayload ?? Data()
+            }
+            if case .plugin(let existingTypeID, let existingPayload) = card.type,
+               existingTypeID == pluginTypeID {
+                return existingPayload
+            }
+            return CardPluginRegistry.shared.definition(for: pluginTypeID)?.defaultPayload ?? Data()
+        }()
+
+        card.pluginSnapshotTexture = nil
+        card.type = .plugin(typeID: pluginTypeID, payload: payload)
+
+        if let def = CardPluginRegistry.shared.definition(for: pluginTypeID) {
+            pluginTypeButton?.setTitle(def.name, for: .normal)
+        } else {
+            pluginTypeButton?.setTitle("Choose Plugin", for: .normal)
+        }
+    }
+
+    private func presentPluginPicker() {
+        let defs = CardPluginRegistry.shared.allDefinitions
+        let alert = UIAlertController(title: "Choose Plugin", message: nil, preferredStyle: .actionSheet)
+
+        if defs.isEmpty {
+            alert.addAction(UIAlertAction(title: "No plugins installed", style: .default))
+        } else {
+            for def in defs {
+                alert.addAction(UIAlertAction(title: def.name, style: .default) { [weak self] _ in
+                    guard let self else { return }
+                    self.pluginTypeID = def.typeID
+                    self.applyPluginType(resetPayload: true)
+                    let activate = self.onActivatePlugin
+                    DispatchQueue.main.async { [weak self] in
+                        self?.dismissPopover {
+                            activate?()
+                        }
+                    }
+                })
+            }
+        }
+
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+
+        if let pop = alert.popoverPresentationController {
+            pop.sourceView = pluginTypeButton
+            pop.sourceRect = pluginTypeButton?.bounds ?? .zero
+        }
+
+        present(alert, animated: true)
     }
 
     private func parseYouTubeVideoInfo(from input: String) -> (videoID: String, aspectRatio: Double)? {
@@ -1273,6 +1381,7 @@ final class CardSettingsFloatingMenu: UIViewController {
         lineSettingsStack.isHidden = !(selectedTab == 1 || selectedTab == 2)
         imageSettingsStack.isHidden = selectedTab != 3
         youtubeSettingsStack.isHidden = selectedTab != 4
+        pluginSettingsStack.isHidden = selectedTab != 5
         if selectedTab == 4, case .youtube = card.type {
             // Keep existing YouTube card state.
         } else if selectedTab == 4 {

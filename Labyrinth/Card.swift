@@ -18,6 +18,7 @@ enum CardType {
     case grid(LinedBackgroundConfig)  // Procedural Grid
     case youtube(videoID: String, aspectRatio: Double) // Embedded YouTube video (rendered via overlay)
     case drawing([Stroke])        // Future: Mini-canvas inside the card
+    case plugin(typeID: String, payload: Data) // Sandboxed runtime card (host-managed state blob)
 }
 
 // Helper to get raw values for Metal (Uniform buffer)
@@ -72,6 +73,7 @@ class Card: Identifiable {
     private var cachedImageSampleColor: SIMD4<Float>?
     var youtubeThumbnailTexture: MTLTexture?
     var youtubeThumbnailVideoID: String?
+    var pluginSnapshotTexture: MTLTexture?
 
     // MARK: - Interaction State
     // When true, the card is selected and can be dragged with finger
@@ -321,6 +323,8 @@ extension Card {
             content = .youtube(videoID: videoID, aspectRatio: aspectRatio)
         case .drawing:
             content = .solid(color: [backgroundColor.x, backgroundColor.y, backgroundColor.z, backgroundColor.w])
+        case .plugin(let typeID, let payload):
+            content = .plugin(typeID: typeID, payload: payload)
         }
 
         return CardDTO(

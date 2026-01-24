@@ -266,16 +266,16 @@ final class PersistenceManager {
         return top
     }
 
-    private func cardType(from content: CardContentDTO, device: MTLDevice) -> CardType {
-        switch content {
-        case .solid(let color):
-            return .solidColor(float4(color))
-        case .lined(let spacing, let lineWidth, let color):
-            return .lined(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: float4(color)))
-        case .grid(let spacing, let lineWidth, let color):
-            return .grid(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: float4(color)))
-        case .image(let data):
-            let loader = MTKTextureLoader(device: device)
+	    private func cardType(from content: CardContentDTO, device: MTLDevice) -> CardType {
+	        switch content {
+	        case .solid(let color):
+	            return .solidColor(float4(color))
+	        case .lined(let spacing, let lineWidth, let color):
+	            return .lined(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: float4(color)))
+	        case .grid(let spacing, let lineWidth, let color):
+	            return .grid(LinedBackgroundConfig(spacing: spacing, lineWidth: lineWidth, color: float4(color)))
+	        case .image(let data):
+	            let loader = MTKTextureLoader(device: device)
             // Note: card image textures are stored exactly as the in-memory Metal texture bytes.
             // Because our card UVs already compensate for the initial image-load vertical flip,
             // we should NOT apply another origin flip here (or the image will import upside-down).
@@ -289,12 +289,14 @@ final class PersistenceManager {
                 ]
             ) {
                 return .image(texture)
-            }
-            return .solidColor(SIMD4<Float>(1, 0, 1, 1))
-        case .youtube(let videoID, let aspectRatio):
-            return .youtube(videoID: videoID, aspectRatio: aspectRatio)
-        }
-    }
+	            }
+	            return .solidColor(SIMD4<Float>(1, 0, 1, 1))
+	        case .youtube(let videoID, let aspectRatio):
+	            return .youtube(videoID: videoID, aspectRatio: aspectRatio)
+	        case .plugin(let typeID, let payload):
+	            return .plugin(typeID: typeID, payload: payload)
+	        }
+	    }
 
     private func cardBackgroundColor(from dto: CardDTO) -> SIMD4<Float> {
         if let background = dto.backgroundColor {

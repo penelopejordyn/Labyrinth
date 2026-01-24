@@ -132,4 +132,5 @@ enum CardContentDTO: Codable {
     case lined(spacing: Float, lineWidth: Float, color: [Float])
     case grid(spacing: Float, lineWidth: Float, color: [Float])
     case youtube(videoID: String, aspectRatio: Double)
+    case plugin(typeID: String, payload: Data)
 }
