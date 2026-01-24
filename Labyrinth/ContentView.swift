@@ -15,6 +15,7 @@ import UniformTypeIdentifiers
 	    @State private var isBrushMenuExpanded = false
 	    @State private var isMenuExpanded = false
 	    @State private var showClearConfirmation = false
+	    @State private var isHandwritingRefinementMenuExpanded = false
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -165,11 +166,11 @@ import UniformTypeIdentifiers
                             }
                         }
 
-	                        HStack(spacing: 12) {
-	                            Button(action: { coordinator.debugPopulateFrames() }) {
-	                                VStack(spacing: 2) {
-	                                    Image(systemName: "bolt.fill")
-	                                        .font(.system(size: 20))
+                        HStack(spacing: 12) {
+                            Button(action: { coordinator.debugPopulateFrames() }) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "bolt.fill")
+                                        .font(.system(size: 20))
 	                                    Text("Fill")
 	                                        .font(.caption)
 	                                }
@@ -218,6 +219,8 @@ import UniformTypeIdentifiers
 	                            .background(.ultraThinMaterial)
 	                            .cornerRadius(16)
 	                        }
+
+	                       
 
 	                        Button(action: {
 	                            withAnimation(.easeInOut(duration: 0.2)) {

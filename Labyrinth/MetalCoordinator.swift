@@ -181,6 +181,8 @@ import UIKit
     var predictedTouchPoints: [CGPoint] = []    // Future points (Transient, SCREEN space)
     var liveStrokeOrigin: SIMD2<Double>?        // Temporary origin for live stroke (Double precision)
 
+    
+
 	    var lassoDrawingPoints: [CGPoint] = []
 	    var lassoPredictedPoints: [CGPoint] = []
 	    var lassoSelection: LassoSelection?
@@ -2500,11 +2502,11 @@ import UIKit
             encoder.setDepthStencilState(stencilStateWrite)
             encoder.setStencilReferenceValue(1)
 
-            // C. Set Pipeline & Bind Content Based on Card Type
-            switch card.type {
-            case .solidColor:
-                // Use solid color pipeline (no texture required)
-                encoder.setRenderPipelineState(cardSolidPipelineState)
+	            // C. Set Pipeline & Bind Content Based on Card Type
+	            switch card.type {
+	            case .solidColor:
+	                // Use solid color pipeline (no texture required)
+	                encoder.setRenderPipelineState(cardSolidPipelineState)
                 encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
                 var c = card.backgroundColor
                 encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
@@ -2568,26 +2570,42 @@ import UIKit
                 encoder.setFragmentBytes(&uniforms, length: MemoryLayout<CardShaderUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
 
-            case .youtube(let videoID, _):
-                if let texture = ensureYouTubeThumbnailTexture(card: card, videoID: videoID) {
-                    // Render the cached thumbnail like an image card.
-                    encoder.setRenderPipelineState(cardPipelineState)
-                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                    encoder.setFragmentTexture(texture, index: 0)
-                    encoder.setFragmentSamplerState(samplerState, index: 0)
-                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
-                } else {
-                    // Placeholder background (thumbnail loads async).
-                    encoder.setRenderPipelineState(cardSolidPipelineState)
-                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
-                    var c = card.backgroundColor
-                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
-                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
-                }
+	            case .youtube(let videoID, _):
+	                if let texture = ensureYouTubeThumbnailTexture(card: card, videoID: videoID) {
+	                    // Render the cached thumbnail like an image card.
+	                    encoder.setRenderPipelineState(cardPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    encoder.setFragmentTexture(texture, index: 0)
+	                    encoder.setFragmentSamplerState(samplerState, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                } else {
+	                    // Placeholder background (thumbnail loads async).
+	                    encoder.setRenderPipelineState(cardSolidPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    var c = card.backgroundColor
+	                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                }
 
-            case .drawing:
-                continue // Future: Render nested strokes
-            }
+	            case .plugin:
+	                // Plugin cards render a snapshot placeholder (when available); interactive UI is hosted via an overlay runtime.
+	                if let texture = card.pluginSnapshotTexture {
+	                    encoder.setRenderPipelineState(cardPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    encoder.setFragmentTexture(texture, index: 0)
+	                    encoder.setFragmentSamplerState(samplerState, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                } else {
+	                    encoder.setRenderPipelineState(cardSolidPipelineState)
+	                    encoder.setVertexBytes(&transform, length: MemoryLayout<CardTransform>.stride, index: 1)
+	                    var c = card.backgroundColor
+	                    encoder.setFragmentBytes(&c, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+	                    encoder.setFragmentBytes(&style, length: MemoryLayout<CardStyleUniforms>.stride, index: 2)
+	                }
+
+	            case .drawing:
+	                continue // Future: Render nested strokes
+	            }
 
             // D. Draw the Card Quad (writes to both color buffer and stencil)
             let vertexBuffer = device.makeBuffer(
@@ -2975,6 +2993,7 @@ import UIKit
 
         return screenPoints
     }
+
 
     private func buildLassoScreenPoints() -> [CGPoint]? {
         guard !lassoDrawingPoints.isEmpty else { return nil }
@@ -3887,48 +3906,54 @@ import UIKit
         let cameraPos = calculateCameraCenterWorld(viewSize: view.bounds.size)
         let cameraPosText = String(format: "(%.1f, %.1f)", cameraPos.x, cameraPos.y)
 
-	        // Update label on main thread
-	        DispatchQueue.main.async {
-	            (mtkView as? TouchableMTKView)?.updateYouTubeOverlay()
-	            (mtkView as? TouchableMTKView)?.updateYouTubeCloseButtonOverlay()
-	            (mtkView as? TouchableMTKView)?.updateLinkSelectionOverlay()
-	            (mtkView as? TouchableMTKView)?.updateSectionNameEditorOverlay()
-	            (mtkView as? TouchableMTKView)?.updateCardNameEditorOverlay()
+        let updateUI = {
+            (mtkView as? TouchableMTKView)?.updateWebCardOverlays()
+            (mtkView as? TouchableMTKView)?.updateYouTubeOverlay()
+            (mtkView as? TouchableMTKView)?.updateYouTubeCloseButtonOverlay()
+            (mtkView as? TouchableMTKView)?.updateLinkSelectionOverlay()
+            (mtkView as? TouchableMTKView)?.updateSectionNameEditorOverlay()
+            (mtkView as? TouchableMTKView)?.updateCardNameEditorOverlay()
 
-	            let refs: String = {
-	                let edges = self.internalLinkReferenceEdges
-	                guard !edges.isEmpty else { return "Refs: 0" }
+            let refs: String = {
+                let edges = self.internalLinkReferenceEdges
+                guard !edges.isEmpty else { return "Refs: 0" }
 
-	                let names = self.internalLinkReferenceNamesByID
-	                let maxLines = 6
-	                var lines: [String] = []
-	                lines.reserveCapacity(min(edges.count, maxLines))
+                let names = self.internalLinkReferenceNamesByID
+                let maxLines = 6
+                var lines: [String] = []
+                lines.reserveCapacity(min(edges.count, maxLines))
 
-	                for edge in edges.prefix(maxLines) {
-	                    let src = (names[edge.sourceID] ?? "(\(edge.sourceID.uuidString.prefix(6)))")
-	                    let dst = (names[edge.targetID] ?? "(\(edge.targetID.uuidString.prefix(6)))")
-	                    lines.append("\(src) -> \(dst)")
-	                }
+                for edge in edges.prefix(maxLines) {
+                    let src = (names[edge.sourceID] ?? "(\(edge.sourceID.uuidString.prefix(6)))")
+                    let dst = (names[edge.targetID] ?? "(\(edge.targetID.uuidString.prefix(6)))")
+                    lines.append("\(src) -> \(dst)")
+                }
 
-	                if edges.count > maxLines {
-	                    lines.append("+\(edges.count - maxLines) more")
-	                }
+                if edges.count > maxLines {
+                    lines.append("+\(edges.count - maxLines) more")
+                }
 
-	                return "Refs: \(edges.count)\n" + lines.joined(separator: "\n")
-	            }()
+                return "Refs: \(edges.count)\n" + lines.joined(separator: "\n")
+            }()
 
-	            debugLabel.text = """
-	            Depth: \(depth) | Tile: \(tileText) | Zoom: \(zoomText)
-	            Path: \(pathText)
-	            Effective: \(effectiveText)
-	            Strokes: \(self.activeFrame.strokes.count)
-	            Camera: \(cameraPosText)
-	            Vertices: \(self.debugDrawnVerticesThisFrame) | Draws: \(self.debugDrawnNodesThisFrame)
-	            \((mtkView as? TouchableMTKView)?.youtubeHUDText() ?? "")
-	            \(refs)
-	            """
-	            mtkView.bringSubviewToFront(debugLabel)
-	        }
+            debugLabel.text = """
+            Depth: \(depth) | Tile: \(tileText) | Zoom: \(zoomText)
+            Path: \(pathText)
+            Effective: \(effectiveText)
+            Strokes: \(self.activeFrame.strokes.count)
+            Camera: \(cameraPosText)
+            Vertices: \(self.debugDrawnVerticesThisFrame) | Draws: \(self.debugDrawnNodesThisFrame)
+            \((mtkView as? TouchableMTKView)?.youtubeHUDText() ?? "")
+            \(refs)
+            """
+            mtkView.bringSubviewToFront(debugLabel)
+        }
+
+        if Thread.isMainThread {
+            updateUI()
+        } else {
+            DispatchQueue.main.async(execute: updateUI)
+        }
 	    }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -5792,6 +5817,7 @@ import UIKit
 
         // Keep points in SCREEN space during drawing
         currentTouchPoints = [point]
+        // Cancel any pending refinement; this stroke continues the phrase.
     }
 
     func handleTouchMoved(at point: CGPoint, predicted: [CGPoint], touchType: UITouch.TouchType) {
@@ -6059,7 +6085,6 @@ import UIKit
 
         // Keep final point in SCREEN space
         currentTouchPoints.append(point)
-
         //  FIX 1: Allow dots (Don't return if count < 4)
         guard !currentTouchPoints.isEmpty else {
             currentTouchPoints = []
@@ -6141,6 +6166,8 @@ import UIKit
 		                }
 		                let routedTarget = appendCanvasStroke(stroke, to: frame)
 		                pushUndo(.drawStroke(stroke: stroke, target: routedTarget))
+
+
             } else {
                 // DRAW ON CANVAS (Other Frame in Telescope Chain)
                 let stroke = createStrokeForFrame(
@@ -7357,15 +7384,16 @@ import UIKit
 	        } else {
 	            return
 	        }
-	        zOrder.removeAll { item in
-	            if case .card(let id) = item {
-	                return id == card.id
-	            }
-	            return false
-	        }
-	        (metalView as? TouchableMTKView)?.deactivateYouTubeOverlayIfTarget(card: card)
-	        card.isEditing = false
-	        clearLassoSelection()
+		        zOrder.removeAll { item in
+		            if case .card(let id) = item {
+		                return id == card.id
+		            }
+		            return false
+		        }
+		        (metalView as? TouchableMTKView)?.deactivateYouTubeOverlayIfTarget(card: card)
+		        (metalView as? TouchableMTKView)?.closeWebCardOverlayIfOpen(card: card)
+		        card.isEditing = false
+		        clearLassoSelection()
 
 	        if case .card(let targetCard, _) = currentDrawingTarget, targetCard === card {
 	            currentDrawingTarget = nil
@@ -7567,6 +7595,52 @@ import UIKit
 	        }
 	        zOrder.insert(.card(card.id), at: 0)
 	    }
+
+	    func addPluginCard(typeID: String) {
+	        guard let view = metalView else {
+	            return
+	        }
+
+	        let cameraCenterWorld = calculateCameraCenterWorld(viewSize: view.bounds.size)
+
+	        let definition = CardPluginRegistry.shared.definition(for: typeID)
+	        let defaultSizePt = definition?.defaultSizePt ?? CGSize(width: 300.0, height: 200.0)
+	        let worldW = Double(defaultSizePt.width) / max(zoomScale, 1e-9)
+	        let worldH = Double(defaultSizePt.height) / max(zoomScale, 1e-9)
+	        let cardSize = SIMD2<Double>(worldW, worldH)
+
+	        let defaultCardColor = SIMD4<Float>(0.2, 0.2, 0.2, 1.0)
+	        let baseName = definition?.name ?? "Plugin"
+	        let defaultName = nextNumberedName(base: baseName, existingNames: allCardsInCanvas(from: rootFrame).map(\.name))
+	        let payload = definition?.defaultPayload ?? Data()
+
+	        let card = Card(
+	            name: defaultName,
+	            origin: cameraCenterWorld,
+	            size: cardSize,
+	            rotation: 0,
+	            zoom: zoomScale,
+	            type: .plugin(typeID: typeID, payload: payload),
+	            backgroundColor: defaultCardColor
+	        )
+
+	        appendCard(card, to: activeFrame)
+	        syncZOrderWithCanvas()
+	        zOrder.removeAll { item in
+	            if case .card(let id) = item {
+	                return id == card.id
+	            }
+	            return false
+	        }
+	        zOrder.insert(.card(card.id), at: 0)
+	    }
+
+	    #if DEBUG
+	    func addSampleWebCard() {
+	        let typeID = CardPluginRegistry.shared.allDefinitions.first?.typeID ?? "labyrinth.sample.hello"
+	        addPluginCard(typeID: typeID)
+	    }
+	    #endif
 
     /// Create a stroke in a target frame's coordinate system (canvas strokes).
     /// Converts screen points into the target frame, even across telescope transitions.

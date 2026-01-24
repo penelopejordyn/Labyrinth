@@ -30,25 +30,25 @@
 
 /* Begin PBXFileReference section */
 		EB365F9B2F0C384700F5B54A /* labyrinth.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = labyrinth.icon; sourceTree = "<group>"; };
-		EBFA97D12EAFF17D00FBB8B5 /* Slate.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Slate.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Labyrinth.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SlateUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		EBFA97D32EAFF17D00FBB8B5 /* Slate */ = {
+		EBFA97D32EAFF17D00FBB8B5 /* Labyrinth */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Slate;
+			path = Labyrinth;
 			sourceTree = "<group>";
 		};
-		EBFA97E12EAFF17D00FBB8B5 /* SlateTests */ = {
+		EBFA97E12EAFF17D00FBB8B5 /* LabyrinthTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = SlateTests;
+			path = LabyrinthTests;
 			sourceTree = "<group>";
 		};
-		EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */ = {
+		EBFA97EB2EAFF17D00FBB8B5 /* LabyrinthUITests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = SlateUITests;
+			path = LabyrinthUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -83,9 +83,9 @@
 			isa = PBXGroup;
 			children = (
 				EB365F9B2F0C384700F5B54A /* labyrinth.icon */,
-				EBFA97D32EAFF17D00FBB8B5 /* Slate */,
-				EBFA97E12EAFF17D00FBB8B5 /* SlateTests */,
-				EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */,
+				EBFA97D32EAFF17D00FBB8B5 /* Labyrinth */,
+				EBFA97E12EAFF17D00FBB8B5 /* LabyrinthTests */,
+				EBFA97EB2EAFF17D00FBB8B5 /* LabyrinthUITests */,
 				EBFA97D22EAFF17D00FBB8B5 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -93,7 +93,7 @@
 		EBFA97D22EAFF17D00FBB8B5 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				EBFA97D12EAFF17D00FBB8B5 /* Slate.app */,
+				EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */,
 				EBFA97DE2EAFF17D00FBB8B5 /* SlateTests.xctest */,
 				EBFA97E82EAFF17D00FBB8B5 /* SlateUITests.xctest */,
 			);
@@ -103,9 +103,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		EBFA97D02EAFF17D00FBB8B5 /* Slate */ = {
+		EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Slate" */;
+			buildConfigurationList = EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Labyrinth" */;
 			buildPhases = (
 				EBFA97CD2EAFF17D00FBB8B5 /* Sources */,
 				EBFA97CE2EAFF17D00FBB8B5 /* Frameworks */,
@@ -116,14 +116,14 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				EBFA97D32EAFF17D00FBB8B5 /* Slate */,
+				EBFA97D32EAFF17D00FBB8B5 /* Labyrinth */,
 			);
-			name = Slate;
+			name = Labyrinth;
 			packageProductDependencies = (
 				EB365E622F085AC300F5B54A /* YouTubePlayerKit */,
 			);
 			productName = Slate;
-			productReference = EBFA97D12EAFF17D00FBB8B5 /* Slate.app */;
+			productReference = EBFA97D12EAFF17D00FBB8B5 /* Labyrinth.app */;
 			productType = "com.apple.product-type.application";
 		};
 		EBFA97DD2EAFF17D00FBB8B5 /* SlateTests */ = {
@@ -140,7 +140,7 @@
 				EBFA97E02EAFF17D00FBB8B5 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				EBFA97E12EAFF17D00FBB8B5 /* SlateTests */,
+				EBFA97E12EAFF17D00FBB8B5 /* LabyrinthTests */,
 			);
 			name = SlateTests;
 			packageProductDependencies = (
@@ -163,7 +163,7 @@
 				EBFA97EA2EAFF17D00FBB8B5 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				EBFA97EB2EAFF17D00FBB8B5 /* SlateUITests */,
+				EBFA97EB2EAFF17D00FBB8B5 /* LabyrinthUITests */,
 			);
 			name = SlateUITests;
 			packageProductDependencies = (
@@ -195,7 +195,7 @@
 					};
 				};
 			};
-			buildConfigurationList = EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Slate" */;
+			buildConfigurationList = EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Labyrinth" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -212,7 +212,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				EBFA97D02EAFF17D00FBB8B5 /* Slate */,
+				EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */,
 				EBFA97DD2EAFF17D00FBB8B5 /* SlateTests */,
 				EBFA97E72EAFF17D00FBB8B5 /* SlateUITests */,
 			);
@@ -271,12 +271,12 @@
 /* Begin PBXTargetDependency section */
 		EBFA97E02EAFF17D00FBB8B5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = EBFA97D02EAFF17D00FBB8B5 /* Slate */;
+			target = EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */;
 			targetProxy = EBFA97DF2EAFF17D00FBB8B5 /* PBXContainerItemProxy */;
 		};
 		EBFA97EA2EAFF17D00FBB8B5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = EBFA97D02EAFF17D00FBB8B5 /* Slate */;
+			target = EBFA97D02EAFF17D00FBB8B5 /* Labyrinth */;
 			targetProxy = EBFA97E92EAFF17D00FBB8B5 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
@@ -416,6 +416,7 @@
 				DEVELOPMENT_TEAM = A282AW9YX2;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -450,6 +451,7 @@
 				DEVELOPMENT_TEAM = A282AW9YX2;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -548,7 +550,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Slate" */ = {
+		EBFA97CC2EAFF17D00FBB8B5 /* Build configuration list for PBXProject "Labyrinth" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F02EAFF17D00FBB8B5 /* Debug */,
@@ -557,7 +559,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Slate" */ = {
+		EBFA97F22EAFF17D00FBB8B5 /* Build configuration list for PBXNativeTarget "Labyrinth" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				EBFA97F32EAFF17D00FBB8B5 /* Debug */,
