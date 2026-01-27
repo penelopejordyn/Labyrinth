@@ -1,0 +1,9 @@
+/handwriting-synthesis/
+/.venv/
+/plans/
+/tools/
+/deepwriting/
+/refine_mvp/iam_json/
+/refine_mvp/distill_out*/
+/refine_mvp/.venv/
+/TRM-student/out/
